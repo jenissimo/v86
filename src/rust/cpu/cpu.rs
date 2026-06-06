@@ -34,6 +34,7 @@ mod wasm {
 }
 
 pub mod js {
+    #[link(wasm_import_module = "env")]
     extern "C" {
         pub fn cpu_exception_hook(interrupt: i32) -> bool;
         pub fn microtick() -> f64;

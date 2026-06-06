@@ -1,4 +1,5 @@
 mod ext {
+    #[link(wasm_import_module = "env")]
     extern "C" {
         pub fn mmap_read8(addr: u32) -> i32;
         pub fn mmap_read16(addr: u32) -> i32;
