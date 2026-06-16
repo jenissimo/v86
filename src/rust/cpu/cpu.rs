@@ -4226,7 +4226,7 @@ pub unsafe fn mark_fpu_simd_dirty() { *fpu_simd_dirty = 1; }
 
 pub unsafe fn write_mmx_reg64(r: i32, data: u64) {
     mark_fpu_simd_dirty();
-    (*fpu_st.offset(r as isize)).mantissa = data;
+    *fpu_st.offset(r as isize) = softfloat::F80 { mantissa: data, sign_exponent: 0xFFFF };
 }
 
 pub unsafe fn read_xmm_f32(r: i32) -> f32 { return (*reg_xmm.offset(r as isize)).f32[0]; }
