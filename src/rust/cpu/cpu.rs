@@ -4275,6 +4275,7 @@ pub unsafe fn write_xmm_reg128(r: i32, data: reg128) {
 }
 
 /// Set the fpu tag word to valid and the top-of-stack to 0 on mmx instructions
+#[no_mangle]
 pub fn transition_fpu_to_mmx() {
     unsafe {
         mark_fpu_simd_dirty();
