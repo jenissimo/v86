@@ -4839,7 +4839,6 @@ pub unsafe fn reset_cpu() {
     *gdtr_size = 0;
     *gdtr_offset = 0;
 
-    *page_fault = false;
     *cr = 1 << 30 | 1 << 29 | 1 << 4;
     *cr.offset(2) = 0;
     *cr.offset(3) = 0;
