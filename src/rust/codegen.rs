@@ -429,10 +429,6 @@ fn gen_get_last_op1(builder: &mut WasmBuilder, previous_instruction: &Instructio
     }
 }
 
-pub fn gen_get_page_fault(builder: &mut WasmBuilder) {
-    builder.load_fixed_u8(global_pointers::page_fault as u32);
-}
-
 pub fn gen_readable_or_pagefault(ctx: &mut JitContext, address_local: &WasmLocal, size: i32) {
     ctx.builder.get_local(address_local);
     ctx.builder.const_i32(size);

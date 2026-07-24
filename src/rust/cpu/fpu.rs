@@ -433,17 +433,20 @@ pub unsafe fn fpu_fldcw(addr: i32) {
 }
 
 #[no_mangle]
-pub unsafe fn fpu_fldenv16(_addr: i32) {
-    dbg_log!("fldenv16");
-    fpu_unimpl();
+pub unsafe fn fpu_fldenv16(addr: i32) {
+    // caller must have called readable_or_pagefault
+    // protected-mode layout (the real-mode layout stores the linear ip/dp)
+    set_control_word(safe_read16(addr).unwrap() as u16);
+    fpu_set_status_word(safe_read16(addr + 2).unwrap() as u16);
+    fpu_set_tag_word(safe_read16(addr + 4).unwrap());
+    *fpu_ip = safe_read16(addr + 6).unwrap();
+    *fpu_ip_selector = safe_read16(addr + 8).unwrap();
+    *fpu_dp = safe_read16(addr + 10).unwrap();
+    *fpu_dp_selector = safe_read16(addr + 12).unwrap()
 }
 #[no_mangle]
 pub unsafe fn fpu_fldenv32(addr: i32) {
-    if let Err(()) = readable_or_pagefault(addr, 28) {
-        *page_fault = true;
-        return;
-    }
-    *page_fault = false;
+    // caller must have called readable_or_pagefault
     set_control_word(safe_read16(addr).unwrap() as u16);
     fpu_set_status_word(safe_read16(addr + 4).unwrap() as u16);
     fpu_set_tag_word(safe_read16(addr + 8).unwrap());
@@ -473,18 +476,9 @@ pub unsafe fn fpu_set_status_word(sw: u16) {
 
 pub unsafe fn fpu_fldm32(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m32(addr))); }
 pub unsafe fn fpu_fldm64(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m64(addr))); }
+pub unsafe fn fpu_fldm80(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m80(addr))); }
 #[no_mangle]
-pub unsafe fn fpu_fldm80(addr: i32) {
-    match fpu_load_m80(addr) {
-        Ok(x) => {
-            *page_fault = false;
-            fpu_push(x)
-        },
-        Err(()) => {
-            *page_fault = true;
-        },
-    }
-}
+pub unsafe fn fpu_fldm80_without_fault(addr: i32) { fpu_push(fpu_load_m80(addr).unwrap()); }
 
 #[no_mangle]
 pub unsafe fn fpu_fmul(target_index: i32, val: F80) {
@@ -587,20 +581,20 @@ pub unsafe fn fpu_store_m80(addr: i32, f: F80) {
 }
 
 #[no_mangle]
-pub unsafe fn fpu_fstenv16(_addr: i32) {
-    dbg_log!("fstenv16");
-    fpu_unimpl();
+pub unsafe fn fpu_fstenv16(addr: i32) {
+    // caller must have called writable_or_pagefault
+    safe_write16(addr + 0, *fpu_control_word as i32).unwrap();
+    safe_write16(addr + 2, fpu_load_status_word() as i32).unwrap();
+    safe_write16(addr + 4, fpu_load_tag_word()).unwrap();
+    safe_write16(addr + 6, *fpu_ip & 0xFFFF).unwrap();
+    safe_write16(addr + 8, *fpu_ip_selector).unwrap();
+    safe_write16(addr + 10, *fpu_dp & 0xFFFF).unwrap();
+    safe_write16(addr + 12, *fpu_dp_selector).unwrap();
 }
 
 #[no_mangle]
 pub unsafe fn fpu_fstenv32(addr: i32) {
-    match writable_or_pagefault(addr, 26) {
-        Ok(()) => *page_fault = false,
-        Err(()) => {
-            *page_fault = true;
-            return;
-        },
-    }
+    // caller must have called writable_or_pagefault
     let high_bits = 0xFFFF0000u32 as i32;
     safe_write32(addr + 0, high_bits + *fpu_control_word as i32).unwrap();
     safe_write32(addr + 4, high_bits + fpu_load_status_word() as i32).unwrap();
@@ -678,18 +672,18 @@ pub unsafe fn fpu_fstp(r: i32) {
 pub unsafe fn fpu_fbld(addr: i32) {
     // FBLD (DF /4): load an 80-bit packed-BCD integer and push it onto the FPU stack.
     // Exact inverse of fpu_fbstp: bytes [0..9) carry 18 packed decimal digits (low nibble =
-    // lower digit, high nibble = upper digit), byte[9] bit 7 = sign. Reads only — page faults
-    // are surfaced by safe_read8 and leave the FPU stack untouched (the instruction re-executes).
+    // lower digit, high nibble = upper digit), byte[9] bit 7 = sign.
+    // caller must have called readable_or_pagefault
     let mut value: i64 = 0;
     let mut scale: i64 = 1;
     for i in 0..9 {
-        let b = return_on_pagefault!(safe_read8(addr + i));
+        let b = safe_read8(addr + i).unwrap();
         value += (b & 0x0F) as i64 * scale;
         scale *= 10;
         value += ((b >> 4) & 0x0F) as i64 * scale;
         scale *= 10;
     }
-    let sign = return_on_pagefault!(safe_read8(addr + 9));
+    let sign = safe_read8(addr + 9).unwrap();
     if sign & 0x80 != 0 {
         value = -value;
     }
@@ -698,13 +692,7 @@ pub unsafe fn fpu_fbld(addr: i32) {
 
 #[no_mangle]
 pub unsafe fn fpu_fbstp(addr: i32) {
-    match writable_or_pagefault(addr, 26) {
-        Ok(()) => *page_fault = false,
-        Err(()) => {
-            *page_fault = true;
-            return;
-        },
-    }
+    // caller must have called writable_or_pagefault
     let st0 = fpu_get_st0();
     let mut x = st0.to_i64().unsigned_abs();
     if x <= 99_9999_9999_9999_9999 {
