@@ -3879,6 +3879,38 @@ pub unsafe fn safe_read_write64_slow_jit(addr: i32, eip: i32) -> i32 {
     safe_read_slow_jit(addr, 64, eip, true)
 }
 
+#[no_mangle]
+pub unsafe fn readable_or_pagefault_jit(addr: i32, size: i32, eip_offset_in_page: i32) -> i32 {
+    dbg_assert!(size > 0 && size < 0x1000);
+    dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
+    let crosses_page = (addr & 0xFFF) + size > 0x1000;
+    if translate_address_read_jit(addr).is_err()
+        || crosses_page && translate_address_read_jit((addr | 0xFFF) + 1).is_err()
+    {
+        *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+        return 1;
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe fn writable_or_pagefault_jit(addr: i32, size: i32, eip_offset_in_page: i32) -> i32 {
+    dbg_assert!(size > 0 && size < 0x1000);
+    dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
+    // Validation only: the pre-checked helper performs its writes through safe_write*,
+    // which own dirty-page/SMC bookkeeping (plain eip convention; SMC invalidation is
+    // handled by the fastmem-generation deopt, not a packed wasm_table_index).
+    let crosses_page = (addr & 0xFFF) + size > 0x1000;
+    if translate_address_write_jit_and_can_skip_dirty(addr).is_err()
+        || crosses_page
+            && translate_address_write_jit_and_can_skip_dirty((addr | 0xFFF) + 1).is_err()
+    {
+        *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+        return 1;
+    }
+    0
+}
+
 pub unsafe fn safe_write_slow_jit(
     addr: i32,
     bitsize: i32,
