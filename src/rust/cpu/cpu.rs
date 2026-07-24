@@ -289,8 +289,12 @@ pub const DEBUG: bool = cfg!(debug_assertions);
 pub const LOOP_COUNTER: i32 = 100_003;
 pub static mut jit_cycle_start_instruction_counter: u32 = 0;
 
-// should probably be kept in sync with APIC_TIMER_FREQ in apic.js
-pub const TSC_RATE: f64 = 1_000_000.0;
+// Guest-visible TSC frequency in ticks/ms — the SINGLE source for both read_tsc
+// and CPUID 0x15/0x16. 2^32 ticks/sec (see read_tsc): keeps UE1-style
+// GSecondsPerCycle float-exact at 2^-32. CPUID must advertise the same rate or a
+// Linux guest skips PIT calibration, trusts the leaf, and runs its clock fast.
+// (APIC timer frequency in apic.rs is independent.)
+pub const TSC_RATE: f64 = 4_294_967.296;
 
 pub static mut cpuid_level: u32 = 0x16;
 
@@ -4473,12 +4477,9 @@ pub unsafe fn set_tsc(low: u32, high: u32) {
     tsc_last_value = new_value;
 }
 
-// 2^32 ticks per second = 4_294_967_296 / 1000 ticks per millisecond.
-const TSC_TICKS_PER_MS: f64 = 4_294_967.296;
-
-// 2^32 ticks per second = 4_294.967296 ticks per microsecond (the unit of the unified
-// virtual clock that QPC/GetTickCount interpolate from).
-const TSC_TICKS_PER_US: f64 = 4_294.967296;
+// TSC_RATE is ticks/ms; the unified virtual clock is in µs.
+const TSC_TICKS_PER_MS: f64 = TSC_RATE;
+const TSC_TICKS_PER_US: f64 = TSC_RATE / 1000.0;
 
 #[no_mangle]
 pub unsafe fn read_tsc() -> u64 {

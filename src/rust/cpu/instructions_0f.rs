@@ -3331,11 +3331,13 @@ pub unsafe fn instr_0FA2() {
         },
 
         0x15 => {
+            // TSC frequency = core crystal clock frequency * EBX/EAX.
+            // 2^25 Hz crystal × 128 = 2^32 Hz — expresses TSC_RATE exactly
+            // (TSC_RATE*1000 itself would saturate the u32).
             eax = 1; // denominator
-            ebx = 1; // numerator
-            ecx = (TSC_RATE * 1000.0) as u32 as i32; // core crystal clock frequency in Hz
-            dbg_assert!(ecx > 0);
-            //  (TSC frequency = core crystal clock frequency * EBX/EAX)
+            ebx = 128; // numerator
+            ecx = 33_554_432; // core crystal clock frequency in Hz (2^25)
+            dbg_assert!((ecx as f64) * (ebx as f64) / (eax as f64) == TSC_RATE * 1000.0);
         },
 
         0x16 => {
