@@ -46,6 +46,12 @@ def main():
 
     result = subprocess.run([lld] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    # Newer rustc defaults lld to --stack-first, which conflicts with our
+    # --global-base=4096 data-first layout — retry with it disabled (upstream b8642ee2).
+    if b"--global-base cannot be less than stack size when --stack-first is used" in result.stderr:
+        args += ["--no-stack-first"]
+        result = subprocess.run([lld] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     print(result.stderr, file=sys.stderr)
     print(result.stdout)
 
