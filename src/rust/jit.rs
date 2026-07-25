@@ -240,6 +240,18 @@ static mut JIT_FASTMEM_WRITES: bool = false;
 // module epilogues spill at every exit.
 static mut JIT_FLAG_LOCALS: bool = false;
 
+// Wasm branch hints (idx 22, bitmask of wasm_builder::HINT_GROUP_*, default 0 = OFF).
+// Emits a "metadata.code.branch_hint" custom section marking the slow-path side of
+// memory/TLB/x87 guards as unlikely. Pure layout advice: no observable semantics, and a
+// malformed section only loses the hints (V8 decodes it with an inner decoder). Read by
+// the optimizing tier only — Liftoff ignores hints, so any win is scaled by the module's
+// share of tier-up'd time. Bit 1 = memory guards, bit 2 = x87 relaxed cache.
+static mut JIT_BRANCH_HINTS: u32 = 0;
+// Robustness self-test knob (idx 23): shift every emitted hint offset by N bytes so the
+// hints deliberately point at non-branch instructions. Modules must still compile and
+// produce identical results — that is the property being asserted.
+static mut JIT_BRANCH_HINT_OFFSET_FUZZ: u32 = 0;
+
 // Tier-2R region recompiler: grow page groups across
 // indirect edges using trace_profiler target histograms, and make hot indirect
 // targets dispatcher entries so AbsoluteEip re-dispatches stay intra-module.
@@ -539,6 +551,9 @@ pub fn fastmem_read_split_enabled() -> bool { unsafe { JIT_FASTMEM_READ_SPLIT } 
 
 #[inline]
 pub fn flag_locals_enabled() -> bool { unsafe { JIT_FLAG_LOCALS } }
+
+#[inline]
+pub fn branch_hint_mask() -> u32 { unsafe { JIT_BRANCH_HINTS } }
 
 // Compile-time gate for the store fast path. Same regime as fastmem reads (32-bit
 // protected mode + paging): the map's identity-map store `mem8 + addr` is only valid
@@ -2567,6 +2582,8 @@ fn jit_generate_module(
     fastmem_generation: Option<u64>,
 ) -> Vec<(u32, u16)> {
     builder.reset();
+    builder.branch_hint_mask = branch_hint_mask();
+    builder.branch_hint_offset_fuzz = unsafe { JIT_BRANCH_HINT_OFFSET_FUZZ };
 
     let mut register_locals = (0..8)
         .map(|i| {
@@ -4195,6 +4212,8 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         18 => JIT_FASTMEM_READ_SPLIT = value != 0,
         19 => JIT_FASTMEM_WRITES = value != 0,
         21 => JIT_FLAG_LOCALS = value != 0,
+        22 => JIT_BRANCH_HINTS = value,
+        23 => JIT_BRANCH_HINT_OFFSET_FUZZ = value,
         _ => dbg_assert!(false),
     }
 }
@@ -4222,6 +4241,8 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         18 => JIT_FASTMEM_READ_SPLIT as u32,
         19 => JIT_FASTMEM_WRITES as u32,
         21 => JIT_FLAG_LOCALS as u32,
+        22 => JIT_BRANCH_HINTS,
+        23 => JIT_BRANCH_HINT_OFFSET_FUZZ,
         _ => 0,
     }
 }

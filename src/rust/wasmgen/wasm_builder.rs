@@ -69,6 +69,23 @@ impl FunctionType {
 
 pub const WASM_MODULE_ARGUMENT_COUNT: u8 = 1;
 
+// Wasm branch hinting (finished proposal, core 3.0): a custom section named
+// "metadata.code.branch_hint" annotates `if`/`br_if` instructions with the expected
+// value of their condition. Consumed by V8's optimizing tier only (Liftoff ignores it);
+// a malformed section can never invalidate the module — the decoder drops the hints.
+pub const BRANCH_HINT_SECTION_NAME: &str = "metadata.code.branch_hint";
+/// Condition is expected to be false (the hinted branch is NOT taken).
+pub const HINT_UNLIKELY: u8 = 0;
+/// Condition is expected to be true (the hinted branch IS taken).
+pub const HINT_LIKELY: u8 = 1;
+
+// Hint groups — bits of jit config idx 22, so a hint whose real distribution turns out
+// to be less lopsided than assumed can be ablated without a rebuild.
+/// Memory guards: TLB hit/miss, fastmem range tests, #PF exits, page-switch check.
+pub const HINT_GROUP_MEM: u32 = 1;
+/// x87 relaxed-mode local-cache validity (churns more than the memory guards).
+pub const HINT_GROUP_X87: u32 = 2;
+
 pub struct WasmBuilder {
     output: Vec<u8>,
     instruction_body: Vec<u8>,
@@ -102,6 +119,18 @@ pub struct WasmBuilder {
     // (unknown helper = spilled = safe; covers arith flag-protocol helpers AND
     // OUT/hypercall thunks whose context switches read cpu.get_eflags()).
     pub flag_locals: Option<[(u8, u32); 5]>,
+
+    // Branch hints (jit config idx 22). Offsets are recorded relative to the start of
+    // instruction_body and rebased onto the locals declaration in finish(); this is only
+    // sound because instruction_body is append-only (no insert/splice/truncate anywhere).
+    // Any future pass that rewrites the body must recompute or clear this vector — a stale
+    // offset does not corrupt the module, it silently loses the hint.
+    branch_hints: Vec<(u32, u8)>,
+    /// Bitmask of enabled HINT_GROUP_*; 0 disables emission entirely.
+    pub branch_hint_mask: u32,
+    // Robustness self-test (jit config idx 23): shift every emitted offset by N so the
+    // hints deliberately miss their instruction. The module must still compile and run.
+    pub branch_hint_offset_fuzz: u32,
 }
 
 // Helpers proven not to touch the lazy-flag globals. Everything else
@@ -164,6 +193,10 @@ impl WasmBuilder {
             local_count: 0,
             arg_local_initial_state: WasmLocal(0),
             flag_locals: None,
+
+            branch_hints: Vec::new(),
+            branch_hint_mask: 0,
+            branch_hint_offset_fuzz: 0,
         };
         b.init();
         b
@@ -196,6 +229,7 @@ impl WasmBuilder {
         self.free_locals_i64.clear();
         self.local_count = 0;
         self.flag_locals = None;
+        self.branch_hints.clear();
 
         dbg_assert!(self.label_to_depth.is_empty());
         dbg_assert!(self.label_stack.is_empty());
@@ -212,24 +246,6 @@ impl WasmBuilder {
         self.write_memory_import();
         self.write_function_section();
         self.write_export_section();
-
-        // write code section preamble
-        self.output.push(op::SC_CODE);
-
-        let idx_code_section_size = self.output.len(); // we will write to this location later
-        self.output.push(0);
-        self.output.push(0); // write temp val for now using 4 bytes
-        self.output.push(0);
-        self.output.push(0);
-
-        self.output.push(1); // number of function bodies: just 1
-
-        // same as above but for body size of the function
-        let idx_fn_body_size = self.output.len();
-        self.output.push(0);
-        self.output.push(0);
-        self.output.push(0);
-        self.output.push(0);
 
         dbg_assert!(
             self.local_count as usize == self.free_locals_i32.len() + self.free_locals_i64.len(),
@@ -261,6 +277,30 @@ impl WasmBuilder {
             groups.push((local_type, 1));
         }
         dbg_assert!(groups.len() < 128);
+
+        // Branch hints must precede the code section. Offsets are relative to the first byte
+        // of the locals declaration (V8: locals_offset_ is taken before DecodeLocals), which
+        // is exactly the group count byte written below — hence the +locals_decl_size rebase.
+        self.write_branch_hint_section(1 + 2 * groups.len() as u32);
+
+        // write code section preamble
+        self.output.push(op::SC_CODE);
+
+        let idx_code_section_size = self.output.len(); // we will write to this location later
+        self.output.push(0);
+        self.output.push(0); // write temp val for now using 4 bytes
+        self.output.push(0);
+        self.output.push(0);
+
+        self.output.push(1); // number of function bodies: just 1
+
+        // same as above but for body size of the function
+        let idx_fn_body_size = self.output.len();
+        self.output.push(0);
+        self.output.push(0);
+        self.output.push(0);
+        self.output.push(0);
+
         self.output.push(groups.len().safe_to_u8());
         for (local_type, count) in groups {
             dbg_assert!(count < 128);
@@ -281,6 +321,39 @@ impl WasmBuilder {
         write_fixed_leb32_at_idx(&mut self.output, idx_code_section_size, code_section_size);
 
         self.output.len()
+    }
+
+    /// Emit the "metadata.code.branch_hint" custom section for the single function body.
+    /// `locals_decl_size` rebases body-relative offsets onto the spec's zero point.
+    fn write_branch_hint_section(&mut self, locals_decl_size: u32) {
+        if self.branch_hints.is_empty() {
+            return;
+        }
+
+        let mut payload: Vec<u8> = Vec::with_capacity(2 + 3 * self.branch_hints.len());
+        write_leb_u32(&mut payload, 1); // one function annotated
+        write_leb_u32(&mut payload, self.function_import_count as u32);
+        write_leb_u32(&mut payload, self.branch_hints.len() as u32);
+
+        let fuzz = self.branch_hint_offset_fuzz;
+        let mut last_offset: Option<u32> = None;
+        for &(offset, hint) in &self.branch_hints {
+            dbg_assert!(hint <= 1);
+            dbg_assert!(last_offset.map_or(true, |p| offset > p)); // spec: strictly increasing
+            last_offset = Some(offset);
+            write_leb_u32(&mut payload, offset + locals_decl_size + fuzz);
+            write_leb_u32(&mut payload, 1); // hint payload size, always 1
+            payload.push(hint);
+        }
+
+        let mut section: Vec<u8> = Vec::with_capacity(1 + BRANCH_HINT_SECTION_NAME.len() + payload.len());
+        write_leb_u32(&mut section, BRANCH_HINT_SECTION_NAME.len() as u32);
+        section.extend(BRANCH_HINT_SECTION_NAME.as_bytes());
+        section.extend(&payload);
+
+        self.output.push(0); // custom section id
+        write_leb_u32(&mut self.output, section.len() as u32);
+        self.output.extend(&section);
     }
 
     pub fn write_type_section(&mut self) {
@@ -1088,6 +1161,35 @@ impl WasmBuilder {
     pub fn br_if(&mut self, label: Label) {
         self.instruction_body.push(op::OP_BRIF);
         self.write_label(label);
+    }
+
+    /// Record a hint for the instruction that is about to be pushed. Must be called
+    /// immediately before the opcode byte: the spec addresses the `if`/`br_if` opcode itself.
+    fn note_branch_hint(&mut self, group: u32, hint: u8) {
+        if self.branch_hint_mask & group != 0 {
+            self.branch_hints
+                .push((self.instruction_body.len() as u32, hint));
+        }
+    }
+
+    pub fn br_if_hinted(&mut self, label: Label, group: u32, hint: u8) {
+        self.note_branch_hint(group, hint);
+        self.br_if(label);
+    }
+    pub fn if_void_hinted(&mut self, group: u32, hint: u8) {
+        // open_block() only touches label bookkeeping, not instruction_body, so the
+        // recorded offset still lands on OP_IF.
+        self.note_branch_hint(group, hint);
+        self.if_void();
+    }
+    pub fn if_i32_hinted(&mut self, group: u32, hint: u8) {
+        self.note_branch_hint(group, hint);
+        self.if_i32();
+    }
+    #[allow(dead_code)]
+    pub fn if_i64_hinted(&mut self, group: u32, hint: u8) {
+        self.note_branch_hint(group, hint);
+        self.if_i64();
     }
 
     fn write_label(&mut self, label: Label) {

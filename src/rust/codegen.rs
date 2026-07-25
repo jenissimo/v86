@@ -10,7 +10,10 @@ use crate::modrm::ModrmByte;
 use crate::opstats;
 use crate::profiler;
 use crate::regs;
-use crate::wasmgen::wasm_builder::{WasmBuilder, WasmLocal, WasmLocalI64};
+use crate::wasmgen::wasm_builder::{
+    WasmBuilder, WasmLocal, WasmLocalI64, HINT_GROUP_MEM, HINT_GROUP_X87, HINT_LIKELY,
+    HINT_UNLIKELY,
+};
 
 pub fn gen_add_cs_offset(ctx: &mut JitContext) {
     if !ctx.cpu.has_flat_segmentation() {
@@ -127,7 +130,9 @@ pub fn gen_page_switch_check(
         ctx.builder.block_end();
     }
     else {
-        ctx.builder.br_if(ctx.exit_label);
+        // The page mapping surviving the switch is the overwhelmingly common case;
+        // a changed mapping means we leave the module entirely.
+        ctx.builder.br_if_hinted(ctx.exit_label, HINT_GROUP_MEM, HINT_UNLIKELY);
     }
 }
 
@@ -442,7 +447,8 @@ pub fn gen_readable_or_pagefault(ctx: &mut JitContext, address_local: &WasmLocal
         ctx.builder.block_end();
     }
     else {
-        ctx.builder.br_if(ctx.exit_with_fault_label);
+        ctx.builder
+            .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
     }
 }
 
@@ -459,7 +465,8 @@ pub fn gen_writable_or_pagefault(ctx: &mut JitContext, address_local: &WasmLocal
         ctx.builder.block_end();
     }
     else {
-        ctx.builder.br_if(ctx.exit_with_fault_label);
+        ctx.builder
+            .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
     }
 }
 
@@ -723,7 +730,8 @@ fn gen_safe_read(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(cont);
+    // TLB hit is the fast path; falling through means calling safe_read*_slow_jit.
+    ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
 
     if cfg!(feature = "profiler") {
         ctx.builder.get_local(&address_local);
@@ -765,7 +773,9 @@ fn gen_safe_read(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    // Page fault out of a guest memory access: cold by construction.
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
 
     ctx.builder.block_end();
 
@@ -873,7 +883,8 @@ fn gen_fastmem_read(
     ctx.builder.or_i32();
     ctx.builder.and_i32();
 
-    ctx.builder.if_void();
+    // In-range identity-mapped RAM is the accepted set this shape exists for.
+    ctx.builder.if_void_hinted(HINT_GROUP_MEM, HINT_LIKELY);
     ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
     ctx.builder.get_local(address_local);
     ctx.builder.add_i32();
@@ -920,7 +931,9 @@ fn gen_fastmem_read(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    // Page fault out of a guest memory access: cold by construction.
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
 
     ctx.builder.get_local(&entry_local);
     ctx.builder.const_i32(!0xFFF);
@@ -1010,7 +1023,8 @@ fn gen_fastmem_read_split(
     ctx.builder.sub_i32();
     ctx.builder.const_i32((r1_top - LOW_MEM_END) as i32);
     ctx.builder.gtu_i32();
-    ctx.builder.br_if(try_next);
+    // Range-1 miss (below-guard HEAP/image data is the hot case).
+    ctx.builder.br_if_hinted(try_next, HINT_GROUP_MEM, HINT_UNLIKELY);
     ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
     ctx.builder.get_local(address_local);
     ctx.builder.add_i32();
@@ -1024,7 +1038,8 @@ fn gen_fastmem_read_split(
         ctx.builder.sub_i32();
         ctx.builder.const_i32(r2_span as i32);
         ctx.builder.gtu_i32();
-        ctx.builder.br_if(slow);
+        // Range-2 miss ⇒ the universal slow helper.
+        ctx.builder.br_if_hinted(slow, HINT_GROUP_MEM, HINT_UNLIKELY);
         ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
         ctx.builder.get_local(address_local);
         ctx.builder.add_i32();
@@ -1073,7 +1088,9 @@ fn gen_fastmem_read_split(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    // Page fault out of a guest memory access: cold by construction.
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
 
     // TLB entries fold mem8 in: (entry & ~0xFFF) ^ addr is a wasm-memory offset.
     ctx.builder.get_local(&entry_local);
@@ -1158,7 +1175,8 @@ pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal
     ctx.builder.const_i32(TLB_VALID as i32);
     ctx.builder.eq_i32();
 
-    ctx.builder.br_if(cont);
+    // TLB hit; the fall-through calls get_phys_eip_slow_jit.
+    ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
 
     if cfg!(feature = "profiler") {
         ctx.builder.get_local(&address_local);
@@ -1183,7 +1201,9 @@ pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    // Page fault out of a guest memory access: cold by construction.
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
 
     ctx.builder.block_end();
 
@@ -1285,7 +1305,9 @@ fn gen_fastmem_write_map(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    // Page fault out of a guest memory access: cold by construction.
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
 
     // Helper returned a TLB-style entry: (entry & ~0xFFF) ^ addr is the store offset.
     ctx.builder.get_local(&entry_local);
@@ -1378,7 +1400,8 @@ fn gen_safe_write(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(cont);
+    // TLB hit; the fall-through calls safe_write*_slow_jit.
+    ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
 
     if cfg!(feature = "profiler") {
         ctx.builder.get_local(&address_local);
@@ -1430,7 +1453,9 @@ fn gen_safe_write(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    // Page fault out of a guest memory access: cold by construction.
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
 
     ctx.builder.block_end();
 
@@ -1606,7 +1631,9 @@ fn gen_push32_coalesced_write(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    // Page fault out of a guest memory access: cold by construction.
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
     gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_WRITE_FAST);
     gen_write32_with_entry(ctx, address_local, &entry_local, value_local);
     ctx.builder.br(done);
@@ -1677,7 +1704,8 @@ pub fn gen_safe_read_write(
 
     let can_use_fast_path_local = ctx.builder.tee_new_local();
 
-    ctx.builder.br_if(cont);
+    // TLB hit; the fall-through calls safe_read_write*_slow_jit.
+    ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
 
     if cfg!(feature = "profiler") {
         ctx.builder.get_local(&address_local);
@@ -1720,7 +1748,9 @@ pub fn gen_safe_read_write(
         ctx.builder.and_i32();
     }
 
-    ctx.builder.br_if(ctx.exit_with_fault_label);
+    // Page fault out of a guest memory access: cold by construction.
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
 
     ctx.builder.block_end();
 
@@ -3374,7 +3404,8 @@ pub fn gen_x87_local_cache_free_all(ctx: &mut JitContext) {
 fn gen_fpu_relaxed_st_ok(ctx: &mut JitContext, i: u32, addr: &WasmLocal) {
     if let Some((_bits, valid)) = gen_x87_local_slot(ctx, i) {
         ctx.builder.get_local(&valid);
-        ctx.builder.if_i32();
+        // Cache hit avoids re-reading the tag word; the fallback is the cold side.
+        ctx.builder.if_i32_hinted(HINT_GROUP_X87, HINT_LIKELY);
         ctx.builder.const_i32(1);
         ctx.builder.else_();
         gen_fpu_relaxed_tag_ok(ctx, addr);
