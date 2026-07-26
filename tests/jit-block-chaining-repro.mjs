@@ -78,7 +78,9 @@ function run()
             resolve({
                 status,
                 ecx: cpu.reg32[1] >>> 0,
-                chaining: cpu.get_jit_config ? cpu.get_jit_config(4) >>> 0 : 0,
+                // idx 12 = RET dynamic chaining. get_jit_config returns 0 for unknown indices,
+                // so reading a retired index silently disables the assertion below.
+                chaining: cpu.get_jit_config ? cpu.get_jit_config(12) >>> 0 : 0,
                 reentry: dget ? dget(1) : 0,
                 chainableFallback: dget ? dget(2) : 0,
                 chainedEdge: dget ? dget(5) : 0,
@@ -124,7 +126,9 @@ if(result.chaining)
     }
 }
 else {
-    console.log("SKIP effectiveness: WebAssembly tail-call support unavailable");
+    // Dormant by construction: this test never enables idx 12. The RET dynamic-chaining path
+    // is covered by jit-alive-repro.mjs, which enables it and asserts RET_CHAIN_HIT > 0.
+    console.log("SKIP effectiveness: RET chaining (idx 12) not enabled in this run");
 }
 
 process.exit(0);
