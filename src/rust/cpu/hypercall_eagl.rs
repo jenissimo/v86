@@ -35,7 +35,12 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
         // 132 = state-token dispatcher (FUN_005c97cb): classes 1/2/8 plus
         // class-6 shader batches — the guest filter routes everything else
         // (and class-6 record mode) to the original.
-        132 => handle_eagl_token_dispatch(),
+        132 => {
+            EAGL_TOK_ENTER += 1;
+            let handled = handle_eagl_token_dispatch();
+            if handled { EAGL_TOK_HANDLED += 1 } else { EAGL_TOK_DECLINE += 1 }
+            handled
+        },
         _ => false,
     }
 }
@@ -442,6 +447,24 @@ unsafe fn eagl_token_cfg_refresh(cfg: i32) -> Result<(), ()> {
     Ok(())
 }
 
+// Boundary-crossing census for handler 132. The guest filter routes per TOKEN, so the fast
+// path pays one OUT trap per crossing; without the count the per-crossing overhead is
+// unanswerable. `skip` is the crossings that did no work beyond the shadow compare — the
+// clearest candidate for batching.
+static mut EAGL_TOK_ENTER: u64 = 0;
+static mut EAGL_TOK_HANDLED: u64 = 0;
+static mut EAGL_TOK_DECLINE: u64 = 0;
+static mut EAGL_TOK_SKIP: u64 = 0;
+
+#[no_mangle]
+pub fn eagl_token_enter_count() -> f64 { unsafe { EAGL_TOK_ENTER as f64 } }
+#[no_mangle]
+pub fn eagl_token_handled_count() -> f64 { unsafe { EAGL_TOK_HANDLED as f64 } }
+#[no_mangle]
+pub fn eagl_token_decline_count() -> f64 { unsafe { EAGL_TOK_DECLINE as f64 } }
+#[no_mangle]
+pub fn eagl_token_skip_count() -> f64 { unsafe { EAGL_TOK_SKIP as f64 } }
+
 unsafe fn handle_eagl_token_dispatch() -> bool {
     let cfg = *(hp_ptr().add(OFF_HC_EAGL_TOKEN_CFG_PTR) as *const u32) as i32;
     if cfg == 0 {
@@ -550,6 +573,7 @@ unsafe fn eagl_dispatch_simple(
             let cur = match safe_read32s(slot_addr) { Ok(v) => v, Err(_) => return false };
             if cur == value {
                 // Redundant set: bump the skip counter, EAX = D3D_OK.
+                EAGL_TOK_SKIP += 1;
                 if skip_addr != 0 {
                     let cnt = match safe_read32s(skip_addr) { Ok(v) => v, Err(_) => return false };
                     if safe_write32(skip_addr, cnt.wrapping_add(1)).is_err() { return false; }
