@@ -1807,15 +1807,41 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
     // module is captured when its ENTRY page is in the set (start>>>12).
     // Read/clear `out` from the harness; bytes are copied (the builder's
     // output buffer is reused for the next compilation).
+    // How much work the JIT actually did — the low-noise denominator for anything that REMOVES
+    // compilation (AOT units, a warm-start cache): module count and emitted bytes are
+    // insensitive to the scene, unlike FPS, and need no cache wipe to observe.
+    const compileStats = globalThis["__jitCompileStats"];
+    if(compileStats)
+    {
+        compileStats["count"] = (compileStats["count"] | 0) + 1;
+        compileStats["bytes"] = (compileStats["bytes"] | 0) + len;
+    }
+
     const wasmDump = globalThis["__wasmDump"];
     if(wasmDump && wasmDump["pages"] && wasmDump["pages"].has(start >>> 12))
     {
-        (wasmDump["out"] || (wasmDump["out"] = [])).push({
+        const rec = {
             "start": start >>> 0,
             "table_index": wasm_table_index,
             "len": len,
             "bytes": code.slice(),
-        });
+        };
+        const out = wasmDump["out"] || (wasmDump["out"] = []);
+        // A hot page is recompiled every time tier-2 promotes and frees it, so an
+        // append-only capture grows without bound (a full byte copy per recompile, and
+        // modules run to hundreds of KB). Consumers that only want the CURRENT module for
+        // a page set keepLatestPerPage and get one record each; the default stays
+        // append-only for callers that inspect every generated module.
+        if(wasmDump["keepLatestPerPage"])
+        {
+            const page = start >>> 12;
+            const i = out.findIndex(r => (r["start"] >>> 12) === page);
+            if(i >= 0) { out[i] = rec; } else { out.push(rec); }
+        }
+        else
+        {
+            out.push(rec);
+        }
     }
 
     if(DEBUG)
@@ -1888,12 +1914,21 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         }
     });
 
+    // ALWAYS report a failed compile/instantiate, not only in DEBUG. Nothing on the Rust side
+    // observes this rejection: codegen_finalize_finished is what releases JitState's single
+    // in-flight `compiling` slot, so a module that never instantiates wedges that slot and
+    // jit_increase_hotness_and_maybe_compile returns early forever — the JIT is dead for the
+    // life of the instance while the guest keeps running, interpreted and silent.
+    result.catch(e => {
+        console.error("[v86] JIT module failed to instantiate — the JIT is now wedged " +
+                      "(the in-flight compile slot is never released). start=" + h(start >>> 0) +
+                      " table_index=" + wasm_table_index + " len=" + len, e);
+    });
+
     if(DEBUG)
     {
         result.catch(e => {
-            console.log(e);
             debugger;
-            throw e;
         });
     }
 };

@@ -76,6 +76,10 @@ static mut JIT_USE_LOOP_SAFETY: bool = true;
 // exiting to main_loop. Gated at COMPILE time — toggle via
 // set_jit_config(12) and clear the JIT cache.
 static mut JIT_RET_CHAINING: bool = false;
+// Count CHAINED module entries toward tier-2 hotness (idx 20, default ON). Pure accounting:
+// it changes no emitted code, so both arms run identical modules and switching needs no
+// cache clear — which is what separates idx 12's CODE effect from its COUNTER effect.
+static mut JIT_CHAIN_TIER2_ACCOUNTING: bool = true;
 // RET-target speculation (superblock lite): annotate the RET of a
 // small module-local leaf with its call sites' return addresses and emit inline
 // eip-compare + direct dispatcher re-entry, skipping the jit_find_cache_entry_in_page
@@ -146,6 +150,18 @@ static mut JIT_FASTMEM_READ_SPLIT: bool = true;
 const TIER2_PAGE_SET_CAP: usize = 256;
 static mut MODULE_EXEC_COUNTS: [u32; 0x10000] = [0; 0x10000];
 
+// Per-module entry count for the SLOT'S CURRENT LIFE (reset when the index is freed),
+// unlike MODULE_EXEC_COUNTS which tier-2 zeroes on promotion. It weights a per-slot V8
+// tier sample (dbg.jitTierStats) by execution, turning "how many modules are in baseline"
+// into "what share of EXECUTION never reaches the optimizing tier". Reset-on-free is what
+// lets the sampler detect slot recycling: a negative delta means a different module.
+static mut MODULE_ENTRY_TOTALS: [u32; 0x10000] = [0; 0x10000];
+
+#[no_mangle]
+pub fn jit_get_module_entry_total(wasm_table_index: u32) -> u32 {
+    unsafe { MODULE_ENTRY_TOTALS[(wasm_table_index & 0xFFFF) as usize] }
+}
+
 // Tier-2 observability (read via dbg.tier2Stats()): without these there is no way to
 // tell "promotions landed" apart from "promotions starved by the page-set cap" — the
 // exact ambiguity that made the in-race B3 A/B unreadable (threshold changes showed
@@ -165,6 +181,13 @@ pub fn jit_get_tier2_promotions() -> u32 {
 pub fn jit_get_tier2_blocked_by_cap() -> u32 {
     unsafe { TIER2_BLOCKED_BY_CAP }
 }
+/// Distinct pages the cap refused (see `tier2_blocked_pages`). Read against the refusal
+/// count: distinct << count means a few hot modules retry, distinct ~ count means the
+/// hot set genuinely outgrew TIER2_PAGE_SET_CAP.
+#[no_mangle]
+pub fn jit_get_tier2_blocked_distinct() -> u32 {
+    get_jit_state().tier2_blocked_pages.len() as u32
+}
 /// i-th tier-2 page address (page<<12), 0 when i >= count. Iteration order is the
 /// HashSet's (arbitrary but stable between mutations) — callers use this to feed
 /// trace2_watch_page with known-hot pages (tier-2 membership == crossed the re-entry
@@ -179,11 +202,20 @@ pub fn jit_get_tier2_page_at(i: u32) -> u32 {
     }
 }
 
-/// Called from cycle_internal on every compiled-module entry. Returns true when the
-/// module was just promoted to tier-2 AND freed — the caller must not dispatch into it
-/// (run interpreted this slice; hotness recompiles it with the tier-2 budget).
-#[no_mangle]
-pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
+/// Bump the entry counters for one module entry. Returns true when THIS entry crossed the
+/// tier-2 threshold (and consumes the crossing by resetting the promotion counter).
+///
+/// Split out of `jit_tier2_note_execution` so a caller that cannot safely promote — a
+/// chained edge, which runs inside a live generated frame — can still do the ACCOUNTING,
+/// which is all a chained edge owes. Touches nothing but two plain static arrays: no
+/// JitState lock, no allocation, no map walk. That matters because the chain path is the
+/// hottest dispatch path in the JIT.
+#[inline]
+fn tier2_count_entry(wasm_table_index: u16) -> bool {
+    unsafe {
+        let t = &mut (*std::ptr::addr_of_mut!(MODULE_ENTRY_TOTALS))[wasm_table_index as usize];
+        *t = t.wrapping_add(1);
+    }
     let threshold = unsafe { JIT_TIER2_THRESHOLD };
     if threshold == 0 {
         return false;
@@ -197,7 +229,17 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
         return false;
     }
     unsafe { MODULE_EXEC_COUNTS[wasm_table_index as usize] = 0 };
+    true
+}
 
+/// Promote a module's pages to tier-2 and free the module so hotness recompiles it with the
+/// tier-2 budget. Returns true when the module was actually freed.
+///
+/// CONTRACT: no generated frame for `wasm_table_index` (or any module it shares pages with)
+/// may be live — this nulls table slots, clears dispatch meta and drops the TLB HAS_CODE
+/// bit. Only two call sites satisfy that: `jit_tier2_note_execution` (cycle_internal,
+/// BETWEEN module entries) and `jit_tier2_drain_pending` (same, before dispatch).
+fn tier2_promote(wasm_table_index: u16) -> bool {
     let mut ctx = get_jit_state();
     let index = WasmTableIndex(wasm_table_index);
     let pages: Vec<Page> = ctx
@@ -215,15 +257,94 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
     }
     if ctx.tier2_pages.len() + pages.len() > TIER2_PAGE_SET_CAP {
         unsafe { TIER2_BLOCKED_BY_CAP += 1 };
+        for p in &pages {
+            if !ctx.tier2_pages.contains(p) {
+                ctx.tier2_blocked_pages.insert(*p);
+            }
+        }
         return false;
     }
     for p in &pages {
         ctx.tier2_pages.insert(*p);
+        // A page that got in is no longer starved — otherwise the set reports a lifetime
+        // tally instead of what is currently being refused, and only ever grows.
+        ctx.tier2_blocked_pages.remove(p);
     }
     unsafe { TIER2_PROMOTIONS += 1 };
     free_wasm_module_tree(&mut ctx, index);
     true
 }
+
+/// Called from cycle_internal on every compiled-module entry. Returns true when the
+/// module was just promoted to tier-2 AND freed — the caller must not dispatch into it
+/// (run interpreted this slice; hotness recompiles it with the tier-2 budget).
+#[no_mangle]
+pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
+    unsafe { TIER2_DIRECT_ENTRIES += 1 };
+    tier2_count_entry(wasm_table_index) && tier2_promote(wasm_table_index)
+}
+
+// Entry-event census, split by the path the entry arrived on. RET chaining (idx 12) changes
+// both the emitted CODE and the hotness COUNTER; the share chain/(chain+direct) is what makes
+// the two separable.
+static mut TIER2_CHAIN_ENTRIES: u64 = 0;
+static mut TIER2_DIRECT_ENTRIES: u64 = 0;
+
+#[no_mangle]
+pub fn jit_get_tier2_chain_entries() -> f64 { unsafe { TIER2_CHAIN_ENTRIES as f64 } }
+#[no_mangle]
+pub fn jit_get_tier2_direct_entries() -> f64 { unsafe { TIER2_DIRECT_ENTRIES as f64 } }
+
+// Promotions owed to CHAINED entries. A chained edge is counted where it happens (see
+// chain_note_execution) but promoted here, because the counting site runs inside a live
+// generated frame and tier2_promote's contract forbids that.
+//
+// Bounded and lossy on purpose: overflow only delays a promotion to the module's next
+// threshold crossing, so the cap costs accuracy, never correctness — and a static array
+// keeps the enqueue allocation-free.
+const TIER2_PENDING_CAP: usize = 64;
+static mut TIER2_PENDING: [u16; TIER2_PENDING_CAP] = [0; TIER2_PENDING_CAP];
+static mut TIER2_PENDING_LEN: u32 = 0;
+static mut TIER2_PENDING_DROPPED: u32 = 0;
+
+/// Queued chain promotions that were dropped because the queue was full. Nonzero means
+/// some promotions slipped to a later crossing — visible rather than mysterious.
+#[no_mangle]
+pub fn jit_get_tier2_pending_dropped() -> u32 { unsafe { TIER2_PENDING_DROPPED } }
+
+/// Drop every queued promotion naming `idx`. Called when the slot is freed: the queue holds
+/// slot numbers, not module identities, so a stale entry would promote the slot's next owner.
+fn tier2_pending_drop(idx: u16) {
+    unsafe {
+        let n = TIER2_PENDING_LEN as usize;
+        let mut w = 0usize;
+        for r in 0..n {
+            if TIER2_PENDING[r] != idx {
+                TIER2_PENDING[w] = TIER2_PENDING[r];
+                w += 1;
+            }
+        }
+        TIER2_PENDING_LEN = w as u32;
+    }
+}
+
+/// Apply the promotions queued by chained entries.
+///
+/// MUST be called only from cycle_internal, i.e. between module entries: it is the same
+/// safe point `jit_tier2_note_execution` already promotes at. Near-free when idle (one
+/// static load and a branch), which is why it can sit on the per-block path.
+#[no_mangle]
+pub fn jit_tier2_drain_pending() {
+    let n = unsafe { TIER2_PENDING_LEN } as usize;
+    if n == 0 {
+        return;
+    }
+    unsafe { TIER2_PENDING_LEN = 0 };
+    for i in 0..n {
+        tier2_promote(unsafe { TIER2_PENDING[i] });
+    }
+}
+
 static mut JIT_DEAD_FLAG_ELISION: bool = false;
 static mut JIT_FASTMEM_READS: bool = false;
 static mut JIT_X87_LOCALS: bool = false;
@@ -930,6 +1051,10 @@ struct JitState {
     // Survives jit_clear_cache (the pages are still the hot ones); dies with the wasm
     // instance (per game load).
     tier2_pages: HashSet<Page>,
+    // Pages a promotion wanted and the cap refused. The refusal COUNT cannot distinguish
+    // "one hot module retrying forever" from "hundreds of distinct pages starved", and those
+    // two want opposite fixes — a bigger cap versus a replacement policy.
+    tier2_blocked_pages: HashSet<Page>,
     #[cfg(debug_assertions)]
     wasm_table_index_to_page: HashMap<WasmTableIndex, HashSet<Page>>,
 }
@@ -1021,6 +1146,7 @@ impl JitState {
             wasm_table_index_free_list: Vec::from_iter(wasm_table_indices),
             compiling: None,
             tier2_pages: HashSet::new(),
+            tier2_blocked_pages: HashSet::new(),
 
             #[cfg(debug_assertions)]
             wasm_table_index_to_page: HashMap::new(),
@@ -1478,6 +1604,45 @@ pub fn jit_find_cache_entry_in_page(
     return -1;
 }
 
+/// Account a CHAINED module entry.
+///
+/// A chained edge jumps module→module without passing through `cycle_internal`, the only
+/// place `jit_tier2_note_execution` runs — so without this a large share of module entries is
+/// invisible to hotness accounting and to `MODULE_ENTRY_TOTALS`.
+///
+/// Counted here, but only counted: promotion is QUEUED for `jit_tier2_drain_pending`, because
+/// this runs inside a live generated frame and promotion frees the module tree, which
+/// `tier2_promote`'s contract forbids. Deferring costs at most one cycle slice against a
+/// threshold of hundreds of thousands of entries and leaves the edge itself untouched — the
+/// target module is still valid and installed.
+#[inline]
+unsafe fn chain_note_execution(packed: i32) {
+    let idx = (packed >> 16) - cpu::WASM_TABLE_OFFSET as i32;
+    if idx < 0 || idx > u16::MAX as i32 {
+        return;
+    }
+    TIER2_CHAIN_ENTRIES += 1;
+    if !JIT_CHAIN_TIER2_ACCOUNTING {
+        return;
+    }
+    let idx = idx as u16;
+    if !tier2_count_entry(idx) {
+        return;
+    }
+    let len = TIER2_PENDING_LEN as usize;
+    if len >= TIER2_PENDING_CAP {
+        TIER2_PENDING_DROPPED += 1;
+        return;
+    }
+    // A module can cross the threshold twice before a drain; promoting it twice would walk
+    // (and free) an index that is no longer its own.
+    if TIER2_PENDING[..len].contains(&idx) {
+        return;
+    }
+    TIER2_PENDING[len] = idx;
+    TIER2_PENDING_LEN += 1;
+}
+
 /// RET/AbsoluteEip dynamic chaining: budget-guarded tlb_code lookup at the runtime eip,
 /// returning the packed (table_slot << 16 | unit_state) target convention, with its own
 /// RET_CHAIN_HIT/RET_CHAIN_MISS stats.
@@ -1512,6 +1677,7 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
         if dispatch_stats_enabled() {
             profiler::stat_increment_always(stat::RET_CHAIN_HIT);
         }
+        chain_note_execution(cached.2);
         return cached.2;
     }
 
@@ -1535,6 +1701,7 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
                 dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
             let packed = table_slot << 16 | unit_state as i32;
             RET_CACHE[cache_idx] = (virt_address, raw_state_flags, packed, RET_CACHE_EPOCH);
+            chain_note_execution(packed);
             return packed;
         }
     }
@@ -2532,6 +2699,223 @@ pub fn codegen_finalize_finished(
     }
 
     check_jit_state_invariants(&mut ctx);
+}
+
+// ─── AOT units (MS-A stage 1) ────────────────────────────────────────────────
+//
+// An AOT unit PRETENDS TO BE A JIT MODULE: it is published into exactly the structures
+// codegen_finalize_finished publishes into, so dispatch, tier-2, SMC invalidation
+// (jit_dirty_page via the TLB HAS_CODE bit) and free_wasm_table_index all treat it like
+// any other module. Only the SOURCE OF THE MODULE BYTES differs — which is the whole
+// design principle of the track (ms-aot-design.md §4.1).
+//
+// The caller (JS) owns instantiation: it compiles the bytes with the SAME `jit_imports`
+// object the live path uses, writes the exported `f` into wasm_table[index + 1024], and
+// only then registers here. Content binding (§5.1 — the sha of the page AFTER relocation,
+// IAT patching and hle-lib patches) is verified caller-side against guest memory, which
+// keeps the Rust surface at what the RFC asked for: registration, nothing else.
+//
+// Entry points are pushed one at a time rather than read out of a guest buffer, so this
+// path never parses caller memory.
+static mut AOT_PENDING_ENTRIES: Option<Vec<(u16, u16)>> = None;
+
+fn aot_pending() -> &'static mut Vec<(u16, u16)> {
+    unsafe {
+        let slot = &mut *std::ptr::addr_of_mut!(AOT_PENDING_ENTRIES);
+        slot.get_or_insert_with(Vec::new)
+    }
+}
+
+#[no_mangle]
+pub fn jit_aot_entry_reset() { aot_pending().clear(); }
+
+#[no_mangle]
+pub fn jit_aot_entry_push(page_offset: u32, initial_state: u32) {
+    aot_pending().push((page_offset as u16, initial_state as u16));
+}
+
+/// Take a free wasm table slot for an AOT unit. Unlike the compile path this NEVER clears
+/// the JIT cache to make room — an AOT registration is best-effort and must not perturb
+/// live modules. 0xFFFF = no slot free.
+#[no_mangle]
+pub fn jit_aot_alloc_table_index() -> u32 {
+    let mut ctx = get_jit_state();
+    match ctx.wasm_table_index_free_list.pop() {
+        Some(i) => i.to_u16() as u32,
+        None => 0xFFFF,
+    }
+}
+
+/// Hand a slot back when the caller could not instantiate the module after all.
+#[no_mangle]
+pub fn jit_aot_free_table_index(wasm_table_index: u32) {
+    // Reject out of range rather than truncating to u16: the 0xFFFF "no index" sentinel
+    // truncated into the free list would be handed to a compile, which then indexes the
+    // wasm table far past its end.
+    if wasm_table_index == 0 || wasm_table_index >= WASM_TABLE_SIZE as u32 {
+        return;
+    }
+    let mut ctx = get_jit_state();
+    let idx = WasmTableIndex(wasm_table_index as u16);
+    if !ctx.wasm_table_index_free_list.contains(&idx) {
+        ctx.wasm_table_index_free_list.push(idx);
+    }
+}
+
+/// Publish an already-instantiated AOT unit for one physical page.
+/// Returns 0 on success, else a refusal code: 1 = bad index, 2 = page already has a
+/// module (the live JIT owns it — never steal it), 3 = no entry points pushed.
+#[no_mangle]
+pub fn jit_register_aot_module(wasm_table_index: u32, phys_addr: u32, state_flags: u32) -> u32 {
+    let mut ctx = get_jit_state();
+    let index = WasmTableIndex(wasm_table_index as u16);
+    if wasm_table_index == 0 || wasm_table_index >= 0xFFFF {
+        return 1;
+    }
+    let page = Page::page_of(phys_addr);
+    if ctx.pages.contains_key(&page) {
+        return 2;
+    }
+    let entry_points = aot_pending().clone();
+    if entry_points.is_empty() {
+        return 3;
+    }
+    let state_flags = CachedStateFlags::of_u32(state_flags);
+
+    // Deliberately NO eager TLB sweep here, unlike codegen_finalize_finished. That sweep
+    // stamps dispatch meta for every virtual page currently mapped to this physical page,
+    // which is only sound because compilation just happened under the CURRENT mapping. An AOT
+    // unit is published at an arbitrary later moment (at boot the TLB still holds the loader's
+    // transient mappings), so stamping blindly would hand a virtual page a module compiled for
+    // a different one — dispatch into code that never belonged there.
+    //
+    // Publishing only into ctx.pages is enough: update_tlb_code stamps a page lazily when the
+    // TLB entry for it is (re)built. The cost is that a page already in the TLB is not served
+    // by its unit until that entry is refreshed — a missed speedup, never a wrong dispatch.
+    ctx.pages.insert(
+        page,
+        PageInfo {
+            wasm_table_index: index,
+            hidden_wasm_table_indices: vec![],
+            entry_points,
+            state_flags,
+        },
+    );
+
+    // Mark the page tier-2, or the unit lives exactly ONE promotion threshold and then deletes
+    // itself: tier2_promote frees any module whose pages are not all in tier2_pages, and that
+    // set starts empty every boot. This restores a fact rather than asserting a new one — a
+    // unit is captured only AFTER its page was promoted, so the page IS tier-2 by construction.
+    //
+    // The cap is still honored (it is the compile-storm guard); refusals are counted so a
+    // starved registration is visible rather than mysterious.
+    if ctx.tier2_pages.len() < TIER2_PAGE_SET_CAP {
+        ctx.tier2_pages.insert(page);
+        ctx.tier2_blocked_pages.remove(&page);
+    }
+    else {
+        unsafe { AOT_TIER2_BLOCKED_BY_CAP += 1 };
+        ctx.tier2_blocked_pages.insert(page);
+    }
+
+    unsafe { AOT_REGISTERED += 1 };
+    check_jit_state_invariants(&mut ctx);
+    0
+}
+
+static mut AOT_TIER2_BLOCKED_BY_CAP: u32 = 0;
+
+/// Registrations that could not mark their page tier-2 because the page-set cap was full.
+/// Nonzero means some units will still be evicted at their first promotion.
+#[no_mangle]
+pub fn jit_aot_tier2_blocked_count() -> u32 { unsafe { AOT_TIER2_BLOCKED_BY_CAP } }
+
+/// Drop every TLB entry so the next access to a registered page rebuilds it — and
+/// `update_tlb_code` then stamps dispatch meta FROM `ctx.pages`, i.e. correct by
+/// construction.
+///
+/// Both obvious alternatives are wrong. Stamping eagerly at registration (what the compile
+/// path does) hands a virtual page a module compiled for a different one, since an AOT unit is
+/// published long after the mapping it was built under. Not stamping at all is worse in a
+/// quieter way: a page already in the TLB never gets meta, so dispatch never enters the unit
+/// while `ctx.pages` still names it the page's owner — the JIT will not compile it either, and
+/// the guest runs that code INTERPRETED.
+///
+/// Call once after a batch of registrations, not per unit.
+#[no_mangle]
+pub fn jit_aot_flush_tlb() { unsafe { cpu::full_clear_tlb() } }
+
+static mut AOT_REGISTERED: u32 = 0;
+
+#[no_mangle]
+pub fn jit_aot_registered_count() -> u32 { unsafe { AOT_REGISTERED } }
+
+// Readback of a live page's publication record — this is what lets a RECORDING pass
+// capture what a replay pass must reproduce (entry points are computed in Rust and are
+// otherwise invisible to the JS side that owns the module bytes).
+#[no_mangle]
+pub fn jit_aot_page_table_index(phys_addr: u32) -> u32 {
+    match get_jit_state().pages.get(&Page::page_of(phys_addr)) {
+        Some(info) => info.wasm_table_index.to_u16() as u32,
+        None => 0xFFFF,
+    }
+}
+
+#[no_mangle]
+pub fn jit_aot_page_state_flags(phys_addr: u32) -> u32 {
+    match get_jit_state().pages.get(&Page::page_of(phys_addr)) {
+        Some(info) => info.state_flags.to_u32(),
+        None => 0xFFFF_FFFF,
+    }
+}
+
+// A compiled module usually spans SEVERAL pages (MAX_PAGES), and every one of them is
+// published with its own entry-point list pointing at the same table index. Capturing only
+// the entry page would leave the rest to be recompiled separately — two modules covering
+// overlapping code. These two let the caller enumerate a module's full page set.
+#[no_mangle]
+pub fn jit_aot_module_page_count(wasm_table_index: u32) -> u32 {
+    let idx = WasmTableIndex(wasm_table_index as u16);
+    get_jit_state()
+        .pages
+        .iter()
+        .filter(|(_, info)| info.wasm_table_index == idx)
+        .count() as u32
+}
+
+/// n-th page address of the module in `wasm_table_index`; 0xFFFF_FFFF when out of range.
+#[no_mangle]
+pub fn jit_aot_module_page_at(wasm_table_index: u32, n: u32) -> u32 {
+    let idx = WasmTableIndex(wasm_table_index as u16);
+    match get_jit_state()
+        .pages
+        .iter()
+        .filter(|(_, info)| info.wasm_table_index == idx)
+        .nth(n as usize)
+    {
+        Some((page, _)) => page.to_address(),
+        None => 0xFFFF_FFFF,
+    }
+}
+
+#[no_mangle]
+pub fn jit_aot_page_entry_count(phys_addr: u32) -> u32 {
+    match get_jit_state().pages.get(&Page::page_of(phys_addr)) {
+        Some(info) => info.entry_points.len() as u32,
+        None => 0,
+    }
+}
+
+/// i-th entry point as (page_offset << 16) | initial_state; 0xFFFF_FFFF when out of range.
+#[no_mangle]
+pub fn jit_aot_page_entry_at(phys_addr: u32, i: u32) -> u32 {
+    match get_jit_state().pages.get(&Page::page_of(phys_addr)) {
+        Some(info) => match info.entry_points.get(i as usize) {
+            Some(&(off, state)) => ((off as u32) << 16) | state as u32,
+            None => 0xFFFF_FFFF,
+        },
+        None => 0xFFFF_FFFF,
+    }
 }
 
 pub fn update_tlb_code(virt_page: Page, phys_page: Page) {
@@ -3850,6 +4234,10 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
     // reset the tier-2 execution counter for the recycled index (B3).
     ret_cache_invalidate_all();
     unsafe { MODULE_EXEC_COUNTS[wasm_table_index.to_u16() as usize] = 0 };
+    unsafe { MODULE_ENTRY_TOTALS[wasm_table_index.to_u16() as usize] = 0 };
+    // A queued promotion names a SLOT, and the slot is about to be recycled. Left in the
+    // queue it would promote — and free — whichever freshly compiled module lands here next.
+    tier2_pending_drop(wasm_table_index.to_u16());
 
     // It is not strictly necessary to clear the function, but it will fail more predictably if we
     // accidentally use the function and may garbage collect unused modules earlier
@@ -4211,6 +4599,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         17 => TIER2_MAX_PAGES = value,
         18 => JIT_FASTMEM_READ_SPLIT = value != 0,
         19 => JIT_FASTMEM_WRITES = value != 0,
+        20 => JIT_CHAIN_TIER2_ACCOUNTING = value != 0,
         21 => JIT_FLAG_LOCALS = value != 0,
         22 => JIT_BRANCH_HINTS = value,
         23 => JIT_BRANCH_HINT_OFFSET_FUZZ = value,
@@ -4240,6 +4629,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         17 => TIER2_MAX_PAGES,
         18 => JIT_FASTMEM_READ_SPLIT as u32,
         19 => JIT_FASTMEM_WRITES as u32,
+        20 => JIT_CHAIN_TIER2_ACCOUNTING as u32,
         21 => JIT_FLAG_LOCALS as u32,
         22 => JIT_BRANCH_HINTS,
         23 => JIT_BRANCH_HINT_OFFSET_FUZZ,

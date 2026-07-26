@@ -3096,6 +3096,14 @@ pub unsafe fn cycle_internal() {
     }
     let initial_state_flags = *state_flags;
 
+    // Tier-2 promotions owed to CHAINED module entries. They are counted inside a live
+    // generated frame (jit::chain_note_execution) but can only be APPLIED here, between
+    // module entries — the same safe point jit_tier2_note_execution promotes at below.
+    // Draining before the dispatch lookup means a module freed by the drain is already
+    // gone from dispatch meta when we look, so this slice runs interpreted with no extra
+    // check. No-op cost is one static load and a branch.
+    jit::jit_tier2_drain_pending();
+
     // DOD SoA lookup (jit::DISPATCH_META — no pointer chase). The old lookup-time
     // fastmem-generation deopt is gone: a stale unit self-deopts via its prologue
     // guard right after dispatch, one bounce, same observable behavior.
