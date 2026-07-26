@@ -166,6 +166,22 @@ pub enum stat {
     ABSEIP_DISPATCH,
     RET_CHAIN_HIT,
     RET_CHAIN_MISS,
+
+    // Shape-flag RUNTIME census (read via profiler_dispatch_stat_get 13-17, emitted only
+    // while jit::DISPATCH_STATS was on at compile time). The compile-site counters next to
+    // these flags answer "was the shape emitted"; only these answer "does it pay off",
+    // because both caches are bets that a later access finds the slot still valid.
+    //   X87_CACHE_HIT/FILL  — relaxed-x87 ST read served from the local vs re-read from
+    //                         fpu_st memory. FILL is the bet lost.
+    //   X87_CACHE_INVALIDATE— an executed invalidate-all (any x87/MMX op the wrappers do
+    //                         not keep coherent, incl. every TOP change).
+    //   PUSH_RUN_HIT/FILL   — push32 store that reused the previous push's TLB entry vs
+    //                         one that had to do the lookup and refill the cache.
+    X87_CACHE_HIT,
+    X87_CACHE_FILL,
+    X87_CACHE_INVALIDATE,
+    PUSH_RUN_HIT,
+    PUSH_RUN_FILL,
 }
 
 #[allow(non_upper_case_globals)]
@@ -234,6 +250,11 @@ pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
         10 => stat::ABSEIP_DISPATCH,
         11 => stat::RET_CHAIN_HIT,
         12 => stat::RET_CHAIN_MISS,
+        13 => stat::X87_CACHE_HIT,
+        14 => stat::X87_CACHE_FILL,
+        15 => stat::X87_CACHE_INVALIDATE,
+        16 => stat::PUSH_RUN_HIT,
+        17 => stat::PUSH_RUN_FILL,
         _ => return 0.0,
     };
     unsafe { stat_array[stat as usize] as f64 }

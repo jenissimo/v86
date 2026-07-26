@@ -1578,6 +1578,7 @@ fn gen_push32_coalesced_write(
     ctx.builder.and_i32();
     ctx.builder.if_void();
     crate::jit::push_run_note_reuse_branch_compiled();
+    gen_dispatch_stat_increment(ctx.builder, profiler::stat::PUSH_RUN_HIT);
     gen_write32_with_entry(ctx, address_local, &cache_entry, value_local);
     ctx.builder.br(done);
     ctx.builder.block_end();
@@ -1640,6 +1641,7 @@ fn gen_push32_coalesced_write(
 
     ctx.builder.block_end();
 
+    gen_dispatch_stat_increment(ctx.builder, profiler::stat::PUSH_RUN_FILL);
     ctx.builder.get_local(&page_local);
     ctx.builder.set_local(&cache_page);
     ctx.builder.get_local(&entry_local);
@@ -3386,6 +3388,7 @@ pub fn gen_x87_local_cache_invalidate_all_runtime(ctx: &mut JitContext) {
     }
 
     crate::jit::x87_locals_note_cache_invalidate_compiled();
+    gen_dispatch_stat_increment(ctx.builder, profiler::stat::X87_CACHE_INVALIDATE);
     for valid in valids {
         ctx.builder.const_i32(0);
         ctx.builder.set_local(&valid);
@@ -3404,8 +3407,11 @@ pub fn gen_x87_local_cache_free_all(ctx: &mut JitContext) {
 fn gen_fpu_relaxed_st_ok(ctx: &mut JitContext, i: u32, addr: &WasmLocal) {
     if let Some((_bits, valid)) = gen_x87_local_slot(ctx, i) {
         ctx.builder.get_local(&valid);
-        // Cache hit avoids re-reading the tag word; the fallback is the cold side.
-        ctx.builder.if_i32_hinted(HINT_GROUP_X87, HINT_LIKELY);
+        // UNLIKELY, not LIKELY: the slot cache is invalidated almost as often as it is read
+        // (x87LocalStats invalidatePerUse), so the hit side is the minority. An inverted hint is
+        // worse than none — it makes the optimizing tier lay out the cold side as fallthrough.
+        // Sole member of HINT_GROUP_X87 (bit1), which is not in the shipped mask.
+        ctx.builder.if_i32_hinted(HINT_GROUP_X87, HINT_UNLIKELY);
         ctx.builder.const_i32(1);
         ctx.builder.else_();
         gen_fpu_relaxed_tag_ok(ctx, addr);
@@ -3425,8 +3431,10 @@ fn gen_fpu_load_relaxed_st_bits(
         crate::jit::x87_locals_note_cache_load_site_compiled();
         ctx.builder.get_local(&valid);
         ctx.builder.if_i64();
+        gen_dispatch_stat_increment(ctx.builder, profiler::stat::X87_CACHE_HIT);
         ctx.builder.get_local_i64(&bits_cache);
         ctx.builder.else_();
+        gen_dispatch_stat_increment(ctx.builder, profiler::stat::X87_CACHE_FILL);
         ctx.builder.const_i32(1);
         ctx.builder.set_local(&valid);
         ctx.builder.get_local(addr);
