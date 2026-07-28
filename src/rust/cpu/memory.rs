@@ -48,6 +48,50 @@ pub unsafe fn zero_memory(addr: u32, size: u32) {
     ptr::write_bytes(mem8.offset(addr as isize), 0, size as usize);
 }
 
+// ── Out-of-guest raw-write detector ────────────────────────────────────────────
+// The `*_no_mmap_or_dirty_check` family writes through `mem8.offset(addr as isize)`
+// with NO range check. `addr` is a u32 cast to isize: for addr >= 0x8000_0000 the
+// offset goes NEGATIVE and the write lands BELOW mem8 — i.e. in the wasm module's own
+// statics (jit::DISPATCH_SLABS, DISPATCH_META, the fastmem map …). A zeroed slab cell
+// reads as dispatch state 0, so the guest re-enters a live module at its block 0 with
+// unrelated registers: the garbage-register AV class. Any hit here is a bug in a
+// CALLER that let guest-controlled state reach a raw write unvalidated.
+static mut OOB_WRITES: u32 = 0;
+// [addr, size, eip, value]
+static mut OOB_LAST: [u32; 4] = [0; 4];
+
+#[no_mangle]
+pub fn memory_get_oob_writes() -> u32 { unsafe { OOB_WRITES } }
+#[no_mangle]
+pub fn memory_get_oob_info(i: u32) -> u32 {
+    unsafe { *OOB_LAST.get(i as usize).unwrap_or(&0) }
+}
+
+/// Returns false ONLY for an address that cannot possibly be guest RAM and whose
+/// `as isize` cast goes negative — those writes land in the wasm module's own statics
+/// and are refused. Everything else out of range is COUNTED but still performed:
+/// an instrument must not silently change semantics on a path it was added to observe.
+#[inline(always)]
+unsafe fn check_in_guest(addr: u32, size: u32, value: i32) -> bool {
+    if addr < *memory_size && addr.wrapping_add(size) <= *memory_size {
+        return true;
+    }
+    OOB_WRITES = OOB_WRITES.wrapping_add(1);
+    OOB_LAST = [
+        addr,
+        size,
+        *crate::cpu::global_pointers::instruction_pointer as u32,
+        value as u32,
+    ];
+    dbg_log!(
+        "OOB-RAW-WRITE addr={:x} size={} eip={:x}",
+        addr,
+        size,
+        *crate::cpu::global_pointers::instruction_pointer
+    );
+    addr < 0x8000_0000
+}
+
 #[allow(non_upper_case_globals)]
 pub static mut vga_mem8: *mut u8 = ptr::null_mut();
 #[allow(non_upper_case_globals)]
@@ -193,6 +237,7 @@ pub unsafe fn write8(addr: u32, value: i32) {
 
 pub unsafe fn write8_no_mmap_or_dirty_check(addr: u32, value: i32) {
     crate::cpu::cpu::dbg_check_write(addr, 1, value & 0xFF);
+    if !check_in_guest(addr, 1, value) { return; }
     *mem8.offset(addr as isize) = value as u8
 }
 
@@ -208,6 +253,7 @@ pub unsafe fn write16(addr: u32, value: i32) {
 }
 pub unsafe fn write16_no_mmap_or_dirty_check(addr: u32, value: i32) {
     crate::cpu::cpu::dbg_check_write(addr, 2, value & 0xFFFF);
+    if !check_in_guest(addr, 2, value) { return; }
     ptr::write_unaligned(mem8.offset(addr as isize) as *mut u16, value as u16)
 }
 
@@ -224,18 +270,22 @@ pub unsafe fn write32(addr: u32, value: i32) {
 
 pub unsafe fn write32_no_mmap_or_dirty_check(addr: u32, value: i32) {
     crate::cpu::cpu::dbg_check_write(addr, 4, value);
+    if !check_in_guest(addr, 4, value) { return; }
     ptr::write_unaligned(mem8.offset(addr as isize) as *mut i32, value)
 }
 
 pub unsafe fn write64_no_mmap_or_dirty_check(addr: u32, value: u64) {
+    if !check_in_guest(addr, 8, value as i32) { return; }
     ptr::write_unaligned(mem8.offset(addr as isize) as *mut u64, value)
 }
 
 pub unsafe fn write128_no_mmap_or_dirty_check(addr: u32, value: reg128) {
+    if !check_in_guest(addr, 16, 0) { return; }
     ptr::write_unaligned(mem8.offset(addr as isize) as *mut reg128, value)
 }
 
 pub unsafe fn memset_no_mmap_or_dirty_check(addr: u32, value: u8, count: u32) {
+    if !check_in_guest(addr, count, value as i32) { return; }
     ptr::write_bytes(mem8.offset(addr as isize), value, count as usize);
 }
 

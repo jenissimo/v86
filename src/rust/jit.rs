@@ -128,6 +128,221 @@ static mut WASM_TABLE_INDEX_DOUBLE_FREE_SKIPPED: u32 = 0;
 #[no_mangle]
 pub fn jit_get_double_free_skipped() -> u32 { unsafe { WASM_TABLE_INDEX_DOUBLE_FREE_SKIPPED } }
 
+// ── Wrong-entry dispatch detector (diagnostic; House/BoD garbage-register hunt) ──
+// Every dispatch resolved through DISPATCH_META is re-verified against ctx.pages —
+// the authoritative publication record. A mismatch is a STALE/WRONG dispatch (the
+// silent wrong-entry class: the guest enters a valid-looking block with another call
+// site's registers). Mismatches are counted, their details latched, and the dispatch
+// REFUSED (interpreter/main-loop takes over) — so if this class is the crash, the
+// detector build both proves it (counter > 0) and survives.
+static mut WRONG_ENTRY_DIRECT: u32 = 0;
+static mut WRONG_ENTRY_CHAIN: u32 = 0;
+static mut RET_MEMO_MISMATCH: u32 = 0;
+// Stale memo hits split by whether the cached slot still names a LIVE module
+// (primary or hidden in ctx.pages). live = benign overwrite staleness (same guest
+// bytes, older module); dead/recycled = genuine wrong-code dispatch.
+static mut RET_MEMO_STALE_LIVE: u32 = 0;
+static mut RET_MEMO_STALE_DEAD: u32 = 0;
+// Wrong-entry detector mode (set_jit_config idx 24):
+// 0 = OFF (no verification — production default; the verify costs a lock + entry-list
+//     find per module entry), 1 = passive (verify + count, dispatch anyway),
+// 2 = refuse (verify + count, mismatches fall back to the interpreter/verified path).
+static mut WRONG_ENTRY_REFUSE: u32 = 0;
+// Ring of the first N mismatches, 4 u32 each:
+// [eip, phys, dispatched idx<<16|state, expected idx<<16|state] for wrong-entry records;
+// [eip, cached packed, fresh packed, 2 (tag)] for memo-mismatch records.
+const WRONG_ENTRY_RING_CAP: usize = 32;
+static mut WRONG_ENTRY_RING: [[u32; 4]; WRONG_ENTRY_RING_CAP] = [[0; 4]; WRONG_ENTRY_RING_CAP];
+static mut WRONG_ENTRY_RING_LEN: u32 = 0;
+// eip, phys, dispatched idx<<16|state, expected idx<<16|state
+static mut WRONG_ENTRY_LAST: [u32; 4] = [0; 4];
+
+fn wrong_entry_ring_push(rec: [u32; 4]) {
+    unsafe {
+        let len = WRONG_ENTRY_RING_LEN as usize;
+        if len < WRONG_ENTRY_RING_CAP {
+            WRONG_ENTRY_RING[len] = rec;
+            WRONG_ENTRY_RING_LEN += 1;
+        }
+    }
+}
+
+/// Read ring record field: i = record index, f = field 0..3. 0 when out of range.
+#[no_mangle]
+pub fn jit_get_wrong_entry_ring(i: u32, f: u32) -> u32 {
+    unsafe {
+        if (i as usize) < WRONG_ENTRY_RING_LEN as usize && f < 4 {
+            WRONG_ENTRY_RING[i as usize][f as usize]
+        }
+        else {
+            0
+        }
+    }
+}
+#[no_mangle]
+pub fn jit_get_wrong_entry_ring_len() -> u32 { unsafe { WRONG_ENTRY_RING_LEN } }
+
+/// Static layout probes: where the JIT's big statics live in linear memory, to check
+/// adjacency against externally-writable buffers (D3D9_ARENA & co).
+#[no_mangle]
+pub fn jit_get_dispatch_slabs_ptr() -> u32 {
+    unsafe { std::ptr::addr_of!(DISPATCH_SLABS) as u32 }
+}
+#[no_mangle]
+pub fn jit_get_dispatch_slabs_len() -> u32 { (DISPATCH_SLAB_COUNT * 0x1000 * 2) as u32 }
+#[no_mangle]
+pub fn jit_get_dispatch_meta_ptr() -> u32 {
+    unsafe { std::ptr::addr_of!(DISPATCH_META) as u32 }
+}
+
+/// Raw meta word for a virt page (diagnostic readback), split into two u32 halves.
+#[no_mangle]
+pub fn jit_debug_meta_lo(vpage: u32) -> u32 { dispatch_meta_get(vpage) as u32 }
+#[no_mangle]
+pub fn jit_debug_meta_hi(vpage: u32) -> u32 { (dispatch_meta_get(vpage) >> 32) as u32 }
+/// Raw slab cell for a virt page's slab at byte-offset `off` (diagnostic readback).
+#[no_mangle]
+pub fn jit_debug_slab_cell(vpage: u32, off: u32) -> u32 {
+    let meta = dispatch_meta_get(vpage);
+    if meta == 0 {
+        return 0xFFFF_FFFF;
+    }
+    let slab = (meta as u16) as usize;
+    if slab == 0 || slab >= DISPATCH_SLAB_COUNT || off >= 0x1000 {
+        return 0xFFFF_FFFF;
+    }
+    unsafe { DISPATCH_SLABS[slab * 0x1000 + off as usize] as u32 }
+}
+
+#[no_mangle]
+pub fn jit_get_wrong_entry_direct() -> u32 { unsafe { WRONG_ENTRY_DIRECT } }
+#[no_mangle]
+pub fn jit_get_wrong_entry_chain() -> u32 { unsafe { WRONG_ENTRY_CHAIN } }
+#[no_mangle]
+pub fn jit_get_ret_memo_mismatch() -> u32 { unsafe { RET_MEMO_MISMATCH } }
+#[no_mangle]
+pub fn jit_get_wrong_entry_info(i: u32) -> u32 {
+    unsafe { *WRONG_ENTRY_LAST.get(i as usize).unwrap_or(&0) }
+}
+#[no_mangle]
+pub fn jit_get_ret_memo_stale_live() -> u32 { unsafe { RET_MEMO_STALE_LIVE } }
+#[no_mangle]
+pub fn jit_get_ret_memo_stale_dead() -> u32 { unsafe { RET_MEMO_STALE_DEAD } }
+
+// Free-time meta audit: DISPATCH_META entries still referencing a slot at the moment
+// it is freed, split by why the TLB sweep missed them. Any nonzero count means a virt
+// page keeps dispatching into the freed (soon-recycled) slot.
+static mut STALE_META_AT_FREE: u32 = 0;
+static mut STALE_META_TLB_LIVE: u32 = 0; // tlb_data != 0 yet sweep missed it (?!)
+static mut STALE_META_TLB_DEAD: u32 = 0; // tlb_data == 0 — meta survived an eviction path
+
+#[no_mangle]
+pub fn jit_get_stale_meta_at_free() -> u32 { unsafe { STALE_META_AT_FREE } }
+#[no_mangle]
+pub fn jit_get_stale_meta_tlb_live() -> u32 { unsafe { STALE_META_TLB_LIVE } }
+#[no_mangle]
+pub fn jit_get_stale_meta_tlb_dead() -> u32 { unsafe { STALE_META_TLB_DEAD } }
+
+fn wrong_entry_refuse() -> bool { unsafe { WRONG_ENTRY_REFUSE >= 2 } }
+
+pub fn wrong_entry_verify_enabled() -> bool { unsafe { WRONG_ENTRY_REFUSE != 0 } }
+
+#[no_mangle]
+pub fn jit_wrong_entry_refuse_enabled() -> bool { wrong_entry_refuse() }
+
+/// Verify a meta-resolved dispatch target against ctx.pages. Returns true when they
+/// agree (dispatch may proceed). `virt` is only for the latched diagnostic record.
+pub fn jit_verify_dispatch_entry(
+    phys_addr: u32,
+    state_flags: CachedStateFlags,
+    wasm_table_index: u16,
+    initial_state: u16,
+    virt: u32,
+    chain: bool,
+) -> bool {
+    let entry = jit_find_cache_entry(phys_addr, state_flags);
+    if entry.wasm_table_index.to_u16() == wasm_table_index && entry.initial_state == initial_state
+    {
+        return true;
+    }
+    unsafe {
+        if chain {
+            WRONG_ENTRY_CHAIN += 1;
+        }
+        else {
+            WRONG_ENTRY_DIRECT += 1;
+        }
+        WRONG_ENTRY_LAST = [
+            virt,
+            phys_addr,
+            (wasm_table_index as u32) << 16 | initial_state as u32,
+            (entry.wasm_table_index.to_u16() as u32) << 16 | entry.initial_state as u32,
+        ];
+        wrong_entry_ring_push(WRONG_ENTRY_LAST);
+        // Capture the two disagreeing sources: the published SLAB for the virt page
+        // (tag 4) and ctx.pages' entry list for the phys page (tag 5) — first pairs
+        // of each, packed offset<<16|state.
+        let meta = dispatch_meta_get(virt >> 12);
+        if meta != 0 {
+            let slab = (meta as u16) as usize;
+            let mut pairs = [0u32; 2];
+            let mut n = 0;
+            for off in 0..0x1000usize {
+                let st = unsafe { DISPATCH_SLABS[slab * 0x1000 + off] };
+                if st != u16::MAX {
+                    if n < 2 {
+                        pairs[n] = (off as u32) << 16 | st as u32;
+                    }
+                    n += 1;
+                }
+            }
+            wrong_entry_ring_push([virt & !0xFFF | (n as u32 & 0xFFF), pairs[0], pairs[1], 4]);
+            // Is this slab SHARED? Scan every meta for the same slab id — sharing means
+            // a slab id was handed out twice (double free / free-stack corruption) and
+            // pages overwrite each other's dispatch tables.
+            let mut share = 0u32;
+            let mut others = [0u32; 2];
+            for p in 0..(1usize << 20) {
+                let m = unsafe { DISPATCH_META[p] };
+                if m != 0 && (m as u16) as usize == slab {
+                    if (p as u32) != virt >> 12 && (share as usize) < 2 {
+                        others[share as usize] = (p as u32) << 12;
+                    }
+                    share += 1;
+                }
+            }
+            wrong_entry_ring_push([slab as u32 | share << 16, others[0], others[1], 6]);
+        }
+        {
+            let ctx = get_jit_state();
+            if let Some(info) = ctx.pages.get(&Page::page_of(phys_addr)) {
+                let l = &info.entry_points;
+                let pk = |i: usize| {
+                    l.get(i)
+                        .map_or(0, |&(o, s)| (o as u32) << 16 | s as u32)
+                };
+                wrong_entry_ring_push([
+                    phys_addr & !0xFFF | (l.len() as u32 & 0xFFF),
+                    pk(0),
+                    pk(1),
+                    5,
+                ]);
+            }
+        }
+    }
+    dbg_log!(
+        "WRONG-ENTRY {} eip={:x} phys={:x} dispatched={}:{} expected={}:{}",
+        if chain { "chain" } else { "direct" },
+        virt,
+        phys_addr,
+        wasm_table_index,
+        initial_state,
+        entry.wasm_table_index.to_u16(),
+        entry.initial_state,
+    );
+    false
+}
+
 // B3 hotness tiering: a module whose RE-ENTRY count (bumped per cycle_internal entry —
 // the cheapest per-module execution proxy that needs no codegen) crosses the threshold
 // gets its pages marked tier-2 and is freed; the ordinary hotness path recompiles it,
@@ -532,12 +747,21 @@ pub fn dispatch_meta_state_flags(meta: u64) -> u32 { (meta >> 32) as u32 }
 #[inline]
 pub fn dispatch_meta_table_index(meta: u64) -> u16 { (meta >> 16) as u16 }
 
+/// Slab cells store `initial_state + 1`, so the "no entry here" sentinel is ZERO —
+/// the value uninitialized or externally-zeroed memory already has. With the previous
+/// encoding (0 = a perfectly valid entry-block index, u16::MAX = miss) any agent that
+/// zeroed a slab cell turned it into a LIVE dispatch to the module's block 0: the guest
+/// re-enters a real compiled module at the wrong entry point, carrying whatever
+/// registers the current call site had — silent wrong-code execution, observed as an
+/// AV with several registers sharing one garbage value. Making the sentinel structural
+/// downgrades that whole class to a dispatch MISS (interpret + recompile: slower, correct).
 #[inline]
 pub fn dispatch_state_lookup(meta: u64, virt_address: u32) -> u16 {
     unsafe {
         let slab = (meta as u16) as usize;
         dbg_assert!(slab != 0 && slab < DISPATCH_SLAB_COUNT);
-        DISPATCH_SLABS[slab * 0x1000 + (virt_address as usize & 0xFFF)]
+        let cell = DISPATCH_SLABS[slab * 0x1000 + (virt_address as usize & 0xFFF)];
+        if cell == 0 { u16::MAX } else { cell - 1 }
     }
 }
 
@@ -574,17 +798,63 @@ pub fn dispatch_meta_set(
         };
         dbg_assert!(slab != 0 && slab < DISPATCH_SLAB_COUNT);
 
+        // 0 = miss (see dispatch_state_lookup): cells hold state + 1.
         let table = &mut DISPATCH_SLABS[slab * 0x1000..slab * 0x1000 + 0x1000];
-        table.fill(u16::MAX);
+        table.fill(0);
         for &(addr, state) in entries {
             dbg_assert!(state != u16::MAX);
-            table[addr as usize] = state;
+            if state == u16::MAX {
+                continue; // cannot be represented as state+1; publishing it as a miss is safe
+            }
+            table[addr as usize] = state + 1;
         }
 
         DISPATCH_META[page] = (state_flags.to_u32() as u64) << 32
             | (wasm_table_index.to_u16() as u64) << 16
             | slab as u64;
+        // Live-cell census, so a later rescan can tell "this slab was overwritten by
+        // something outside the JIT" from "this slab legitimately has few entries".
+        // With 0 = miss, a zero cell is no longer self-evidently damage.
+        DISPATCH_SLAB_LIVE[slab] = entries.len() as u16;
     }
+}
+
+// Entries published per slab (see dispatch_meta_set). Compared against a live recount
+// by `jit_slab_audit`.
+static mut DISPATCH_SLAB_LIVE: [u16; DISPATCH_SLAB_COUNT] = [0; DISPATCH_SLAB_COUNT];
+
+/// Slabs whose live-cell count no longer matches what was published — i.e. cells were
+/// zeroed (or written) by something other than the JIT. Returns the number of damaged
+/// slabs; `jit_slab_audit_last` names the most recent one.
+#[no_mangle]
+pub fn jit_slab_audit() -> u32 {
+    unsafe {
+        let mut damaged = 0;
+        for s in 1..DISPATCH_SLAB_COUNT {
+            let published = DISPATCH_SLAB_LIVE[s];
+            if published == 0 {
+                continue;
+            }
+            let mut live = 0u32;
+            for i in 0..0x1000 {
+                if DISPATCH_SLABS[s * 0x1000 + i] != 0 {
+                    live += 1;
+                }
+            }
+            if live != published as u32 {
+                damaged += 1;
+                SLAB_AUDIT_LAST = [s as u32, published as u32, live];
+            }
+        }
+        damaged
+    }
+}
+
+static mut SLAB_AUDIT_LAST: [u32; 3] = [0; 3];
+
+#[no_mangle]
+pub fn jit_slab_audit_last(i: u32) -> u32 {
+    unsafe { *SLAB_AUDIT_LAST.get(i as usize).unwrap_or(&0) }
 }
 
 /// Unpublish a page. Returns true if the page actually had an entry (callers use
@@ -601,6 +871,7 @@ pub fn dispatch_meta_clear(page: u32) -> bool {
         dbg_assert!(DISPATCH_SLAB_FREE_TOP < DISPATCH_SLAB_COUNT);
         DISPATCH_SLAB_FREE[DISPATCH_SLAB_FREE_TOP] = slab as u16;
         DISPATCH_SLAB_FREE_TOP += 1;
+        DISPATCH_SLAB_LIVE[slab] = 0; // no longer published — exclude from the audit
         DISPATCH_META[page] = 0;
         true
     }
@@ -1674,11 +1945,78 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
         && cached.2 >= 0
         && cached.3 == RET_CACHE_EPOCH
     {
-        if dispatch_stats_enabled() {
-            profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+        // Wrong-entry detector (idx 24; OFF by default): a memo hit bypasses
+        // DISPATCH_META entirely, so verify the cached packed target against a fresh
+        // meta resolution; overwrite staleness (live older module) is counted as
+        // stale-live and is benign — same guest bytes.
+        if !wrong_entry_verify_enabled() {
+            if dispatch_stats_enabled() {
+                profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+            }
+            chain_note_execution(cached.2);
+            return cached.2;
         }
-        chain_note_execution(cached.2);
-        return cached.2;
+        let meta = dispatch_meta_get(virt_address >> 12);
+        let fresh = if meta != 0
+            && dispatch_meta_state_flags(meta) == state_flags
+        {
+            let st = dispatch_state_lookup(meta, virt_address);
+            if st != u16::MAX {
+                (dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32) << 16
+                    | st as i32
+            }
+            else {
+                -1
+            }
+        }
+        else {
+            -1
+        };
+        if fresh == cached.2 {
+            if dispatch_stats_enabled() {
+                profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+            }
+            chain_note_execution(cached.2);
+            return cached.2;
+        }
+        RET_MEMO_MISMATCH += 1;
+        // Classify the stale target: a LIVE module (primary or hidden) is benign
+        // overwrite-staleness — same guest bytes, older module. A dead/recycled slot
+        // is genuine wrong-code dispatch.
+        let stale_idx = ((cached.2 >> 16) - cpu::WASM_TABLE_OFFSET as i32) as u16;
+        let target = WasmTableIndex(stale_idx);
+        let live = {
+            let ctx = get_jit_state();
+            ctx.pages.values().any(|info| {
+                info.wasm_table_index == target
+                    || info.hidden_wasm_table_indices.contains(&target)
+            })
+        };
+        if live {
+            RET_MEMO_STALE_LIVE += 1;
+        }
+        else {
+            RET_MEMO_STALE_DEAD += 1;
+        }
+        if RET_MEMO_MISMATCH <= 8 {
+            wrong_entry_ring_push([virt_address, cached.2 as u32, fresh as u32, 2]);
+        }
+        dbg_log!(
+            "RET-MEMO-MISMATCH eip={:x} cached={:x} fresh={:x} staleTargetLive={}",
+            virt_address,
+            cached.2,
+            fresh,
+            live
+        );
+        if !wrong_entry_refuse() {
+            // Passive: preserve stock behavior exactly — dispatch the stale target.
+            if dispatch_stats_enabled() {
+                profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+            }
+            chain_note_execution(cached.2);
+            return cached.2;
+        }
+        RET_CACHE[cache_idx].2 = -1;
     }
 
     let raw_state_flags = state_flags;
@@ -1693,16 +2031,36 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     if meta != 0 && dispatch_meta_state_flags(meta) == state_flags.to_u32() {
         let unit_state = dispatch_state_lookup(meta, virt_address);
         if unit_state != u16::MAX {
-            if dispatch_stats_enabled() {
-                profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+            // Wrong-entry detector (idx 24; OFF by default): re-verify the meta-resolved
+            // target against ctx.pages before tail-calling into it.
+            let verified = if !wrong_entry_verify_enabled() {
+                true
             }
+            else {
+                match cpu::translate_address_read_no_side_effects(virt_address as i32) {
+                    Ok(phys) => jit_verify_dispatch_entry(
+                        phys,
+                        state_flags,
+                        dispatch_meta_table_index(meta),
+                        unit_state,
+                        virt_address,
+                        true,
+                    ),
+                    Err(()) => false,
+                }
+            };
+            if verified || !wrong_entry_refuse() {
+                if dispatch_stats_enabled() {
+                    profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+                }
 
-            let table_slot =
-                dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
-            let packed = table_slot << 16 | unit_state as i32;
-            RET_CACHE[cache_idx] = (virt_address, raw_state_flags, packed, RET_CACHE_EPOCH);
-            chain_note_execution(packed);
-            return packed;
+                let table_slot =
+                    dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
+                let packed = table_slot << 16 | unit_state as i32;
+                RET_CACHE[cache_idx] = (virt_address, raw_state_flags, packed, RET_CACHE_EPOCH);
+                chain_note_execution(packed);
+                return packed;
+            }
         }
     }
 
@@ -4225,6 +4583,34 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
     #[cfg(debug_assertions)]
     ctx.wasm_table_index_to_page.remove(&wasm_table_index);
 
+    // Diagnostic audit (idx 24; OFF by default): any DISPATCH_META entry still naming
+    // this slot right now is a stale dispatch source the TLB sweeps missed — the next
+    // module recycling the slot inherits those virt pages' dispatches.
+    if wrong_entry_verify_enabled()
+    {
+    unsafe {
+        let idx = wasm_table_index.to_u16();
+        for page in 0..(1usize << 20) {
+            let meta = DISPATCH_META[page];
+            if meta != 0 && dispatch_meta_table_index(meta) == idx {
+                STALE_META_AT_FREE += 1;
+                if cpu::tlb_data[page] != 0 {
+                    STALE_META_TLB_LIVE += 1;
+                }
+                else {
+                    STALE_META_TLB_DEAD += 1;
+                }
+                wrong_entry_ring_push([
+                    (page as u32) << 12,
+                    idx as u32,
+                    cpu::tlb_data[page] as u32,
+                    3, // tag: stale-meta-at-free record
+                ]);
+            }
+        }
+    }
+    }
+
     ctx.wasm_table_index_free_list.push(wasm_table_index);
 
     // This is the ONLY place a table slot is nulled — invalidate the B1b ret-target
@@ -4603,6 +4989,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         21 => JIT_FLAG_LOCALS = value != 0,
         22 => JIT_BRANCH_HINTS = value,
         23 => JIT_BRANCH_HINT_OFFSET_FUZZ = value,
+        24 => WRONG_ENTRY_REFUSE = value,
         _ => dbg_assert!(false),
     }
 }
@@ -4633,6 +5020,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         21 => JIT_FLAG_LOCALS as u32,
         22 => JIT_BRANCH_HINTS,
         23 => JIT_BRANCH_HINT_OFFSET_FUZZ,
+        24 => WRONG_ENTRY_REFUSE,
         _ => 0,
     }
 }

@@ -3161,6 +3161,27 @@ pub unsafe fn cycle_internal() {
         }
     }
 
+    // Wrong-entry detector (diagnostic, set_jit_config idx 24; OFF by default): re-verify
+    // the meta-resolved dispatch against ctx.pages; in refuse mode a disagreement drops
+    // the dispatch (this slice runs interpreted) — see jit::jit_verify_dispatch_entry.
+    if jit::wrong_entry_verify_enabled() {
+        if let Some((wasm_table_index, initial_state)) = jit_entry {
+            if let Ok(phys_eip) = get_phys_eip() {
+                if !jit::jit_verify_dispatch_entry(
+                    phys_eip,
+                    initial_state_flags,
+                    wasm_table_index,
+                    initial_state,
+                    initial_eip as u32,
+                    false,
+                ) && jit::jit_wrong_entry_refuse_enabled()
+                {
+                    jit_entry = None;
+                }
+            }
+        }
+    }
+
     if let Some((wasm_table_index, initial_state)) = jit_entry {
         if jit::CHECK_JIT_STATE_INVARIANTS {
             match get_phys_eip() {

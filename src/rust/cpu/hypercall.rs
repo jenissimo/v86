@@ -2149,6 +2149,45 @@ unsafe fn zero_block(addr: u32, size: u32) {
     }
 }
 
+/// Times a guest-corrupted slab structure (free-list next pointer or control block)
+/// was caught before it could drive a raw write outside the slab. The slab free list
+/// is threaded THROUGH guest heap memory, so a guest use-after-free store turns a
+/// next pointer into game data; unvalidated, that pointer feeds
+/// `write32_no_mmap_or_dirty_check` — whose `mem8.offset(addr as isize)` goes
+/// NEGATIVE for addr >= 0x8000_0000 and lands in the wasm module's own statics
+/// (observed: 4 KiB HEAP_ZERO_MEMORY zero_blocks stomping jit::DISPATCH_SLABS, where
+/// a zeroed cell reads as dispatch state 0 → wrong-block entry → garbage-register AV).
+static mut HC_SLAB_POISONED: u32 = 0;
+
+#[no_mangle]
+pub fn hc_slab_poisoned_count() -> u32 { unsafe { HC_SLAB_POISONED } }
+
+/// Validate the slab bounds read from the (guest-writable) control block. Anchored on
+/// the one thing the guest cannot fake: real guest memory size. Returns None when the
+/// control block is corrupt — callers must fall back to the JS path.
+#[inline]
+unsafe fn slab_bounds(ctl: u32) -> Option<(u32, u32)> {
+    let base = slab_rd(ctl, SLAB_REL_BASE);
+    let end = slab_rd(ctl, SLAB_REL_END);
+    // base == 0 is "slab not initialized yet", the ordinary pre-init state — NOT
+    // corruption. Counting it would drown the poison signal in boot noise.
+    if base == 0 {
+        return Some((0, 0));
+    }
+    let mem_size = *crate::cpu::global_pointers::memory_size;
+    if base < 0x1000 || base >= end || end > mem_size {
+        return None;
+    }
+    Some((base, end))
+}
+
+/// A block pointer from guest-writable state (free-list next, bump cursor) is only
+/// usable for RAW writes if the whole block lies inside the slab.
+#[inline]
+fn slab_block_ok(ptr: u32, size_class: u32, base: u32, end: u32) -> bool {
+    ptr >= base + 16 && ptr.wrapping_add(size_class) <= end && ptr % 4 == 0
+}
+
 /// HeapAlloc(hHeap, dwFlags, dwBytes) — stdcall, 3 args.
 /// Fast path: slab bump allocation or free-list pop for blocks ≤4KB.
 /// Returns false to fall through to JS for large/zero-size/slab-exhausted cases.
@@ -2158,7 +2197,15 @@ unsafe fn handle_heap_alloc() -> bool {
     // only address guest RAM; this page is unreachable from guest code). ctl==0 ⇒ slab off.
     let ctl = *(page.add(OFF_HC_SLAB_CTL_PTR) as *const u32);
     if ctl == 0 { return false; }
-    let slab_base = slab_rd(ctl, SLAB_REL_BASE);
+    // Bounds come from a guest-RAM control block — validate before ANY raw write
+    // derives from them (see HC_SLAB_POISONED).
+    let (slab_base, slab_end_checked) = match slab_bounds(ctl) {
+        Some(b) => b,
+        None => {
+            HC_SLAB_POISONED = HC_SLAB_POISONED.wrapping_add(1);
+            return false;
+        }
+    };
     if slab_base == 0 { return false; } // slab not initialized
 
     let esp = read_reg32(ESP);
@@ -2183,6 +2230,17 @@ unsafe fn handle_heap_alloc() -> bool {
     let fl_rel = SLAB_REL_FREELIST + bin * 4;
     let head = slab_rd(ctl, fl_rel);
     if head != 0 {
+        // The next pointer lives in FREED GUEST MEMORY — a guest use-after-free store
+        // replaces it with game data. Unvalidated it would feed the raw header write and
+        // zero_block below, and a value >= 0x8000_0000 wraps below mem8 into the wasm
+        // statics. A poisoned head means the whole bin list is untrustworthy: drop it
+        // (real Windows would AV/corrupt the APP's heap here, never the machine) and
+        // let JS serve the allocation.
+        if !slab_block_ok(head, size_class, slab_base, slab_end_checked) {
+            HC_SLAB_POISONED = HC_SLAB_POISONED.wrapping_add(1);
+            slab_wr(ctl, fl_rel, 0);
+            return false;
+        }
         // Pop from free list: first 4 bytes of user data = next pointer
         let next = memory::read32_no_mmap_check(head) as u32;
         slab_wr(ctl, fl_rel, next);
@@ -2199,7 +2257,13 @@ unsafe fn handle_heap_alloc() -> bool {
 
     // Bump allocate: [bump..bump+16) = header zone, [bump+16..bump+16+size_class) = user data
     let bump = slab_rd(ctl, SLAB_REL_BUMP);
-    let slab_end = slab_rd(ctl, SLAB_REL_END);
+    let slab_end = slab_end_checked;
+    // The bump cursor is guest-RAM state too — hold it to the same standard as a
+    // free-list pointer before the raw header write / zero_block below.
+    if bump < slab_base || bump > slab_end {
+        HC_SLAB_POISONED = HC_SLAB_POISONED.wrapping_add(1);
+        return false;
+    }
     let user_ptr = bump + 16;
     let new_bump = user_ptr + size_class;
     if new_bump > slab_end {
@@ -2224,7 +2288,14 @@ unsafe fn handle_heap_free() -> bool {
     let page = hp_ptr();
     let ctl = *(page.add(OFF_HC_SLAB_CTL_PTR) as *const u32);
     if ctl == 0 { return false; }
-    let slab_base = slab_rd(ctl, SLAB_REL_BASE);
+    // Same guest-writable-bounds discipline as handle_heap_alloc.
+    let (slab_base, slab_end) = match slab_bounds(ctl) {
+        Some(b) => b,
+        None => {
+            HC_SLAB_POISONED = HC_SLAB_POISONED.wrapping_add(1);
+            return false;
+        }
+    };
     if slab_base == 0 { return false; }
 
     let esp = read_reg32(ESP);
@@ -2235,7 +2306,6 @@ unsafe fn handle_heap_free() -> bool {
         return true;
     }
 
-    let slab_end = slab_rd(ctl, SLAB_REL_END);
     // Must be within slab with room for header
     if lp_mem < slab_base + 16 || lp_mem >= slab_end { return false; }
 
