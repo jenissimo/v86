@@ -13,6 +13,7 @@ d3d9-webgpu = { path = "crates/d3d9-webgpu" }
 [features]
 default = []
 profiler = []
+aot-driver = []
 
 [lib]
 crate-type = ["cdylib"]

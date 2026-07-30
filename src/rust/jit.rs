@@ -5091,3 +5091,7 @@ pub unsafe fn jit_snapshot_get_entry_count(i: u32) -> u32 {
     }
     0
 }
+
+// AOT offline driver (spike): feature-gated, absent from the shipped engine.
+#[cfg(feature = "aot-driver")]
+mod aot_driver;
