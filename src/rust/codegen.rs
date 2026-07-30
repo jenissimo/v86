@@ -3181,6 +3181,10 @@ pub fn gen_test_jcxz(ctx: &mut JitContext, is_asize_32: bool) {
     ctx.builder.eqz_i32();
 }
 
+// Every caller reproduces fpu_get_sti (cpu/fpu.rs) exactly: the strict-mode branches, the
+// runtime fallbacks of the relaxed fast paths, and FLD ST(i). So the empty-slot contract
+// (INDEFINITE_NAN + stack fault, not stale register bytes) holds here too — inlined rather
+// than routed through the helper, which would put a call on FLD ST(i).
 pub fn gen_fpu_get_sti(ctx: &mut JitContext, i: u32) {
     if crate::softfloat::is_fpu_relaxed() {
         // Relaxed mode: directly read from fpu_st array, skipping scratch register round-trip.
@@ -3191,15 +3195,51 @@ pub fn gen_fpu_get_sti(ctx: &mut JitContext, i: u32) {
         ctx.builder.add_i32();
         ctx.builder.const_i32(7);
         ctx.builder.and_i32();
+        let index = ctx.builder.tee_new_local();
         ctx.builder.const_i32(16);
         ctx.builder.mul_i32();
         ctx.builder.const_i32(global_pointers::fpu_st as i32);
         ctx.builder.add_i32();
-        let addr_local = ctx.builder.tee_new_local();
+        let addr_local = ctx.builder.set_new_local();
+
+        ctx.builder
+            .load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+        ctx.builder.get_local(&index);
+        ctx.builder.shr_u_i32();
+        ctx.builder.const_i32(1);
+        ctx.builder.and_i32();
+        let empty = ctx.builder.set_new_local();
+
+        // fpu_stack_fault, inline. Emitted before the value so nothing of ours is on the
+        // wasm stack across the block.
+        ctx.builder.get_local(&empty);
+        ctx.builder.if_void();
+        gen_mark_fpu_simd_dirty(ctx.builder);
+        ctx.builder
+            .const_i32(global_pointers::fpu_status_word as i32);
+        ctx.builder
+            .load_fixed_u16(global_pointers::fpu_status_word as u32);
+        ctx.builder.const_i32(!FPU_C1);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(FPU_EX_SF | FPU_EX_I);
+        ctx.builder.or_i32();
+        ctx.builder.store_aligned_u16(0);
+        ctx.builder.block_end();
+
+        ctx.builder.const_i64(F80_INDEFINITE_NAN_MANTISSA);
+        ctx.builder.get_local(&addr_local);
         ctx.builder.load_unaligned_i64(0); // mantissa
+        ctx.builder.get_local(&empty);
+        ctx.builder.select();
+        ctx.builder.const_i32(F80_INDEFINITE_NAN_SIGN_EXPONENT);
         ctx.builder.get_local(&addr_local);
         ctx.builder.load_unaligned_u16(8); // sign_exponent
+        ctx.builder.get_local(&empty);
+        ctx.builder.select();
+
+        ctx.builder.free_local(empty);
         ctx.builder.free_local(addr_local);
+        ctx.builder.free_local(index);
     }
     else {
         ctx.builder
@@ -3333,6 +3373,10 @@ const FPU_C2: i32 = 0x400;
 const FPU_C3: i32 = 0x4000;
 // includes C1: x87 FCOM clears C0/C1/C2/C3 (see cpu/fpu.rs FPU_RESULT_FLAGS)
 const FPU_RESULT_FLAGS: i32 = FPU_C0 | FPU_C1 | FPU_C2 | FPU_C3;
+const FPU_EX_I: i32 = 1 << 0;
+const FPU_EX_SF: i32 = 1 << 6;
+const F80_INDEFINITE_NAN_MANTISSA: i64 = 0xC000000000000000u64 as i64;
+const F80_INDEFINITE_NAN_SIGN_EXPONENT: i32 = 0x7FFF;
 
 #[derive(Copy, Clone)]
 pub enum FpuFastBinOp {
@@ -4055,6 +4099,16 @@ pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
     ctx.builder.get_local(&new_empty);
     ctx.builder.store_u8(0);
 
+    // fpu_push clears C1 on the successful push (this path); C1 is a result flag the guest
+    // reads back with FNSTSW, not fault accumulation.
+    ctx.builder
+        .const_i32(global_pointers::fpu_status_word as i32);
+    ctx.builder
+        .load_fixed_u16(global_pointers::fpu_status_word as u32);
+    ctx.builder.const_i32(!FPU_C1);
+    ctx.builder.and_i32();
+    ctx.builder.store_aligned_u16(0);
+
     ctx.builder.get_local(&new_ptr);
     ctx.builder.const_i32(16);
     ctx.builder.mul_i32();
@@ -4124,6 +4178,33 @@ pub fn gen_fpu_relaxed_fxch(ctx: &mut JitContext, i: u32) {
     ctx.builder.free_local(st0_addr);
 }
 
+// FST/FSTP ST(i) marks the destination non-empty in the tag word when the source is live
+// (cpu/fpu.rs fpu_fst); the raw 16-byte copy alone leaves ST(i) tagged empty. Emitted
+// before the pop, so fpu_stack_ptr still selects the source, as in the helper.
+fn gen_fpu_clear_stack_empty_sti(ctx: &mut JitContext, i: u32) {
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    ctx.builder.const_i32(global_pointers::fpu_stack_empty as i32);
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder.const_i32(1);
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.const_i32(i as i32);
+    ctx.builder.add_i32();
+    ctx.builder.const_i32(7);
+    ctx.builder.and_i32();
+    ctx.builder.shl_i32();
+    ctx.builder.const_i32(-1);
+    ctx.builder.xor_i32();
+    ctx.builder.and_i32();
+    ctx.builder.store_u8(0);
+    ctx.builder.block_end();
+}
+
 pub fn gen_fpu_relaxed_fst(ctx: &mut JitContext, i: u32, pop: bool) {
     if !crate::softfloat::is_fpu_relaxed() {
         gen_fn1_const(ctx.builder, if pop { "fpu_fstp" } else { "fpu_fst" }, i);
@@ -4133,6 +4214,7 @@ pub fn gen_fpu_relaxed_fst(ctx: &mut JitContext, i: u32, pop: bool) {
     let st0_addr = gen_fpu_st_addr(ctx, 0);
     let sti_addr = gen_fpu_st_addr(ctx, i);
     gen_fpu_copy_raw(ctx, &st0_addr, &sti_addr);
+    gen_fpu_clear_stack_empty_sti(ctx, i);
     gen_x87_local_cache_invalidate_all_runtime(ctx);
     if pop {
         gen_fpu_relaxed_pop(ctx);

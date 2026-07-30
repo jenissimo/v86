@@ -155,10 +155,15 @@ pub unsafe fn fpu_load_m80(addr: i32) -> OrPageFault<F80> {
     let mantissa = safe_read64s(addr)?;
     let sign_exponent = safe_read16(addr + 8)? as u16;
     // TODO: Canonical form
-    Ok(F80 {
-        mantissa,
-        sign_exponent,
-    })
+    let v = F80 { mantissa, sign_exponent };
+    // 0x7FFE (2^16383, e.g. LDBL_MAX) is a legal image that aliases RELAXED_TAG; while
+    // relaxed mode is on it would be decoded as f64 bits, so re-express it as a relaxed
+    // value (out of f64 range -> the infinity every operation on it would produce anyway).
+    // This is the only path by which a guest-authored 80-bit image enters a register.
+    if crate::softfloat::is_fpu_relaxed() && sign_exponent == crate::softfloat::RELAXED_TAG {
+        return Ok(F80::of_f64(v.to_f64_strict()));
+    }
+    Ok(v)
 }
 
 #[no_mangle]
@@ -849,8 +854,9 @@ pub unsafe fn fpu_fxtract() {
         let st0 = st0.to_true_f80();
         let exp = st0.exponent();
         fpu_write_st(*fpu_stack_ptr as i32, F80::of_i32(exp.into()));
+        // The significand keeps the operand's sign: FXTRACT(-8.0) -> ST(1)=3, ST(0)=-1.0
         fpu_push(F80 {
-            sign_exponent: 0x3FFF,
+            sign_exponent: (st0.sign_exponent & 0x8000) | 0x3FFF,
             mantissa: st0.mantissa,
         });
     }

@@ -25,12 +25,27 @@ pub fn is_precision_single() -> bool {
 static mut FPU_RELAXED: bool = false;
 
 /// Magic sign_exponent value used to tag relaxed-format F80 values.
-/// 0x7FFE = exponent 0x3FFF = 2^16383 — physically impossible in game math.
-const RELAXED_TAG: u16 = 0x7FFE;
+/// NOT an impossible encoding: 0x7FFE is the exponent field of every finite 2^16383-scale
+/// x87 value (LDBL_MAX among them), so it is only honoured while relaxed mode is on and
+/// fpu_load_m80 rewrites the one guest-supplied image that could alias it.
+pub const RELAXED_TAG: u16 = 0x7FFE;
 
 #[no_mangle]
 pub extern "C" fn set_relaxed_fpu(enabled: u32) {
-    unsafe { FPU_RELAXED = enabled != 0; }
+    let on = enabled != 0;
+    unsafe {
+        if on == FPU_RELAXED {
+            return;
+        }
+        // Live registers are read under the new mode's tag rules, so resolve them first:
+        // relaxed f64 bits would otherwise be decoded as a true 80-bit encoding.
+        for i in 0..8 {
+            let p = crate::cpu::global_pointers::fpu_st.offset(i);
+            *p = (*p).to_true_f80();
+        }
+        crate::cpu::cpu::mark_fpu_simd_dirty();
+        FPU_RELAXED = on;
+    }
 }
 
 #[no_mangle]
@@ -118,14 +133,44 @@ impl F80 {
         sign_exponent: 0xFFFF,
     };
 
-    pub fn sign(&self) -> bool { (self.sign_exponent >> 15) == 1 }
-    pub fn exponent(&self) -> i16 { (self.sign_exponent as i16 & 0x7FFF) - 0x3FFF }
+    /// RELAXED_TAG is a real exponent field (2^16383), so it only means "mantissa holds
+    /// raw f64 bits" while the mode that writes it is on. Every tag test goes through here.
+    #[inline]
+    fn is_relaxed(&self) -> bool {
+        unsafe { FPU_RELAXED && self.sign_exponent == RELAXED_TAG }
+    }
+    #[inline]
+    fn both_relaxed(&self, other: &F80) -> bool {
+        unsafe {
+            FPU_RELAXED
+                && self.sign_exponent == RELAXED_TAG
+                && other.sign_exponent == RELAXED_TAG
+        }
+    }
+
+    /// Relaxed values carry their sign in bit 63 of the f64 bits, not in
+    /// `sign_exponent` — which is the constant RELAXED_TAG, so reading bit 15
+    /// reports every value as positive.
+    pub fn sign(&self) -> bool {
+        if self.is_relaxed() { return self.mantissa >> 63 == 1; }
+        (self.sign_exponent >> 15) == 1
+    }
+    pub fn exponent(&self) -> i16 {
+        let v = self.to_true_f80();
+        (v.sign_exponent as i16 & 0x7FFF) - 0x3FFF
+    }
 
     pub fn to_f64(&self) -> u64 {
         // Relaxed fast path: f64 bits stored directly, skip biasing
-        if self.sign_exponent == RELAXED_TAG {
+        if self.is_relaxed() {
             return self.mantissa;
         }
+        self.to_f64_strict()
+    }
+
+    // Decode as a true 80-bit value, ignoring relaxed mode (needed where a raw guest image
+    // must be read even though its exponent field can equal RELAXED_TAG).
+    pub fn to_f64_strict(&self) -> u64 {
         let sign = (self.sign_exponent >> 15) as u64;
         let exp = (self.sign_exponent & 0x7FFF) as i32;
         let mant = self.mantissa;
@@ -333,7 +378,7 @@ impl F80 {
     pub fn ln(self) -> F80 { F80::of_f64x(self.to_f64x().ln()) }
 
     pub fn abs(self) -> F80 {
-        if self.sign_exponent == RELAXED_TAG {
+        if self.is_relaxed() {
             // Relaxed format: sign is bit 63 of mantissa (f64 bits)
             F80 { mantissa: self.mantissa & !(1u64 << 63), sign_exponent: RELAXED_TAG }
         } else {
@@ -344,7 +389,7 @@ impl F80 {
 
     // Resolve the relaxed f64-bits form to a real 80-bit value; true F80 passes through.
     pub fn to_true_f80(self) -> F80 {
-        if self.sign_exponent == RELAXED_TAG {
+        if self.is_relaxed() {
             F80::of_f64_strict(self.mantissa)
         } else {
             self
@@ -462,7 +507,7 @@ impl std::ops::Add for F80 {
     type Output = F80;
     fn add(self, other: Self) -> Self {
         // Fast path: both operands already hold raw f64 bits
-        if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
+        if self.both_relaxed(&other) {
             let r = apply_precision(f64::from_bits(self.mantissa) + f64::from_bits(other.mantissa));
             return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
         }
@@ -474,7 +519,7 @@ impl std::ops::Add for F80 {
 impl std::ops::Sub for F80 {
     type Output = F80;
     fn sub(self, other: Self) -> Self {
-        if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
+        if self.both_relaxed(&other) {
             let r = apply_precision(f64::from_bits(self.mantissa) - f64::from_bits(other.mantissa));
             return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
         }
@@ -486,7 +531,7 @@ impl std::ops::Sub for F80 {
 impl std::ops::Neg for F80 {
     type Output = F80;
     fn neg(self) -> Self {
-        if self.sign_exponent == RELAXED_TAG {
+        if self.is_relaxed() {
             // Relaxed format: sign is bit 63 of mantissa (f64 bits)
             F80 { mantissa: self.mantissa ^ (1u64 << 63), sign_exponent: RELAXED_TAG }
         } else {
@@ -499,7 +544,7 @@ impl std::ops::Neg for F80 {
 impl std::ops::Mul for F80 {
     type Output = F80;
     fn mul(self, other: Self) -> Self {
-        if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
+        if self.both_relaxed(&other) {
             let r = apply_precision(f64::from_bits(self.mantissa) * f64::from_bits(other.mantissa));
             return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
         }
@@ -511,7 +556,7 @@ impl std::ops::Mul for F80 {
 impl std::ops::Div for F80 {
     type Output = F80;
     fn div(self, other: Self) -> Self {
-        if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
+        if self.both_relaxed(&other) {
             let r = apply_precision(f64::from_bits(self.mantissa) / f64::from_bits(other.mantissa));
             return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
         }
@@ -523,7 +568,7 @@ impl std::ops::Div for F80 {
 impl std::ops::Rem for F80 {
     type Output = F80;
     fn rem(self, other: Self) -> Self {
-        if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
+        if self.both_relaxed(&other) {
             let r = f64::from_bits(self.mantissa) % f64::from_bits(other.mantissa);
             return F80 { mantissa: r.to_bits(), sign_exponent: RELAXED_TAG };
         }
@@ -534,7 +579,7 @@ impl std::ops::Rem for F80 {
 
 impl PartialEq for F80 {
     fn eq(&self, other: &Self) -> bool {
-        if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
+        if self.both_relaxed(other) {
             return f64::from_bits(self.mantissa) == f64::from_bits(other.mantissa);
         }
         let a = f64::from_bits(self.to_f64());
@@ -544,7 +589,7 @@ impl PartialEq for F80 {
 }
 impl PartialOrd for F80 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if self.sign_exponent == RELAXED_TAG && other.sign_exponent == RELAXED_TAG {
+        if self.both_relaxed(other) {
             return f64::from_bits(self.mantissa).partial_cmp(&f64::from_bits(other.mantissa));
         }
         let a = f64::from_bits(self.to_f64());

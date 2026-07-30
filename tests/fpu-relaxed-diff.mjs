@@ -449,6 +449,40 @@ function build_image(bodyName)
             emit(0xDE, 0x2D); imm32(I16V);     // FISUBR m16
             fstp64(ACC);
         },
+        // FST ST(i) also clears the destination's stack-empty bit; a raw register copy
+        // leaves the tag word claiming ST(i) is empty.
+        fst_tagword() {
+            fld1();                            // TOP=7, st0=1.0
+            fst_sti(3);                        // -> phys (7+3)&7 = 2, currently empty
+            emit(0xD9, 0x35); imm32(DATA + 0x200);  // fnstenv [env]
+            emit(0xA1); imm32(DATA + 0x208);   // mov eax, [tag word]
+            movMemEax(ACC);
+            emit(0xDD, 0xC3);                  // ffree st(3) -> release phys 2
+            fstp32(LAST);                      // drain st0
+        },
+        // FLD ST(i) on an empty slot yields INDEFINITE_NAN + a stack fault, not stale bytes.
+        fld_empty() {
+            emit(0xDB, 0xE2);                  // fnclex (measure this iteration's flags)
+            fld1();                            // TOP=7
+            fldsti(3);                         // ST(3) = phys 2, empty
+            fstp64(ACC);                       // ACC = what the empty slot produced
+            fstp32(LAST);                      // drain the 1.0
+            emit(0x31, 0xC0);                  // xor eax,eax
+            fnstsw_ax();
+            movMemEax(LAST);                   // LAST = status word (SF|IE, C1 clear)
+        },
+        // A successful push clears C1 (fpu_push); FXAM sets it first so a skipped clear shows.
+        push_c1() {
+            fld64(C64);                        // 0.75
+            fchs();                            // -0.75
+            emit(0xD9, 0xE5);                  // fxam -> C1 = sign = 1
+            fld1();                            // push must clear C1
+            emit(0x31, 0xC0);                  // xor eax,eax
+            fnstsw_ax();
+            movMemEax(ACC);
+            fstp32(LAST);
+            fstp32(LAST);
+        },
     };
 
     emit(0xBC); imm32(0x200000);          // mov esp, 0x200000
@@ -530,7 +564,11 @@ const fmt = (r) => `${r.status} acc=${r.ebx.toString(16).padStart(8,"0")}:${r.ea
 const variants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_sti", "m80_mem", "m80_pop", "m80_nopop", "tag_pop", "full", "fxch_sticky", "fcom_sticky", "consts_sign", "fist_round", "fist_round_neg", "fcomi_flags",
     // newly-covered families (previously untested, where Bug #2 is hypothesised to live)
     "fcom_mem", "fst_reg", "fild_widths", "fist16_round", "consts_all", "fcomi_more", "tl_mix",
-    "fnstsw_top", "fiarith32", "fiarith16"];
+    "fnstsw_top", "fiarith32", "fiarith16",
+    // architectural state the inline paths used to drop: tag word, empty-slot reads, C1
+    "fst_tagword", "fld_empty", "push_c1"]
+    // optional argv filter: `node tests/fpu-relaxed-diff.mjs fld_empty push_c1`
+    .filter(v => process.argv.length <= 2 || process.argv.slice(2).includes(v));
 // FCOM/FXCH between two relaxed values must not fall back to the helper (that re-poisons
 // the slot). Only meaningful in relaxed(1).
 const stickyVariants = ["fxch_sticky", "fcom_sticky"];
