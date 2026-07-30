@@ -289,7 +289,10 @@ pub fn jit_verify_dispatch_entry(
             let mut n = 0;
             for off in 0..0x1000usize {
                 let st = unsafe { DISPATCH_SLABS[slab * 0x1000 + off] };
-                if st != u16::MAX {
+                // Cells hold state + 1, so 0 — not u16::MAX — is the miss sentinel
+                // (see dispatch_state_lookup). Testing against u16::MAX counted every
+                // empty cell as an entry, making n ≈ 0x1000 and the pairs meaningless.
+                if st != 0 {
                     if n < 2 {
                         pairs[n] = (off as u32) << 16 | st as u32;
                     }
