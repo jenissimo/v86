@@ -4543,12 +4543,18 @@ pub unsafe fn read_tsc() -> u64 {
         None => (js::microtick() * TSC_TICKS_PER_MS) as u64,
     };
     let value = value.wrapping_sub(tsc_offset);
-    // Monotonic floor + sub-sample forward progress: never return <= the previous value. When wall
-    // clock hasn't advanced since the last call (performance.now resolution / tight RDTSC loops in
-    // light frames), advance by 1 tick so consecutive reads ALWAYS differ — a real wall jump snaps it
-    // forward again. This is a rare safety net, not the normal path (unlike the old guard, which
-    // plateaued).
-    let result = if value <= tsc_last_value {
+    // Compare modulo 2^64, not as ordinary unsigned integers. The unified-clock page can be
+    // re-seeded immediately after reset_cpu(): set_tsc() may have sampled the OLD page while
+    // instruction_counter was already zero, then the first tick publishes a slightly EARLIER
+    // coherent base. Subtracting the old offset turns that brief backward step into a value near
+    // u64::MAX. A plain `value <= last` mistakes it for an enormous forward jump; UE1 converts
+    // that first RDTSC through _ftol, gets INT64_MAX, and its splash deadline can never expire.
+    //
+    // Serial-number arithmetic classifies a delta larger than half the u64 range as "behind".
+    // It also handles a legitimate TSC wrap correctly: max -> small has a small forward delta.
+    // Keep the existing one-tick progress guarantee while the source catches back up.
+    let forward = value.wrapping_sub(tsc_last_value);
+    let result = if forward == 0 || forward > i64::MAX as u64 {
         tsc_last_value.wrapping_add(1)
     } else {
         value
