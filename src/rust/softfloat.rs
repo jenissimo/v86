@@ -37,14 +37,35 @@ pub extern "C" fn set_relaxed_fpu(enabled: u32) {
         if on == FPU_RELAXED {
             return;
         }
-        // Live registers are read under the new mode's tag rules, so resolve them first:
-        // relaxed f64 bits would otherwise be decoded as a true 80-bit encoding.
+        // Live registers are read under the new mode's tag rules, so resolve them across
+        // the switch — in BOTH directions, and always decided before the flip, since
+        // afterwards the two forms are indistinguishable:
+        //   relaxed -> strict: f64 bits would be decoded as a true 80-bit encoding.
+        //   strict -> relaxed: a genuine 2^16383-scale value (exponent == RELAXED_TAG,
+        //     LDBL_MAX among them) would be misread as f64 bits — the same alias
+        //     fpu_load_m80 rewrites, re-expressed the same way.
+        let mut aliased = [0u64; 8];
+        let mut alias_mask = 0u8;
         for i in 0..8 {
             let p = crate::cpu::global_pointers::fpu_st.offset(i);
-            *p = (*p).to_true_f80();
+            if on {
+                if (*p).sign_exponent == RELAXED_TAG {
+                    aliased[i as usize] = (*p).to_f64_strict();
+                    alias_mask |= 1 << i;
+                }
+            }
+            else {
+                *p = (*p).to_true_f80();
+            }
         }
         crate::cpu::cpu::mark_fpu_simd_dirty();
         FPU_RELAXED = on;
+        for i in 0..8 {
+            if alias_mask >> i & 1 != 0 {
+                *crate::cpu::global_pointers::fpu_st.offset(i) =
+                    F80::of_f64(aliased[i as usize]);
+            }
+        }
     }
 }
 
@@ -272,7 +293,10 @@ impl F80 {
             // Normalize: find the leading 1 bit
             let shift = mant.leading_zeros() - 12; // 12 because top 12 bits of u64 are unused
             let normalized_mant = mant << (shift + 1); // shift out the leading 1, then we add J-bit
-            let f80_exp = (1 - 1023 + 16383 - shift as i32) as u16;
+            // A subnormal is mant * 2^-1074 with its leading 1 at bit L = 51 - shift, so the
+            // f80 field is 16383 + L - 1074 = 16383 - 1023 - shift. Biasing it as if the
+            // implicit bit were present (1 - 1023) doubles the value.
+            let f80_exp = (-1023 + 16383 - shift as i32) as u16;
             return F80 {
                 mantissa: 0x8000000000000000 | (normalized_mant << 11),
                 sign_exponent: (sign << 15) | f80_exp,

@@ -159,6 +159,7 @@ pub unsafe fn fpu_load_m80(addr: i32) -> OrPageFault<F80> {
     // 0x7FFE (2^16383, e.g. LDBL_MAX) is a legal image that aliases RELAXED_TAG; while
     // relaxed mode is on it would be decoded as f64 bits, so re-express it as a relaxed
     // value (out of f64 range -> the infinity every operation on it would produce anyway).
+    // The tag is positive-only, so the negative image (0xFFFE) is never misread as relaxed.
     // This is the only path by which a guest-authored 80-bit image enters a register.
     if crate::softfloat::is_fpu_relaxed() && sign_exponent == crate::softfloat::RELAXED_TAG {
         return Ok(F80::of_f64(v.to_f64_strict()));

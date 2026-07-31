@@ -471,6 +471,34 @@ function build_image(bodyName)
             fnstsw_ax();
             movMemEax(LAST);                   // LAST = status word (SF|IE, C1 clear)
         },
+        // A 9th push onto a full stack is an OVERFLOW: fpu_push sets C1 + SF|IE and writes
+        // INDEFINITE_NAN, keeping the live register — it does not silently store the value.
+        push_overflow() {
+            emit(0xDB, 0xE3);                  // fninit (empty stack, SW=0, TOP=0)
+            for(let i = 0; i < 8; i++) fld64(C64B);   // fill the stack with 1.25 -> TOP=0
+            fld64(C64);                        // 9th push of 0.75 -> overflow
+            emit(0x31, 0xC0);                  // xor eax,eax
+            fnstsw_ax();
+            movMemEax(LAST);                   // LAST = status word
+            fstp64(ACC);                       // ACC = ST(0) after the 9th push
+            emit(0xDB, 0xE3);                  // fninit (drain for the next iteration)
+        },
+        // FST ST(i) reads ST(0) through fpu_get_st0: an EMPTY source raises SF|IE and stores
+        // INDEFINITE_NAN, so a raw slot copy would resurrect the freed slot's stale bytes.
+        fst_empty_src() {
+            emit(0xDB, 0xE3);                  // fninit
+            fld1();                            // TOP=7
+            fld64(C64);                        // TOP=6, phys6 = 0.75
+            emit(0xDD, 0xC0);                  // ffree st(0) -> phys6 empty, stale bytes = 0.75
+            emit(0xDB, 0xE2);                  // fnclex (measure this iteration's flags)
+            fst_sti(1);                        // FST ST(1) with an empty source
+            emit(0x31, 0xC0);                  // xor eax,eax
+            fnstsw_ax();
+            movMemEax(LAST);                   // LAST = status word
+            emit(0xD9, 0xF7);                  // fincstp -> ST(0) is now the destination
+            fstp64(ACC);                       // ACC = what FST wrote into ST(1)
+            emit(0xDB, 0xE3);                  // fninit
+        },
         // A successful push clears C1 (fpu_push); FXAM sets it first so a skipped clear shows.
         push_c1() {
             fld64(C64);                        // 0.75
@@ -566,7 +594,9 @@ const variants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_st
     "fcom_mem", "fst_reg", "fild_widths", "fist16_round", "consts_all", "fcomi_more", "tl_mix",
     "fnstsw_top", "fiarith32", "fiarith16",
     // architectural state the inline paths used to drop: tag word, empty-slot reads, C1
-    "fst_tagword", "fld_empty", "push_c1"]
+    "fst_tagword", "fld_empty", "push_c1",
+    // stack faults the inline paths used to swallow: push overflow, FST from an empty ST(0)
+    "push_overflow", "fst_empty_src"]
     // optional argv filter: `node tests/fpu-relaxed-diff.mjs fld_empty push_c1`
     .filter(v => process.argv.length <= 2 || process.argv.slice(2).includes(v));
 // FCOM/FXCH between two relaxed values must not fall back to the helper (that re-poisons

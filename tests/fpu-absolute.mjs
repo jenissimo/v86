@@ -58,6 +58,145 @@ function build_image()
     return buf;
 }
 
+// A STRICT-mode FLD m64 / FSTP m64 of an f64 subnormal must round-trip bit-exactly: the
+// pair is of_f64_strict -> to_f64_strict, so a biasing error in either shows up here.
+// Relaxed mode never reaches of_f64_strict on this path (of_f64 short-circuits), which is
+// why only the strict rows can catch it.
+const SUBNORM = DATA + 64;      // largest f64 subnormal, 0x000FFFFFFFFFFFFF
+const SUBNORM_OUT = DATA + 72;
+const SUBNORM_LO = 0xFFFFFFFF, SUBNORM_HI = 0x000FFFFF;
+
+function build_subnormal_image()
+{
+    const IMG_SIZE = 0x4000;
+    const buf = new Uint8Array(IMG_SIZE);
+    const dv = new DataView(buf.buffer);
+    const MAGIC = 0x1BADB002, FLAGS = 0x10000;
+    dv.setUint32(0x00, MAGIC, true);
+    dv.setUint32(0x04, FLAGS, true);
+    dv.setUint32(0x08, (-(MAGIC + FLAGS)) >>> 0, true);
+    dv.setUint32(0x0c, BASE, true);
+    dv.setUint32(0x10, BASE, true);
+    dv.setUint32(0x14, BASE + IMG_SIZE, true);
+    dv.setUint32(0x18, BASE + IMG_SIZE, true);
+    dv.setUint32(0x1c, BASE + ENTRY_OFF, true);
+
+    dv.setUint32(SUBNORM - BASE, SUBNORM_LO, true);
+    dv.setUint32(SUBNORM - BASE + 4, SUBNORM_HI, true);
+
+    let o = ENTRY_OFF;
+    const emit = (...b) => { for(const x of b) buf[o++] = x & 0xff; };
+    const imm32 = (v) => { dv.setUint32(o, v >>> 0, true); o += 4; };
+
+    emit(0xBC); imm32(0x200000);            // mov esp, 0x200000
+    emit(0xDB, 0xE3);                       // fninit
+    emit(0xDD, 0x05); imm32(SUBNORM);       // fld  qword [subnormal]
+    emit(0xDD, 0x1D); imm32(SUBNORM_OUT);   // fstp qword
+    emit(0xA1); imm32(SUBNORM_OUT);         // mov eax, [lo]
+    emit(0x8B, 0x1D); imm32(SUBNORM_OUT+4); // mov ebx, [hi]
+    emit(0xF4);                             // hlt
+    emit(0xEB, 0xFE);
+    return buf;
+}
+
+function run_subnormal({ jit, relaxed })
+{
+    return new Promise((resolve) => {
+        const img = build_subnormal_image();
+        const emulator = new V86({ autostart:false, memory_size:16*1024*1024,
+                                   disable_jit: jit ? 0 : 1, log_level:0 });
+        let timer;
+        const finish = (status) => {
+            clearTimeout(timer);
+            const cpu = emulator.v86.cpu;
+            const r = { status, eax: cpu.reg32[0]>>>0, ebx: cpu.reg32[3]>>>0 };
+            try { emulator.stop(); } catch(e) {}
+            resolve(r);
+        };
+        emulator.bus.register("cpu-event-halt", () => finish("halt"));
+        emulator.add_listener("emulator-loaded", () => {
+            const cpu = emulator.v86.cpu;
+            const setRelaxed = cpu.wm.exports.set_relaxed_fpu;
+            setRelaxed(relaxed ? 1 : 0);
+            cpu.reboot_internal(); cpu.reset_memory();
+            cpu.load_multiboot(img.buffer);
+            setRelaxed(relaxed ? 1 : 0);
+            timer = setTimeout(() => finish("HANG"), 15000);
+            emulator.run();
+        });
+    });
+}
+
+// Mid-run mode switch: FLD m80 in STRICT mode leaves a genuine 2^16383-scale value in the
+// register (its exponent field is RELAXED_TAG); the OUT toggles relaxed on, and the FSTP
+// must still see +Inf rather than the mantissa reinterpreted as raw f64 bits. Single pass,
+// so this runs in the interpreter — it characterises set_relaxed_fpu, not the codegen.
+const TOGGLE_PORT = 0x8888;
+
+function build_toggle_image()
+{
+    const IMG_SIZE = 0x4000;
+    const buf = new Uint8Array(IMG_SIZE);
+    const dv = new DataView(buf.buffer);
+    const MAGIC = 0x1BADB002, FLAGS = 0x10000;
+    dv.setUint32(0x00, MAGIC, true);
+    dv.setUint32(0x04, FLAGS, true);
+    dv.setUint32(0x08, (-(MAGIC + FLAGS)) >>> 0, true);
+    dv.setUint32(0x0c, BASE, true);
+    dv.setUint32(0x10, BASE, true);
+    dv.setUint32(0x14, BASE + IMG_SIZE, true);
+    dv.setUint32(0x18, BASE + IMG_SIZE, true);
+    dv.setUint32(0x1c, BASE + ENTRY_OFF, true);
+
+    dv.setUint32(LDBLMAX - BASE, 0xFFFFFFFF, true);
+    dv.setUint32(LDBLMAX - BASE + 4, 0xFFFFFFFF, true);
+    dv.setUint16(LDBLMAX - BASE + 8, 0x7FFE, true);
+
+    let o = ENTRY_OFF;
+    const emit = (...b) => { for(const x of b) buf[o++] = x & 0xff; };
+    const imm32 = (v) => { dv.setUint32(o, v >>> 0, true); o += 4; };
+
+    emit(0xBC); imm32(0x200000);            // mov esp, 0x200000
+    emit(0xDB, 0xE3);                       // fninit
+    emit(0xDB, 0x2D); imm32(LDBLMAX);       // fld  tbyte [LDBL_MAX]
+    emit(0xBA); imm32(TOGGLE_PORT);         // mov edx, TOGGLE_PORT
+    emit(0xEE);                             // out dx, al  -> host flips relaxed on
+    emit(0xDD, 0x1D); imm32(OUT_C);         // fstp qword
+    emit(0xA1); imm32(OUT_C);               // mov eax, [lo]
+    emit(0x8B, 0x15); imm32(OUT_C + 4);     // mov edx, [hi]
+    emit(0xF4);                             // hlt
+    emit(0xEB, 0xFE);
+    return buf;
+}
+
+function run_toggle()
+{
+    return new Promise((resolve) => {
+        const img = build_toggle_image();
+        const emulator = new V86({ autostart:false, memory_size:16*1024*1024,
+                                   disable_jit: 1, log_level:0 });
+        let timer;
+        const finish = (status) => {
+            clearTimeout(timer);
+            try { emulator.stop(); } catch(e) {}
+            const cpu = emulator.v86.cpu;
+            resolve({ status, eax: cpu.reg32[0]>>>0, edx: cpu.reg32[2]>>>0 });
+        };
+        emulator.bus.register("cpu-event-halt", () => finish("halt"));
+        emulator.add_listener("emulator-loaded", () => {
+            const cpu = emulator.v86.cpu;
+            const setRelaxed = cpu.wm.exports.set_relaxed_fpu;
+            setRelaxed(0);
+            cpu.reboot_internal(); cpu.reset_memory();
+            cpu.load_multiboot(img.buffer);
+            setRelaxed(0);
+            cpu.io.register_write(TOGGLE_PORT, cpu, () => setRelaxed(1));
+            timer = setTimeout(() => finish("HANG"), 15000);
+            emulator.run();
+        });
+    });
+}
+
 function run({ jit, relaxed })
 {
     return new Promise((resolve) => {
@@ -101,6 +240,22 @@ for(const jit of [false, true]) {
                 `significand=${hex(r.ebx)}:${hex(r.eax)} ${okSig?"OK":"<<< BAD (want bff00000:00000000)"}`,
                 `exponent=${hex(r.ecx)} ${okExp?"OK":"<<< BAD (want 40080000)"}`,
                 `m80=${hex(r.edx)} ${okM80?"OK":"<<< BAD (want 7ff00000)"}`);
+}
+{
+    const r = await run_toggle();
+    const okToggle = r.edx === 0x7FF00000 && r.eax === 0;
+    if(!okToggle) fail = true;
+    console.log(`strict->relaxed toggle ${r.status}`,
+                `m80=${hex(r.edx)}:${hex(r.eax)} ${okToggle?"OK":"<<< BAD (want 7ff00000:00000000)"}`);
+}
+for(const relaxed of [false, true])
+for(const jit of [false, true]) {
+    const r = await run_subnormal({ jit, relaxed });
+    const ok = r.ebx === SUBNORM_HI && r.eax === SUBNORM_LO;
+    if(!ok) fail = true;
+    console.log(`subnormal round-trip relaxed=${relaxed?1:0} jit=${jit?1:0} ${r.status}`,
+                `out=${hex(r.ebx)}:${hex(r.eax)}`,
+                ok ? "OK" : `<<< BAD (want ${hex(SUBNORM_HI)}:${hex(SUBNORM_LO)})`);
 }
 console.log(fail ? "VERDICT: FAIL" : "VERDICT: all OK");
 process.exit(fail ? 1 : 0);
