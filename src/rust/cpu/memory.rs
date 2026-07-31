@@ -64,7 +64,7 @@ static mut OOB_LAST: [u32; 4] = [0; 4];
 pub fn memory_get_oob_writes() -> u32 { unsafe { OOB_WRITES } }
 #[no_mangle]
 pub fn memory_get_oob_info(i: u32) -> u32 {
-    unsafe { *OOB_LAST.get(i as usize).unwrap_or(&0) }
+    unsafe { (&*std::ptr::addr_of!(OOB_LAST)).get(i as usize).copied().unwrap_or(0) }
 }
 
 /// Returns false ONLY for an address that cannot possibly be guest RAM and whose

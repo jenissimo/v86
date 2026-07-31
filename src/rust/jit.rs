@@ -222,7 +222,7 @@ pub fn jit_get_wrong_entry_chain() -> u32 { unsafe { WRONG_ENTRY_CHAIN } }
 pub fn jit_get_ret_memo_mismatch() -> u32 { unsafe { RET_MEMO_MISMATCH } }
 #[no_mangle]
 pub fn jit_get_wrong_entry_info(i: u32) -> u32 {
-    unsafe { *WRONG_ENTRY_LAST.get(i as usize).unwrap_or(&0) }
+    unsafe { (&*std::ptr::addr_of!(WRONG_ENTRY_LAST)).get(i as usize).copied().unwrap_or(0) }
 }
 #[no_mangle]
 pub fn jit_get_ret_memo_stale_live() -> u32 { unsafe { RET_MEMO_STALE_LIVE } }
@@ -290,11 +290,11 @@ pub fn jit_verify_dispatch_entry(
             for off in 0..0x1000usize {
                 let st = unsafe { DISPATCH_SLABS[slab * 0x1000 + off] };
                 // Cells hold state + 1, so 0 — not u16::MAX — is the miss sentinel
-                // (see dispatch_state_lookup). Testing against u16::MAX counted every
-                // empty cell as an entry, making n ≈ 0x1000 and the pairs meaningless.
+                // (see dispatch_state_lookup), and the reported state must be decoded
+                // back so it is comparable with the tag-5 record below.
                 if st != 0 {
                     if n < 2 {
-                        pairs[n] = (off as u32) << 16 | st as u32;
+                        pairs[n] = (off as u32) << 16 | (st - 1) as u32;
                     }
                     n += 1;
                 }
@@ -857,7 +857,7 @@ static mut SLAB_AUDIT_LAST: [u32; 3] = [0; 3];
 
 #[no_mangle]
 pub fn jit_slab_audit_last(i: u32) -> u32 {
-    unsafe { *SLAB_AUDIT_LAST.get(i as usize).unwrap_or(&0) }
+    unsafe { (&*std::ptr::addr_of!(SLAB_AUDIT_LAST)).get(i as usize).copied().unwrap_or(0) }
 }
 
 /// Unpublish a page. Returns true if the page actually had an entry (callers use
