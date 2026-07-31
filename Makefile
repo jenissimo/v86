@@ -236,6 +236,12 @@ with-profiler: $(RUST_FILES) build/zstddeclib.o Cargo.toml
 	cargo rustc --release --features profiler $(CARGO_FLAGS)
 	cp build/wasm32-unknown-unknown/release/v86.wasm build/v86.wasm || true
 
+# The aot-driver spike ships in no wasm build, so only this keeps it compiling against jit.rs.
+# Its own target dir: swapping the feature set in build/ would invalidate every cached artifact
+# there and force the next real build to redo the world.
+check-aot-driver: $(RUST_FILES)
+	cargo check --features aot-driver --target wasm32-unknown-unknown --target-dir build/check-aot-driver
+
 watch:
 	cargo watch -x 'rustc $(CARGO_FLAGS)' -s 'cp build/wasm32-unknown-unknown/debug/v86.wasm build/v86-debug.wasm'
 
@@ -361,7 +367,7 @@ api-tests: build/v86-debug.wasm
 	./tests/api/reboot.js
 	./tests/api/pic.js
 
-all-tests: eslint kvm-unit-test qemutests qemutests-release jitpagingtests api-tests nasmtests nasmtests-force-jit rust-test tests expect-tests
+all-tests: eslint check-aot-driver kvm-unit-test qemutests qemutests-release jitpagingtests api-tests nasmtests nasmtests-force-jit rust-test tests expect-tests
 	# Skipping:
 	# - devices-test (hangs)
 

@@ -5,6 +5,7 @@ tests/jit-paging/test-jit
 tests/jit-paging/test-jit-smc
 *.map
 build/
+target/
 closure-compiler/
 images/
 *.bak
