@@ -360,11 +360,6 @@ static mut JIT_TIER2_RET_SPEC_MAX_INSTR: u32 = 96;
 // modules (cold code keeps the global MAX_PAGES), so the V8 large-function OOM risk
 // that forbids raising the global cap doesn't apply at moderate values.
 static mut TIER2_MAX_PAGES: u32 = 8;
-// Split-range fastmem read shape: two early-exit range tests instead of the
-// 4-compare and/or chain — hot below-guard reads drop ~25 → ~10 wasm ops. Same
-// acceptance set; A/B via set_jit_config idx 18 + JIT cache clear (shape is baked in
-// at module compile time).
-static mut JIT_FASTMEM_READ_SPLIT: bool = true;
 const TIER2_PAGE_SET_CAP: usize = 256;
 static mut MODULE_EXEC_COUNTS: [u32; 0x10000] = [0; 0x10000];
 
@@ -564,7 +559,6 @@ pub fn jit_tier2_drain_pending() {
 }
 
 static mut JIT_DEAD_FLAG_ELISION: bool = false;
-static mut JIT_FASTMEM_READS: bool = false;
 static mut JIT_X87_LOCALS: bool = false;
 static mut JIT_PUSH_RUN_COALESCING: bool = false;
 // Fastmem WRITES behind a per-page writability map (idx 19).
@@ -642,34 +636,12 @@ fn ret_chaining_enabled() -> bool { unsafe { JIT_RET_CHAINING } }
 fn ret_speculation_enabled() -> bool { unsafe { JIT_RET_SPECULATION } }
 fn dead_flag_elision_enabled() -> bool { unsafe { JIT_DEAD_FLAG_ELISION } }
 
-// Indices 0/1 remain as stable stat-array slots + TS label names ('tlbFullClear',
-// 'tlbClear'); the TLB-clear sites no longer bump (see cpu.rs), so nothing emits
-// them from Rust now — kept for the stats layout and possible future use.
-#[allow(dead_code)]
-pub const FASTMEM_BUMP_TLB_FULL_CLEAR: u32 = 0;
-#[allow(dead_code)]
-pub const FASTMEM_BUMP_TLB_CLEAR: u32 = 1;
-pub const FASTMEM_BUMP_INVLPG: u32 = 2;
-#[allow(dead_code)]
-pub const FASTMEM_BUMP_ADDRESS_SPACE_PROTECT: u32 = 3;
-#[allow(dead_code)]
-pub const FASTMEM_BUMP_ADDRESS_SPACE_RELEASE: u32 = 4;
-#[allow(dead_code)]
-pub const FASTMEM_BUMP_PAGE_TABLE_DECOMMIT: u32 = 5;
-#[allow(dead_code)]
-pub const FASTMEM_BUMP_PAGE_TABLE_COMMIT: u32 = 6;
-#[allow(dead_code)]
-pub const FASTMEM_BUMP_PAGE_TABLE_PROTECT: u32 = 7;
-pub const FASTMEM_BUMP_WRITE_WATCH: u32 = 8;
-#[allow(dead_code)]
-pub const FASTMEM_BUMP_MANUAL: u32 = 9;
-const FASTMEM_BUMP_SOURCE_COUNT: usize = 10;
 
-static mut FASTMEM_BUMPS_BY_SOURCE: [u32; FASTMEM_BUMP_SOURCE_COUNT] =
-    [0; FASTMEM_BUMP_SOURCE_COUNT];
-static mut FASTMEM_SPECULATED_LOADS_COMPILED: u32 = 0;
-static mut FASTMEM_DEOPT_RECOMPILES: u32 = 0;
-static mut FASTMEM_THRASH_LATCHED: bool = false;
+// ── Fastmem READ map ───────────────────────────────────────────────────────
+// One byte per 4 KB virtual page. The JIT loads this byte for every speculative
+// read, so a mapping/protection change is a local data update, never a global
+// JIT invalidation. Byte 1 means exactly: present, identity-mapped RAM, outside
+// low memory and the guard band. All other values force the normal TLB path.
 
 // ── Fastmem WRITE map ─────────────────────────────────────────────────────────────
 // One byte per 4 KB VA page across the full 4 GB space (1 MB static). The JIT store
@@ -713,11 +685,6 @@ static mut FASTMEM_WRITE_EXCLUDE_HI_PAGE: u32 = 0;
 // meta packing: state_flags(u32) << 32 | wasm_table_index(u16) << 16 | slab(u16).
 // meta == 0 ⇒ page has no compiled code. Slab index 0 is RESERVED-invalid so the
 // zero word stays an unambiguous sentinel; usable slabs are 1..DISPATCH_SLAB_COUNT.
-//
-// The per-unit fastmem generation was deliberately DROPPED from the lookup path:
-// a stale-generation unit that gets dispatched self-deopts via its own prologue
-// guard (jit_generate_module's fastmem_generation check) on entry — one extra
-// bounce right after a generation bump, identical observable behavior.
 //
 // Maintenance funnels are exactly the old tlb_code writers: set_tlb_code (compile/
 // TLB-fill) and cpu::clear_tlb_code (eviction/invlpg/dirty) — no new choke points.
@@ -886,14 +853,6 @@ pub fn dispatch_slab_high_water() -> u32 { unsafe { DISPATCH_SLAB_HIGH_WATER } }
 #[no_mangle]
 pub fn dispatch_slab_overflows() -> u32 { unsafe { DISPATCH_SLAB_OVERFLOWS } }
 
-// Coarse remap-thrash latch, using guest icount as the clock.
-static mut FASTMEM_THRASH_WINDOW_START: u32 = 0;
-static mut FASTMEM_THRASH_WINDOW_BUMPS: u32 = 0;
-// ~50M guest instructions ≈ a fraction of a second at in-game rates.
-const FASTMEM_THRASH_WINDOW_ICOUNT: u32 = 50_000_000;
-// > ~4 remaps/frame sustained across the window.
-const FASTMEM_THRASH_BUMP_LIMIT: u32 = 240;
-
 // Compile-site counters; runtime hit/fill split is not instrumented.
 static mut X87_LOCAL_CACHE_LOAD_SITES_COMPILED: u32 = 0;
 static mut X87_LOCAL_CACHE_STORES_COMPILED: u32 = 0;
@@ -915,34 +874,10 @@ pub fn fastmem_get_guard_base() -> u32 { FASTMEM_GUARD_BASE }
 pub fn fastmem_get_guard_size() -> u32 { FASTMEM_GUARD_SIZE }
 
 #[inline]
-pub fn fastmem_current_generation() -> u64 {
-    unsafe { *global_pointers::fastmem_generation }
-}
-
-#[inline]
-pub fn fastmem_compile_generation(state_flags: CachedStateFlags) -> Option<u64> {
-    unsafe {
-        if !JIT_FASTMEM_READS
-            || !state_flags.is_32()
-            || !*global_pointers::protected_mode
-            || (*global_pointers::cr & cpu::CR0_PG) == 0
-            || FASTMEM_THRASH_LATCHED
-        {
-            None
-        }
-        else {
-            Some(*global_pointers::fastmem_generation)
-        }
-    }
-}
-
-#[inline]
 pub fn x87_locals_enabled() -> bool { unsafe { JIT_X87_LOCALS } }
 
 #[inline]
 pub fn push_run_coalescing_enabled() -> bool { unsafe { JIT_PUSH_RUN_COALESCING } }
-
-pub fn fastmem_read_split_enabled() -> bool { unsafe { JIT_FASTMEM_READ_SPLIT } }
 
 #[inline]
 pub fn flag_locals_enabled() -> bool { unsafe { JIT_FLAG_LOCALS } }
@@ -1167,63 +1102,6 @@ pub fn push_run_note_reuse_branch_compiled() {
     }
 }
 
-#[inline]
-pub fn fastmem_note_speculated_load_compiled() {
-    unsafe {
-        FASTMEM_SPECULATED_LOADS_COMPILED =
-            FASTMEM_SPECULATED_LOADS_COMPILED.saturating_add(1);
-    }
-}
-
-#[no_mangle]
-pub fn fastmem_bump_generation(source: u32) {
-    unsafe {
-        // 0 is the non-fastmem Code sentinel.
-        *global_pointers::fastmem_generation =
-            (*global_pointers::fastmem_generation).wrapping_add(1);
-        let idx = (source as usize).min(FASTMEM_BUMP_SOURCE_COUNT - 1);
-        FASTMEM_BUMPS_BY_SOURCE[idx] = FASTMEM_BUMPS_BY_SOURCE[idx].saturating_add(1);
-
-        // Thrash auto-latch: only relevant while speculation is live.
-        if JIT_FASTMEM_READS && !FASTMEM_THRASH_LATCHED {
-            FASTMEM_THRASH_WINDOW_BUMPS = FASTMEM_THRASH_WINDOW_BUMPS.saturating_add(1);
-            let icount = *global_pointers::instruction_counter;
-            let elapsed = icount.wrapping_sub(FASTMEM_THRASH_WINDOW_START);
-            if elapsed >= FASTMEM_THRASH_WINDOW_ICOUNT {
-                if FASTMEM_THRASH_WINDOW_BUMPS >= FASTMEM_THRASH_BUMP_LIMIT {
-                    FASTMEM_THRASH_LATCHED = true;
-                    let bumps = FASTMEM_THRASH_WINDOW_BUMPS;
-                    dbg_log!("fastmem: thrash-latched off, {} bumps/window", bumps);
-                }
-                FASTMEM_THRASH_WINDOW_START = icount;
-                FASTMEM_THRASH_WINDOW_BUMPS = 0;
-            }
-        }
-    }
-}
-
-#[no_mangle]
-pub fn fastmem_get_generation() -> u32 { fastmem_current_generation() as u32 }
-
-#[no_mangle]
-pub fn fastmem_get_bump_count(source: u32) -> u32 {
-    unsafe {
-        let idx = (source as usize).min(FASTMEM_BUMP_SOURCE_COUNT - 1);
-        FASTMEM_BUMPS_BY_SOURCE[idx]
-    }
-}
-
-#[no_mangle]
-pub fn fastmem_get_speculated_loads_compiled() -> u32 {
-    unsafe { FASTMEM_SPECULATED_LOADS_COMPILED }
-}
-
-#[no_mangle]
-pub fn fastmem_get_deopt_recompiles() -> u32 { unsafe { FASTMEM_DEOPT_RECOMPILES } }
-
-#[no_mangle]
-pub fn fastmem_get_thrash_latched() -> u32 { unsafe { FASTMEM_THRASH_LATCHED as u32 } }
-
 #[no_mangle]
 pub fn x87_locals_get_cache_load_sites_compiled() -> u32 {
     unsafe { X87_LOCAL_CACHE_LOAD_SITES_COMPILED }
@@ -1320,6 +1198,9 @@ struct JitState {
     pages: HashMap<Page, PageInfo>,
     wasm_table_index_free_list: Vec<WasmTableIndex>,
     compiling: Option<(WasmTableIndex, CompilingPageState)>,
+    // Rust owns this reservation until commit or abort. JS must clear its corresponding
+    // table entry before calling abort; Rust never infers ownership from that table.
+    aot_staged: Option<AotTransaction>,
     // B3 hotness tiering: pages promoted to tier-2 (jit_tier2_note_execution) — modules
     // whose entries land on these pages compile with the expanded tier-2 budgets.
     // Survives jit_clear_cache (the pages are still the hot ones); dies with the wasm
@@ -1349,9 +1230,13 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
         HashSet::from_iter(ctx.wasm_table_index_free_list.iter().copied());
     let used = HashSet::from_iter(ctx.pages.values().map(|info| info.wasm_table_index));
     let compiling = HashSet::from_iter(ctx.compiling.as_ref().map(|&(index, _)| index));
+    let staged = HashSet::from_iter(ctx.aot_staged.as_ref().map(|tx| tx.wasm_table_index));
     dbg_assert!(free.intersection(&used).next().is_none());
     dbg_assert!(used.intersection(&compiling).next().is_none());
-    dbg_assert!(free.len() + used.len() + compiling.len() == (WASM_TABLE_SIZE - 1) as usize);
+    dbg_assert!(free.intersection(&staged).next().is_none());
+    dbg_assert!(used.intersection(&staged).next().is_none());
+    dbg_assert!(compiling.intersection(&staged).next().is_none());
+    dbg_assert!(free.len() + used.len() + compiling.len() + staged.len() == (WASM_TABLE_SIZE - 1) as usize);
 
     let hidden: HashSet<WasmTableIndex> = ctx
         .pages
@@ -1360,6 +1245,7 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
         .collect();
     dbg_assert!(free.intersection(&hidden).next().is_none());
     dbg_assert!(hidden.is_subset(&used));
+    dbg_assert!(hidden.intersection(&staged).next().is_none());
 
     #[cfg(debug_assertions)]
     for (wasm_table_index, pages) in &ctx.wasm_table_index_to_page {
@@ -1419,6 +1305,7 @@ impl JitState {
 
             wasm_table_index_free_list: Vec::from_iter(wasm_table_indices),
             compiling: None,
+            aot_staged: None,
             tier2_pages: HashSet::new(),
             tier2_blocked_pages: HashSet::new(),
 
@@ -1555,7 +1442,6 @@ pub struct JitContext<'a> {
     pub fpu_simd_dirty_marked: bool,
     pub elide_current_flags: bool,
     pub instruction_counter: WasmLocal,
-    pub fastmem_generation: Option<u64>,
     /// Emit the per-page-map store fast path for this unit.
     pub fastmem_writes: bool,
     pub x87_local_cache: [Option<X87LocalCacheSlot>; 8],
@@ -2897,8 +2783,6 @@ fn jit_analyze_and_generate(
     let basic_block_by_addr: HashMap<u32, BasicBlock> =
         basic_blocks.into_iter().map(|b| (b.addr, b)).collect();
 
-    let fastmem_generation = fastmem_compile_generation(state_flags);
-
     let entries = jit_generate_module(
         structure,
         &basic_block_by_addr,
@@ -2906,7 +2790,6 @@ fn jit_analyze_and_generate(
         &mut ctx.wasm_builder,
         wasm_table_index,
         state_flags,
-        fastmem_generation,
     );
     dbg_assert!(!entries.is_empty());
 
@@ -2970,6 +2853,86 @@ fn jit_analyze_and_generate(
     );
 
     check_jit_state_invariants(ctx);
+}
+
+// [wasm_table_index, phys_addr, error_kind, recovery_status]
+static mut CODEGEN_FINALIZE_FAILURE_LAST: [u32; 4] = [0; 4];
+static mut CODEGEN_FINALIZE_FAILURE_COUNT: u32 = 0;
+
+#[no_mangle]
+pub fn codegen_get_finalize_failure_count() -> u32 {
+    unsafe { CODEGEN_FINALIZE_FAILURE_COUNT }
+}
+
+const AOT_TX_MAX_PAGES: usize = 256;
+const AOT_TX_MAX_ENTRIES_PER_PAGE: usize = 4096;
+const AOT_TX_MAX_ENTRIES: usize = 65_536;
+
+struct AotStagedPage {
+    page: Page,
+    info: PageInfo,
+    expected_entries: usize,
+}
+
+struct AotTransaction {
+    wasm_table_index: WasmTableIndex,
+    expected_pages: usize,
+    pages: Vec<AotStagedPage>,
+    building: Option<AotStagedPage>,
+    entry_total: usize,
+    ready: bool,
+    #[cfg(debug_assertions)]
+    debug_pages: HashSet<Page>,
+}
+
+#[no_mangle]
+pub fn codegen_get_finalize_failure_info(i: u32) -> u32 {
+    unsafe {
+        (&*std::ptr::addr_of!(CODEGEN_FINALIZE_FAILURE_LAST))
+            .get(i as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+#[no_mangle]
+pub fn codegen_is_compiling() -> u32 {
+    let ctx = get_jit_state();
+    ctx.compiling.is_some() as u32
+}
+
+#[no_mangle]
+pub fn codegen_finalize_failed(
+    wasm_table_index: WasmTableIndex,
+    phys_addr: u32,
+    error_kind: u32,
+) -> u32 {
+    let mut ctx = get_jit_state();
+    let recovery_status = if ctx.compiling.is_none() {
+        1
+    }
+    else if ctx.compiling.as_ref().unwrap().0 != wasm_table_index {
+        2
+    }
+    else {
+        let (pending_wasm_table_index, _) = ctx.compiling.take().unwrap();
+        dbg_assert!(pending_wasm_table_index == wasm_table_index);
+        free_wasm_table_index(&mut ctx, pending_wasm_table_index);
+        check_jit_state_invariants(&mut ctx);
+        0
+    };
+
+    unsafe {
+        CODEGEN_FINALIZE_FAILURE_COUNT = CODEGEN_FINALIZE_FAILURE_COUNT.wrapping_add(1);
+        CODEGEN_FINALIZE_FAILURE_LAST = [
+            wasm_table_index.to_u16() as u32,
+            phys_addr,
+            error_kind,
+            recovery_status,
+        ];
+    }
+
+    recovery_status
 }
 
 #[no_mangle]
@@ -3076,112 +3039,221 @@ pub fn codegen_finalize_finished(
 // IAT patching and hle-lib patches) is verified caller-side against guest memory, which
 // keeps the Rust surface at what the RFC asked for: registration, nothing else.
 //
-// Entry points are pushed one at a time rather than read out of a guest buffer, so this
-// path never parses caller memory.
-static mut AOT_PENDING_ENTRIES: Option<Vec<(u16, u16)>> = None;
+// The staged builder never reads caller memory and never truncates caller-provided values.
+// A successful `prepare_finish` means all validation and recoverable allocation are complete;
+// `commit` can therefore move the complete unit into ctx.pages without a fallible step.
+const AOT_TX_OK: u32 = 0;
+const AOT_TX_BAD_STATE: u32 = 1;
+const AOT_TX_BAD_INDEX: u32 = 2;
+const AOT_TX_SLOT_UNAVAILABLE: u32 = 3;
+const AOT_TX_FINGERPRINT_MISMATCH: u32 = 4;
+const AOT_TX_BAD_PAGE_COUNT: u32 = 5;
+const AOT_TX_BAD_PAGE: u32 = 6;
+const AOT_TX_PAGE_OWNED: u32 = 7;
+const AOT_TX_BAD_FLAGS: u32 = 8;
+const AOT_TX_BAD_ENTRY: u32 = 9;
+const AOT_TX_NO_ENTRIES: u32 = 10;
+const AOT_TX_CAPACITY: u32 = 11;
 
-fn aot_pending() -> &'static mut Vec<(u16, u16)> {
-    unsafe {
-        let slot = &mut *std::ptr::addr_of_mut!(AOT_PENDING_ENTRIES);
-        slot.get_or_insert_with(Vec::new)
+#[inline]
+fn aot_tx_release(ctx: &mut JitState, tx: AotTransaction) {
+    let index = tx.wasm_table_index;
+    drop(tx);
+    free_wasm_table_index(ctx, index);
+}
+
+#[no_mangle]
+pub fn jit_aot_tx_begin(wasm_table_index: u32, page_count: u32, fp_lo: u32, fp_hi: u32) -> u32 {
+    let mut ctx = get_jit_state();
+    if ctx.aot_staged.is_some() { return AOT_TX_BAD_STATE; }
+    if wasm_table_index == 0 || wasm_table_index >= WASM_TABLE_SIZE as u32 { return AOT_TX_BAD_INDEX; }
+    if page_count == 0 || page_count as usize > AOT_TX_MAX_PAGES { return AOT_TX_BAD_PAGE_COUNT; }
+    let fingerprint = jit_codegen_fingerprint();
+    if fp_lo != fingerprint as u32 || fp_hi != (fingerprint >> 32) as u32 {
+        return AOT_TX_FINGERPRINT_MISMATCH;
+    }
+    let index = WasmTableIndex(wasm_table_index as u16);
+    if ctx.compiling.as_ref().map_or(false, |(i, _)| *i == index)
+        || ctx.pages.values().any(|info| info.wasm_table_index == index || info.hidden_wasm_table_indices.contains(&index))
+    {
+        return AOT_TX_SLOT_UNAVAILABLE;
+    }
+    let free_at = match ctx.wasm_table_index_free_list.iter().position(|&i| i == index) {
+        Some(position) => position,
+        None => return AOT_TX_SLOT_UNAVAILABLE,
+    };
+    let count = page_count as usize;
+    let mut pages = Vec::new();
+    #[cfg(debug_assertions)]
+    let mut debug_pages = HashSet::new();
+    #[allow(unused_mut)]
+    let mut reserve_failed = pages.try_reserve_exact(count).is_err()
+        || ctx.pages.try_reserve(count).is_err()
+        || ctx.tier2_pages.try_reserve(count).is_err()
+        || ctx.tier2_blocked_pages.try_reserve(count).is_err();
+    #[cfg(debug_assertions)]
+    {
+        reserve_failed = reserve_failed
+            || ctx.wasm_table_index_to_page.try_reserve(1).is_err()
+            || debug_pages.try_reserve(count).is_err();
+    }
+    if reserve_failed {
+        return AOT_TX_CAPACITY;
+    }
+    ctx.wasm_table_index_free_list.swap_remove(free_at);
+    ctx.aot_staged = Some(AotTransaction {
+        wasm_table_index: index,
+        expected_pages: count,
+        pages,
+        building: None,
+        entry_total: 0,
+        ready: false,
+        #[cfg(debug_assertions)]
+        debug_pages,
+    });
+    check_jit_state_invariants(&mut ctx);
+    AOT_TX_OK
+}
+
+#[no_mangle]
+pub fn jit_aot_tx_page_begin(phys_addr: u32, state_flags: u32, entry_count: u32) -> u32 {
+    let mut ctx = get_jit_state();
+    let ram = unsafe { *global_pointers::memory_size };
+    if phys_addr & 0xFFF != 0 || phys_addr > ram || ram - phys_addr < 0x1000 { return AOT_TX_BAD_PAGE; }
+    if state_flags & !0x0F != 0 { return AOT_TX_BAD_FLAGS; }
+    let page = Page::page_of(phys_addr);
+    if ctx.pages.contains_key(&page) { return AOT_TX_PAGE_OWNED; }
+    let tx = match ctx.aot_staged.as_mut() { Some(tx) if !tx.ready => tx, _ => return AOT_TX_BAD_STATE };
+    if tx.building.is_some() || tx.pages.len() >= tx.expected_pages { return AOT_TX_BAD_STATE; }
+    let count = entry_count as usize;
+    if count > AOT_TX_MAX_ENTRIES_PER_PAGE || tx.entry_total.saturating_add(count) > AOT_TX_MAX_ENTRIES {
+        return AOT_TX_BAD_ENTRY;
+    }
+    if tx.pages.iter().any(|p| p.page == page) { return AOT_TX_PAGE_OWNED; }
+    let mut entries = Vec::new();
+    if entries.try_reserve_exact(count).is_err() { return AOT_TX_CAPACITY; }
+    tx.building = Some(AotStagedPage {
+        page,
+        info: PageInfo {
+            wasm_table_index: tx.wasm_table_index,
+            hidden_wasm_table_indices: vec![],
+            entry_points: entries,
+            state_flags: CachedStateFlags::of_u32(state_flags),
+        },
+        expected_entries: count,
+    });
+    AOT_TX_OK
+}
+
+#[no_mangle]
+pub fn jit_aot_tx_entry_push(page_offset: u32, initial_state: u32) -> u32 {
+    let mut ctx = get_jit_state();
+    let tx = match ctx.aot_staged.as_mut() { Some(tx) if !tx.ready => tx, _ => return AOT_TX_BAD_STATE };
+    let page = match tx.building.as_mut() { Some(page) => page, None => return AOT_TX_BAD_STATE };
+    if page_offset > 0xFFF || initial_state > u16::MAX as u32 || page.info.entry_points.len() >= page.expected_entries {
+        return AOT_TX_BAD_ENTRY;
+    }
+    page.info.entry_points.push((page_offset as u16, initial_state as u16));
+    AOT_TX_OK
+}
+
+#[no_mangle]
+pub fn jit_aot_tx_page_finish() -> u32 {
+    let mut ctx = get_jit_state();
+    let tx = match ctx.aot_staged.as_mut() { Some(tx) if !tx.ready => tx, _ => return AOT_TX_BAD_STATE };
+    let page = match tx.building.take() { Some(page) => page, None => return AOT_TX_BAD_STATE };
+    if page.info.entry_points.len() != page.expected_entries {
+        tx.building = Some(page);
+        return AOT_TX_BAD_ENTRY;
+    }
+    tx.entry_total += page.info.entry_points.len();
+    #[cfg(debug_assertions)]
+    { tx.debug_pages.insert(page.page); }
+    tx.pages.push(page);
+    AOT_TX_OK
+}
+
+#[no_mangle]
+pub fn jit_aot_tx_prepare_finish() -> u32 {
+    let mut ctx = get_jit_state();
+    let tx = match ctx.aot_staged.as_mut() { Some(tx) if !tx.ready => tx, _ => return AOT_TX_BAD_STATE };
+    if tx.building.is_some() || tx.pages.len() != tx.expected_pages { return AOT_TX_BAD_STATE; }
+    if tx.entry_total == 0 { return AOT_TX_NO_ENTRIES; }
+    tx.ready = true;
+    AOT_TX_OK
+}
+
+#[no_mangle]
+pub fn jit_aot_tx_abort() -> u32 {
+    let mut ctx = get_jit_state();
+    match ctx.aot_staged.take() {
+        Some(tx) => {
+            aot_tx_release(&mut ctx, tx);
+            check_jit_state_invariants(&mut ctx);
+            AOT_TX_OK
+        },
+        None => AOT_TX_BAD_STATE,
     }
 }
 
 #[no_mangle]
-pub fn jit_aot_entry_reset() { aot_pending().clear(); }
-
-#[no_mangle]
-pub fn jit_aot_entry_push(page_offset: u32, initial_state: u32) {
-    aot_pending().push((page_offset as u16, initial_state as u16));
+pub fn jit_aot_tx_commit() -> u32 {
+    let mut ctx = get_jit_state();
+    if !ctx.aot_staged.as_ref().map_or(false, |tx| tx.ready) { return AOT_TX_BAD_STATE; }
+    let tx = ctx.aot_staged.take().unwrap();
+    #[cfg(debug_assertions)]
+    let index = tx.wasm_table_index;
+    let page_count = tx.pages.len();
+    #[cfg(debug_assertions)]
+    let debug_pages = tx.debug_pages;
+    for staged in tx.pages {
+        let page = staged.page;
+        ctx.pages.insert(page, staged.info);
+        if ctx.tier2_pages.len() < TIER2_PAGE_SET_CAP {
+            ctx.tier2_pages.insert(page);
+            ctx.tier2_blocked_pages.remove(&page);
+        }
+        else {
+            unsafe { AOT_TIER2_BLOCKED_BY_CAP += 1 };
+            ctx.tier2_blocked_pages.insert(page);
+        }
+    }
+    #[cfg(debug_assertions)]
+    { ctx.wasm_table_index_to_page.insert(index, debug_pages); }
+    unsafe { AOT_REGISTERED = AOT_REGISTERED.wrapping_add(page_count as u32); }
+    check_jit_state_invariants(&mut ctx);
+    AOT_TX_OK
 }
 
-/// Take a free wasm table slot for an AOT unit. Unlike the compile path this NEVER clears
-/// the JIT cache to make room — an AOT registration is best-effort and must not perturb
-/// live modules. 0xFFFF = no slot free.
+#[no_mangle]
+pub fn jit_aot_tx_staged_index() -> u32 {
+    get_jit_state().aot_staged.as_ref().map_or(0xFFFF, |tx| tx.wasm_table_index.to_u16() as u32)
+}
+
+#[no_mangle]
+pub fn jit_aot_free_table_index_count() -> u32 { get_jit_state().wasm_table_index_free_list.len() as u32 }
+
+/// Retired compatibility export. Exact-slot reservation belongs exclusively to
+/// `jit_aot_tx_begin`; this refuses without changing ownership.
 #[no_mangle]
 pub fn jit_aot_alloc_table_index() -> u32 {
-    let mut ctx = get_jit_state();
-    match ctx.wasm_table_index_free_list.pop() {
-        Some(i) => i.to_u16() as u32,
-        None => 0xFFFF,
-    }
+    // Retired: exact-slot ownership belongs exclusively to jit_aot_tx_begin.
+    0xFFFF
 }
 
-/// Hand a slot back when the caller could not instantiate the module after all.
+/// Retired compatibility export. `jit_aot_tx_abort` is the only release path.
 #[no_mangle]
 pub fn jit_aot_free_table_index(wasm_table_index: u32) {
-    // Reject out of range rather than truncating to u16: the 0xFFFF "no index" sentinel
-    // truncated into the free list would be handed to a compile, which then indexes the
-    // wasm table far past its end.
-    if wasm_table_index == 0 || wasm_table_index >= WASM_TABLE_SIZE as u32 {
-        return;
-    }
-    let mut ctx = get_jit_state();
-    let idx = WasmTableIndex(wasm_table_index as u16);
-    if !ctx.wasm_table_index_free_list.contains(&idx) {
-        ctx.wasm_table_index_free_list.push(idx);
-    }
+    let _ = wasm_table_index;
+    // Retired: abort is the only way to release a transaction reservation.
 }
 
-/// Publish an already-instantiated AOT unit for one physical page.
-/// Returns 0 on success, else a refusal code: 1 = bad index, 2 = page already has a
-/// module (the live JIT owns it — never steal it), 3 = no entry points pushed.
+/// Retired compatibility export. Per-page publication is refused to preserve atomic units.
 #[no_mangle]
 pub fn jit_register_aot_module(wasm_table_index: u32, phys_addr: u32, state_flags: u32) -> u32 {
-    let mut ctx = get_jit_state();
-    let index = WasmTableIndex(wasm_table_index as u16);
-    if wasm_table_index == 0 || wasm_table_index >= 0xFFFF {
-        return 1;
-    }
-    let page = Page::page_of(phys_addr);
-    if ctx.pages.contains_key(&page) {
-        return 2;
-    }
-    let entry_points = aot_pending().clone();
-    if entry_points.is_empty() {
-        return 3;
-    }
-    let state_flags = CachedStateFlags::of_u32(state_flags);
-
-    // Deliberately NO eager TLB sweep here, unlike codegen_finalize_finished. That sweep
-    // stamps dispatch meta for every virtual page currently mapped to this physical page,
-    // which is only sound because compilation just happened under the CURRENT mapping. An AOT
-    // unit is published at an arbitrary later moment (at boot the TLB still holds the loader's
-    // transient mappings), so stamping blindly would hand a virtual page a module compiled for
-    // a different one — dispatch into code that never belonged there.
-    //
-    // Publishing only into ctx.pages is enough: update_tlb_code stamps a page lazily when the
-    // TLB entry for it is (re)built. The cost is that a page already in the TLB is not served
-    // by its unit until that entry is refreshed — a missed speedup, never a wrong dispatch.
-    ctx.pages.insert(
-        page,
-        PageInfo {
-            wasm_table_index: index,
-            hidden_wasm_table_indices: vec![],
-            entry_points,
-            state_flags,
-        },
-    );
-
-    // Mark the page tier-2, or the unit lives exactly ONE promotion threshold and then deletes
-    // itself: tier2_promote frees any module whose pages are not all in tier2_pages, and that
-    // set starts empty every boot. This restores a fact rather than asserting a new one — a
-    // unit is captured only AFTER its page was promoted, so the page IS tier-2 by construction.
-    //
-    // The cap is still honored (it is the compile-storm guard); refusals are counted so a
-    // starved registration is visible rather than mysterious.
-    if ctx.tier2_pages.len() < TIER2_PAGE_SET_CAP {
-        ctx.tier2_pages.insert(page);
-        ctx.tier2_blocked_pages.remove(&page);
-    }
-    else {
-        unsafe { AOT_TIER2_BLOCKED_BY_CAP += 1 };
-        ctx.tier2_blocked_pages.insert(page);
-    }
-
-    unsafe { AOT_REGISTERED += 1 };
-    check_jit_state_invariants(&mut ctx);
-    0
+    let _ = (wasm_table_index, phys_addr, state_flags);
+    // Retired: per-page publication would violate unit atomicity.
+    AOT_TX_BAD_STATE
 }
 
 static mut AOT_TIER2_BLOCKED_BY_CAP: u32 = 0;
@@ -3324,7 +3396,6 @@ fn jit_generate_module(
     builder: &mut WasmBuilder,
     wasm_table_index: WasmTableIndex,
     state_flags: CachedStateFlags,
-    fastmem_generation: Option<u64>,
 ) -> Vec<(u32, u16)> {
     builder.reset();
     builder.branch_hint_mask = branch_hint_mask();
@@ -3364,16 +3435,6 @@ fn jit_generate_module(
     let exit_label = builder.block_void();
     let exit_with_fault_label = builder.block_void();
     let main_loop_label = builder.loop_void();
-    if let Some(compiled_generation) = fastmem_generation {
-        builder.load_fixed_i64(global_pointers::fastmem_generation as u32);
-        builder.const_i64(compiled_generation as i64);
-        builder.ne_i64();
-        builder.if_void();
-        builder.const_i32(wasm_table_index.to_u16() as i32);
-        builder.call_fn1("fastmem_deopt_jit_unit");
-        builder.br(exit_label);
-        builder.block_end();
-    }
     if unsafe { JIT_USE_LOOP_SAFETY } {
         builder.get_local(&instruction_counter);
         builder.const_i32(cpu::LOOP_COUNTER);
@@ -3402,7 +3463,6 @@ fn jit_generate_module(
         fpu_simd_dirty_marked: false,
         elide_current_flags: false,
         instruction_counter,
-        fastmem_generation,
         fastmem_writes: fastmem_writes_compile_enabled(state_flags),
         x87_local_cache: std::array::from_fn(|_| None),
         push32_write_cache: None,
@@ -4551,6 +4611,13 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
             _ => {},
         }
 
+        dbg_assert!(
+            ctx.aot_staged
+                .as_ref()
+                .map_or(true, |tx| tx.wasm_table_index != wasm_table_index),
+            "Attempt to free wasm table index that is AOT-staged"
+        );
+
         dbg_assert!(!ctx
             .pages
             .values()
@@ -4781,24 +4848,6 @@ pub fn jit_dirty_cache(start_addr: u32, end_addr: u32) {
 #[no_mangle]
 pub fn jit_dirty_page(page: Page) { jit_dirty_page_ctx(&mut get_jit_state(), page) }
 
-#[no_mangle]
-pub fn fastmem_deopt_jit_unit(wasm_table_index: u32) {
-    let target = WasmTableIndex(wasm_table_index as u16);
-    let mut ctx = get_jit_state();
-
-    let present = ctx.pages.values().any(|info| {
-        info.wasm_table_index == target || info.hidden_wasm_table_indices.contains(&target)
-    });
-    if !present {
-        return;
-    }
-
-    unsafe {
-        FASTMEM_DEOPT_RECOMPILES = FASTMEM_DEOPT_RECOMPILES.saturating_add(1);
-    }
-    free_wasm_module_tree(&mut ctx, target);
-}
-
 /// dirty pages in the range of start_addr and end_addr, which must span at most two pages
 pub fn jit_dirty_cache_small(start_addr: u32, end_addr: u32) {
     dbg_assert!(start_addr < end_addr);
@@ -4965,19 +5014,79 @@ pub fn enter_basic_block(phys_eip: u32) {
     }
 }
 
+pub const JIT_CONFIG_ABI_VERSION: u32 = 1;
+const JIT_CONFIG_SUPPORTED_MASK: u32 = 0x01FB_FDEF;
+const JIT_CONFIG_UNSUPPORTED: u32 = u32::MAX;
+
+#[inline]
+fn jit_config_is_supported(index: u32) -> bool {
+    index < u32::BITS && JIT_CONFIG_SUPPORTED_MASK & (1 << index) != 0
+}
+
 #[no_mangle]
-pub unsafe fn set_jit_config(index: u32, value: u32) {
+pub fn jit_config_abi_version() -> u32 { JIT_CONFIG_ABI_VERSION }
+
+#[no_mangle]
+pub fn jit_config_supported_mask() -> u32 { JIT_CONFIG_SUPPORTED_MASK }
+
+// FNV-1a over the exact inputs that affect emitted JIT wasm. Field order is ABI-stable:
+// configuration indices 1-3, 5-8, 10-14, 16-17, 19, and 21-23; relaxed-FPU mode;
+// DISPATCH_STATS; and the fixed fastmem layout constants. Policy/accounting/diagnostic
+// indices 0, 15, 20, and 24 deliberately do not participate.
+fn jit_codegen_fingerprint() -> u64 {
+    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    let mut add = |value: u32| {
+        hash ^= value as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    };
+    unsafe {
+        add(MAX_PAGES);
+        add(JIT_USE_LOOP_SAFETY as u32);
+        add(MAX_EXTRA_BASIC_BLOCKS);
+        add(JIT_DEAD_FLAG_ELISION as u32);
+        add(JIT_INDIRECT_REGIONS as u32);
+        add(JIT_INDIRECT_REGION_MIN_SHARE);
+        add(JIT_INDIRECT_REGION_MAX_PAGES);
+        add(JIT_X87_LOCALS as u32);
+        add(JIT_PUSH_RUN_COALESCING as u32);
+        add(JIT_RET_CHAINING as u32);
+        add(JIT_RET_SPECULATION as u32);
+        add(JIT_RET_SPEC_MAX_INSTR);
+        add(JIT_TIER2_RET_SPEC_MAX_INSTR);
+        add(TIER2_MAX_PAGES);
+        add(JIT_FASTMEM_WRITES as u32);
+        add(JIT_FLAG_LOCALS as u32);
+        add(JIT_BRANCH_HINTS);
+        add(JIT_BRANCH_HINT_OFFSET_FUZZ);
+        add(DISPATCH_STATS as u32);
+    }
+    add(crate::softfloat::get_relaxed_fpu());
+    add(FASTMEM_LOW_MEM_END);
+    add(FASTMEM_GUARD_BASE);
+    add(FASTMEM_GUARD_SIZE);
+    hash
+}
+
+#[no_mangle]
+pub fn jit_codegen_fingerprint_lo() -> u32 { jit_codegen_fingerprint() as u32 }
+
+#[no_mangle]
+pub fn jit_codegen_fingerprint_hi() -> u32 { (jit_codegen_fingerprint() >> 32) as u32 }
+
+#[no_mangle]
+pub unsafe fn set_jit_config(index: u32, value: u32) -> u32 {
+    if !jit_config_is_supported(index) {
+        return JIT_CONFIG_UNSUPPORTED;
+    }
     match index {
         0 => JIT_DISABLED = value != 0,
         1 => MAX_PAGES = value,
         2 => JIT_USE_LOOP_SAFETY = value != 0,
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
-        // idx 4 retired (static block-chaining removed; use idx 12 dynamic RET chaining)
         5 => JIT_DEAD_FLAG_ELISION = value != 0,
         6 => JIT_INDIRECT_REGIONS = value != 0,
         7 => JIT_INDIRECT_REGION_MIN_SHARE = value,
         8 => JIT_INDIRECT_REGION_MAX_PAGES = value,
-        9 => JIT_FASTMEM_READS = value != 0,
         10 => JIT_X87_LOCALS = value != 0,
         11 => JIT_PUSH_RUN_COALESCING = value != 0,
         12 => JIT_RET_CHAINING = value != 0,
@@ -4986,19 +5095,22 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         15 => JIT_TIER2_THRESHOLD = value,
         16 => JIT_TIER2_RET_SPEC_MAX_INSTR = value,
         17 => TIER2_MAX_PAGES = value,
-        18 => JIT_FASTMEM_READ_SPLIT = value != 0,
         19 => JIT_FASTMEM_WRITES = value != 0,
         20 => JIT_CHAIN_TIER2_ACCOUNTING = value != 0,
         21 => JIT_FLAG_LOCALS = value != 0,
         22 => JIT_BRANCH_HINTS = value,
         23 => JIT_BRANCH_HINT_OFFSET_FUZZ = value,
         24 => WRONG_ENTRY_REFUSE = value,
-        _ => dbg_assert!(false),
+        _ => unreachable!(),
     }
+    0
 }
 
 #[no_mangle]
 pub unsafe fn get_jit_config(index: u32) -> u32 {
+    if !jit_config_is_supported(index) {
+        return JIT_CONFIG_UNSUPPORTED;
+    }
     match index {
         0 => JIT_DISABLED as u32,
         1 => MAX_PAGES as u32,
@@ -5008,7 +5120,6 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         6 => JIT_INDIRECT_REGIONS as u32,
         7 => JIT_INDIRECT_REGION_MIN_SHARE,
         8 => JIT_INDIRECT_REGION_MAX_PAGES,
-        9 => JIT_FASTMEM_READS as u32,
         10 => JIT_X87_LOCALS as u32,
         11 => JIT_PUSH_RUN_COALESCING as u32,
         12 => JIT_RET_CHAINING as u32,
@@ -5017,14 +5128,13 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         15 => JIT_TIER2_THRESHOLD,
         16 => JIT_TIER2_RET_SPEC_MAX_INSTR,
         17 => TIER2_MAX_PAGES,
-        18 => JIT_FASTMEM_READ_SPLIT as u32,
         19 => JIT_FASTMEM_WRITES as u32,
         20 => JIT_CHAIN_TIER2_ACCOUNTING as u32,
         21 => JIT_FLAG_LOCALS as u32,
         22 => JIT_BRANCH_HINTS,
         23 => JIT_BRANCH_HINT_OFFSET_FUZZ,
         24 => WRONG_ENTRY_REFUSE,
-        _ => 0,
+        _ => unreachable!(),
     }
 }
 

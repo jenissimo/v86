@@ -440,7 +440,6 @@ pub static mut DBG_WW_ZERO_PREV: u32 = 0;
 pub static mut DBG_WW_ZERO_HITS: u32 = 0;
 
 #[no_mangle] pub unsafe fn dbg_set_write_watch(addr: u32) {
-    crate::jit::fastmem_bump_generation(crate::jit::FASTMEM_BUMP_WRITE_WATCH);
     // Force the watched page onto the store slow path so dbg_check_write
     // still fires when fastmem writes are on (the fast path bypasses it). Move bit2 from
     // the previously watched page to the new one (addr == 0 disarms → just clear).
@@ -2311,7 +2310,7 @@ pub unsafe fn do_page_walk(
 #[no_mangle]
 pub unsafe fn full_clear_tlb() {
     profiler::stat_increment(stat::FULL_CLEAR_TLB);
-    // TLB flush only; mapping/protect sites bump fastmem_generation.
+    // TLB flush only; read-map maintenance belongs to mapping/protect sites.
     // clear tlb including global pages
     *last_virt_eip = -1;
     for i in 0..valid_tlb_entries_count {
@@ -2332,7 +2331,7 @@ pub unsafe fn full_clear_tlb() {
 #[no_mangle]
 pub unsafe fn clear_tlb() {
     profiler::stat_increment(stat::CLEAR_TLB);
-    // Software TLB eviction only; no fastmem_generation bump.
+    // Software TLB eviction only; it does not change the read-map.
     // clear tlb excluding global pages
     *last_virt_eip = -1;
     let mut global_page_offset = 0;
@@ -2921,6 +2920,8 @@ pub unsafe fn set_cr3(mut cr3: i32) {
         dbg_assert!(cr3 & 0xFFF == 0, "TODO");
     }
     *cr.offset(3) = cr3;
+    // The read map is valid only for BottleShip's explicit identity map. A CR3
+    // change may install arbitrary translations, so fail closed until TS rebuilds it.
     clear_tlb();
 }
 
@@ -4618,8 +4619,9 @@ pub fn clear_tlb_code(page: i32) {
 }
 
 pub unsafe fn invlpg(addr: i32) {
-    jit::fastmem_bump_generation(jit::FASTMEM_BUMP_INVLPG);
     let page = (addr as u32 >> 12) as i32;
+    // A guest may have rewritten this PTE before INVLPG. Clear only this map byte;
+    // all subsequent reads use the authoritative TLB/page walk until TS re-arms it.
     // Note: Doesn't remove this page from valid_tlb_entries: This isn't
     // necessary, because when valid_tlb_entries grows too large, it will be
     // empties by calling clear_tlb, which removes this entry as it isn't global.
@@ -4863,7 +4865,6 @@ pub unsafe fn reset_cpu() {
 
     *mxcsr = 0x1F80;
     *fpu_simd_dirty = 0;
-    *fastmem_generation = 1;
 
     full_clear_tlb();
 

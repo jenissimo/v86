@@ -59,51 +59,15 @@ import { BusConnector } from "./bus.js";
 const DUMP_GENERATED_WASM = false;
 const DUMP_UNCOMPILED_ASSEMBLY = false;
 
-let cached_return_call_indirect_supported;
-function return_call_indirect_supported()
-{
-    if(cached_return_call_indirect_supported !== undefined)
-    {
-        return cached_return_call_indirect_supported;
-    }
-
-    // (module
-    //   (type (func (param i32)))
-    //   (table 1 funcref)
-    //   (func (type 0)
-    //     local.get 0
-    //     i32.const 0
-    //     return_call_indirect (type 0)))
-    const probe = new Uint8Array([
-        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00,
-        0x03, 0x02, 0x01, 0x00,
-        0x04, 0x04, 0x01, 0x70, 0x00, 0x01,
-        0x0a, 0x0b, 0x01, 0x09, 0x00, 0x20, 0x00, 0x41,
-        0x00, 0x13, 0x00, 0x00, 0x0b,
-    ]);
-
-    try {
-        cached_return_call_indirect_supported = WebAssembly.validate(probe);
-    }
-    catch(e) {
-        cached_return_call_indirect_supported = false;
-    }
-    return cached_return_call_indirect_supported;
-}
-
 /** @constructor */
 export function CPU(bus, wm, stop_idling)
 {
     this.stop_idling = stop_idling;
     this.wm = wm;
     this.wasm_patch();
-    this.jit_block_chaining_supported =
-        return_call_indirect_supported() && !globalThis.DISABLE_JIT_BLOCK_CHAINING;
-    this.set_jit_config(4, this.jit_block_chaining_supported ? 1 : 0);
     // Default ON — kill-switch: globalThis.DISABLE_JIT_DEAD_FLAG_ELISION
     this.jit_dead_flag_elision_enabled = !globalThis.DISABLE_JIT_DEAD_FLAG_ELISION;
-    this.set_jit_config(5, this.jit_dead_flag_elision_enabled ? 1 : 0);
+    this.set_jit_config_checked(5, this.jit_dead_flag_elision_enabled ? 1 : 0);
     this.create_jit_imports();
 
     const memory = this.wm.exports.memory;
@@ -415,6 +379,43 @@ CPU.prototype.wasm_patch = function()
 
     this.set_jit_config = get_import("set_jit_config");
     this.get_jit_config = get_import("get_jit_config");
+    this.jit_config_abi_version = get_import("jit_config_abi_version");
+    this.jit_config_supported_mask = get_import("jit_config_supported_mask");
+    this.jit_codegen_fingerprint_lo = get_import("jit_codegen_fingerprint_lo");
+    this.jit_codegen_fingerprint_hi = get_import("jit_codegen_fingerprint_hi");
+
+    for(const name of [
+        "set_jit_config", "get_jit_config", "jit_config_abi_version",
+        "jit_config_supported_mask", "jit_codegen_fingerprint_lo", "jit_codegen_fingerprint_hi",
+    ])
+    {
+        if(typeof this[name] !== "function")
+        {
+            throw new Error("Missing required JIT config ABI export: " + name);
+        }
+    }
+
+    const jit_config_abi = this.jit_config_abi_version() >>> 0;
+    if(jit_config_abi !== 1)
+    {
+        throw new Error("Unsupported JIT config ABI: expected 1, got " + jit_config_abi);
+    }
+    this.jit_config_supported_mask_value = this.jit_config_supported_mask() >>> 0;
+    this.set_jit_config_raw = this.set_jit_config;
+    this.set_jit_config_checked = (index, value) => {
+        if(index >= 32 || !(this.jit_config_supported_mask_value & (1 << index)))
+        {
+            throw new Error("Unsupported JIT config index " + index + " (mask=0x" +
+                this.jit_config_supported_mask_value.toString(16) + ")");
+        }
+        const status = this.set_jit_config_raw(index, value) >>> 0;
+        if(status !== 0)
+        {
+            throw new Error("set_jit_config(" + index + ", " + value + ") failed with status " + status);
+        }
+        return status;
+    };
+    this.set_jit_config = (index, value) => this.set_jit_config_checked(index, value);
 
     this.read8 = get_import("read8");
     this.read16 = get_import("read16");
@@ -456,6 +457,7 @@ CPU.prototype.wasm_patch = function()
     this.jit_clear_cache = get_import("jit_clear_cache_js");
     this.jit_dirty_cache = get_import("jit_dirty_cache");
     this.codegen_finalize_finished = get_import("codegen_finalize_finished");
+    this.codegen_finalize_failed = get_import("codegen_finalize_failed");
 
     this.allocate_memory = get_import("allocate_memory");
     this.zero_memory = get_import("zero_memory");
@@ -1050,7 +1052,7 @@ CPU.prototype.init = function(settings, device_bus)
 
     if(settings.disable_jit)
     {
-        this.set_jit_config(0, 1);
+        this.set_jit_config_checked(0, 1);
     }
 
     settings.cpuid_level && this.set_cpuid_level(settings.cpuid_level);
@@ -1877,17 +1879,22 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
 
         this.seen_code[start] = (this.seen_code[start] || 0) + 1;
 
-        if(this.test_hook_did_generate_wasm)
-        {
-            this.test_hook_did_generate_wasm(code);
-        }
+    }
+
+    // Test-only fault injection must never mutate the reusable Rust builder view. Production
+    // keeps the original zero-copy bytes; tests receive and instantiate an isolated copy.
+    let instantiation_code = code;
+    if(this.test_hook_did_generate_wasm)
+    {
+        instantiation_code = code.slice();
+        this.test_hook_did_generate_wasm(instantiation_code);
     }
 
     const SYNC_COMPILATION = false;
 
     if(SYNC_COMPILATION)
     {
-        const module = new WebAssembly.Module(code);
+        const module = new WebAssembly.Module(instantiation_code);
         const result = new WebAssembly.Instance(module, { "e": this.jit_imports });
         const f = result.exports["f"];
 
@@ -1902,7 +1909,7 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         return;
     }
 
-    const result = WebAssembly.instantiate(code, { "e": this.jit_imports }).then(result => {
+    const result = WebAssembly.instantiate(instantiation_code, { "e": this.jit_imports }).then(result => {
         const f = result.instance.exports["f"];
 
         this.wm.wasm_table.set(wasm_table_index + WASM_TABLE_OFFSET, f);
@@ -1914,15 +1921,17 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         }
     });
 
-    // ALWAYS report a failed compile/instantiate, not only in DEBUG. Nothing on the Rust side
-    // observes this rejection: codegen_finalize_finished is what releases JitState's single
-    // in-flight `compiling` slot, so a module that never instantiates wedges that slot and
-    // jit_increase_hotness_and_maybe_compile returns early forever — the JIT is dead for the
-    // life of the instance while the guest keeps running, interpreted and silent.
     result.catch(e => {
-        console.error("[v86] JIT module failed to instantiate — the JIT is now wedged " +
-                      "(the in-flight compile slot is never released). start=" + h(start >>> 0) +
-                      " table_index=" + wasm_table_index + " len=" + len, e);
+        const error_kind = e instanceof WebAssembly.CompileError ? 1 :
+            e instanceof WebAssembly.LinkError ? 2 : 3;
+        const recovery_status = this.codegen_finalize_failed(
+            wasm_table_index,
+            start,
+            error_kind,
+        );
+        console.error("[v86] JIT module failed; recovered=" + (recovery_status === 0) +
+                      " start=" + h(start >>> 0) + " table_index=" + wasm_table_index +
+                      " len=" + len + " error_kind=" + error_kind, e);
     });
 
     if(DEBUG)

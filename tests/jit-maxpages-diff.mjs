@@ -408,12 +408,10 @@ function run(image, cfg) {
             if (cfg.jit && cpu.set_jit_config) {
                 cpu.set_jit_config(1, cfg.maxPages);   // MAX_PAGES
                 cpu.set_jit_config(5, 1);              // dead-flag elision (prod default)
-                cpu.set_jit_config(9, 1);              // fastmem reads (prod default; needs PG)
-                cpu.set_jit_config(10, 1);             // x87 locals (prod default)
+                cpu.set_jit_config(10, 1);             // explicit x87-locals ablation
                 cpu.set_jit_config(11, 1);             // push-run coalescing (prod default)
                 cpu.set_jit_config(12, 1);             // RET dynamic chaining (prod default)
                 cpu.set_jit_config(13, 1);             // RET speculation (prod default)
-                cpu.set_jit_config(18, 1);             // fastmem read split (prod default)
                 cpu.set_jit_config(22, 1);             // branch hints bit0 (prod default)
                 cpu.set_jit_config(15, cfg.tier2 ?? 0);// tier-2 threshold
                 cpu.jit_clear_cache?.();

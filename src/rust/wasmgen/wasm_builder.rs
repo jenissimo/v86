@@ -140,7 +140,6 @@ fn flag_spill_whitelisted(name: &str) -> bool {
         || name.starts_with("safe_write")
         || name.starts_with("report_")
         || name.starts_with("jit_find_cache_entry")
-        || name == "fastmem_deopt_jit_unit"
         || name == "coverage_log"
 }
 

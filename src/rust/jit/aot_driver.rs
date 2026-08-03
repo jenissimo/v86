@@ -138,7 +138,6 @@ pub fn aot_drv_compile(
         LAST_PAGE_COUNT = pages.len() as u32;
     }
 
-    let fastmem_generation = fastmem_compile_generation(state_flags);
 
     // Own builder instance: the driver must not disturb the live JIT's builder state.
     let builder = unsafe {
@@ -156,7 +155,6 @@ pub fn aot_drv_compile(
         builder,
         WasmTableIndex(table_index as u16),
         state_flags,
-        fastmem_generation,
     );
 
     unsafe {

@@ -45,6 +45,9 @@ pub fn allocate_memory(size: u32) -> u32 {
 
 #[no_mangle]
 pub unsafe fn zero_memory(addr: u32, size: u32) {
+    if !check_in_guest(addr, size, 0) {
+        return;
+    }
     ptr::write_bytes(mem8.offset(addr as isize), 0, size as usize);
 }
 
@@ -67,13 +70,21 @@ pub fn memory_get_oob_info(i: u32) -> u32 {
     unsafe { (&*std::ptr::addr_of!(OOB_LAST)).get(i as usize).copied().unwrap_or(0) }
 }
 
-/// Returns false ONLY for an address that cannot possibly be guest RAM and whose
-/// `as isize` cast goes negative — those writes land in the wasm module's own statics
-/// and are refused. Everything else out of range is COUNTED but still performed:
-/// an instrument must not silently change semantics on a path it was added to observe.
+/// Returns true only when the complete span is in guest RAM.
+#[inline(always)]
+fn range_in_guest_memory(addr: u32, size: u32, guest_memory_size: u32) -> bool {
+    addr.checked_add(size)
+        .map_or(false, |end| end <= guest_memory_size)
+}
+
+#[inline(always)]
+unsafe fn range_in_guest(addr: u32, size: u32) -> bool {
+    range_in_guest_memory(addr, size, *memory_size)
+}
+
 #[inline(always)]
 unsafe fn check_in_guest(addr: u32, size: u32, value: i32) -> bool {
-    if addr < *memory_size && addr.wrapping_add(size) <= *memory_size {
+    if range_in_guest(addr, size) {
         return true;
     }
     OOB_WRITES = OOB_WRITES.wrapping_add(1);
@@ -89,7 +100,7 @@ unsafe fn check_in_guest(addr: u32, size: u32, value: i32) -> bool {
         size,
         *crate::cpu::global_pointers::instruction_pointer
     );
-    addr < 0x8000_0000
+    false
 }
 
 #[allow(non_upper_case_globals)]
@@ -140,7 +151,21 @@ pub fn read8(addr: u32) -> i32 {
         read8_no_mmap_check(addr)
     }
 }
-pub fn read8_no_mmap_check(addr: u32) -> i32 { unsafe { *mem8.offset(addr as isize) as i32 } }
+pub fn read8_no_mmap_check(addr: u32) -> i32 {
+    unsafe {
+        if !range_in_guest(addr, 1) {
+            return 0;
+        }
+        *mem8.offset(addr as isize) as i32
+    }
+}
+
+// Export direct, non-MMIO raw-memory adapters so the executable boundary contract exercises the
+// production pointer-bearing helpers rather than a JavaScript substitute.
+#[no_mangle]
+pub fn memory_raw_read8(addr: u32) -> i32 {
+    read8_no_mmap_check(addr)
+}
 
 #[no_mangle]
 pub fn read16(addr: u32) -> i32 {
@@ -160,7 +185,12 @@ pub fn read16(addr: u32) -> i32 {
     }
 }
 pub fn read16_no_mmap_check(addr: u32) -> i32 {
-    unsafe { ptr::read_unaligned(mem8.offset(addr as isize) as *const u16) as i32 }
+    unsafe {
+        if !range_in_guest(addr, 2) {
+            return 0;
+        }
+        ptr::read_unaligned(mem8.offset(addr as isize) as *const u16) as i32
+    }
 }
 
 #[no_mangle]
@@ -186,7 +216,12 @@ pub fn read32s(addr: u32) -> i32 {
     }
 }
 pub fn read32_no_mmap_check(addr: u32) -> i32 {
-    unsafe { ptr::read_unaligned(mem8.offset(addr as isize) as *const i32) }
+    unsafe {
+        if !range_in_guest(addr, 4) {
+            return 0;
+        }
+        ptr::read_unaligned(mem8.offset(addr as isize) as *const i32)
+    }
 }
 
 pub unsafe fn read64s(addr: u32) -> i64 {
@@ -199,6 +234,9 @@ pub unsafe fn read64s(addr: u32) -> i64 {
         }
     }
     else {
+        if !range_in_guest(addr, 8) {
+            return 0;
+        }
         ptr::read_unaligned(mem8.offset(addr as isize) as *const i64)
     }
 }
@@ -220,6 +258,9 @@ pub unsafe fn read128(addr: u32) -> reg128 {
         }
     }
     else {
+        if !range_in_guest(addr, 16) {
+            return reg128 { i32: [0; 4] };
+        }
         ptr::read_unaligned(mem8.offset(addr as isize) as *const reg128)
     }
 }
@@ -239,6 +280,11 @@ pub unsafe fn write8_no_mmap_or_dirty_check(addr: u32, value: i32) {
     crate::cpu::cpu::dbg_check_write(addr, 1, value & 0xFF);
     if !check_in_guest(addr, 1, value) { return; }
     *mem8.offset(addr as isize) = value as u8
+}
+
+#[no_mangle]
+pub unsafe fn memory_raw_write8(addr: u32, value: i32) {
+    write8_no_mmap_or_dirty_check(addr, value);
 }
 
 #[no_mangle]
@@ -274,6 +320,11 @@ pub unsafe fn write32_no_mmap_or_dirty_check(addr: u32, value: i32) {
     ptr::write_unaligned(mem8.offset(addr as isize) as *mut i32, value)
 }
 
+#[no_mangle]
+pub unsafe fn memory_raw_write32(addr: u32, value: i32) {
+    write32_no_mmap_or_dirty_check(addr, value);
+}
+
 pub unsafe fn write64_no_mmap_or_dirty_check(addr: u32, value: u64) {
     if !check_in_guest(addr, 8, value as i32) { return; }
     ptr::write_unaligned(mem8.offset(addr as isize) as *mut u64, value)
@@ -290,8 +341,11 @@ pub unsafe fn memset_no_mmap_or_dirty_check(addr: u32, value: u8, count: u32) {
 }
 
 pub unsafe fn memcpy_no_mmap_or_dirty_check(src_addr: u32, dst_addr: u32, count: u32) {
-    dbg_assert!(src_addr < *memory_size);
-    dbg_assert!(dst_addr < *memory_size);
+    let source_in_guest = check_in_guest(src_addr, count, 0);
+    let destination_in_guest = check_in_guest(dst_addr, count, 0);
+    if !source_in_guest || !destination_in_guest {
+        return;
+    }
     ptr::copy(
         mem8.offset(src_addr as isize),
         mem8.offset(dst_addr as isize),
@@ -299,7 +353,55 @@ pub unsafe fn memcpy_no_mmap_or_dirty_check(src_addr: u32, dst_addr: u32, count:
     )
 }
 
+#[no_mangle]
+pub unsafe fn memory_raw_memcpy(src_addr: u32, dst_addr: u32, count: u32) {
+    memcpy_no_mmap_or_dirty_check(src_addr, dst_addr, count);
+}
+
+#[no_mangle]
+pub fn memory_raw_read32(addr: u32) -> i32 {
+    read32_no_mmap_check(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::range_in_guest_memory;
+
+    #[test]
+    fn guest_range_at_exact_end_is_valid() {
+        assert!(range_in_guest_memory(0x0FFF, 1, 0x1000));
+    }
+
+    #[test]
+    fn guest_range_partial_overrun_is_rejected() {
+        assert!(!range_in_guest_memory(0x0FFF, 2, 0x1000));
+    }
+
+    #[test]
+    fn guest_range_address_overrun_is_rejected() {
+        assert!(!range_in_guest_memory(0x1000, 1, 0x1000));
+    }
+
+    #[test]
+    fn guest_range_u32_wrap_is_rejected() {
+        assert!(!range_in_guest_memory(u32::MAX - 1, 4, u32::MAX));
+    }
+
+    #[test]
+    fn guest_range_zero_length_at_boundary_is_valid() {
+        assert!(range_in_guest_memory(0x1000, 0, 0x1000));
+    }
+
+    #[test]
+    fn guest_range_normal_in_range_span_is_valid() {
+        assert!(range_in_guest_memory(0x100, 0x20, 0x1000));
+    }
+}
+
 pub unsafe fn memcpy_into_svga_lfb(src_addr: u32, dst_addr: u32, count: u32) {
+    if !check_in_guest(src_addr, count, 0) {
+        return;
+    }
     dbg_assert!(src_addr < *memory_size);
     dbg_assert!(in_svga_lfb(dst_addr));
     dbg_assert!(Page::page_of(dst_addr) == Page::page_of(dst_addr + count - 1));
@@ -389,6 +491,9 @@ pub unsafe fn mmap_write128(addr: u32, v0: u64, v1: u64) {
 
 #[no_mangle]
 pub unsafe fn is_memory_zeroed(addr: u32, length: u32) -> bool {
+    if !range_in_guest(addr, length) {
+        return false;
+    }
     dbg_assert!(addr % 8 == 0);
     dbg_assert!(length % 8 == 0);
     for i in (addr..addr + length).step_by(8) {

@@ -75,9 +75,6 @@ pub const sse_scratch_register: *mut reg128 = 1136 as *mut reg128;
 
 pub const fpu_st: *mut F80 = 1152 as *mut F80;
 
-// After fpu_st. 64-bit avoids practical ABA wrap.
-pub const fastmem_generation: *mut u64 = 1280 as *mut u64;
-
 pub fn get_reg32_offset(r: u32) -> u32 {
     dbg_assert!(r < 8);
     (unsafe { reg32.offset(r as isize) }) as u32

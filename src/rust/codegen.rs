@@ -683,10 +683,6 @@ fn gen_safe_read(
     address_local: &WasmLocal,
     where_to_write: Option<u32>,
 ) {
-    if gen_fastmem_read(ctx, bits, address_local, where_to_write) {
-        return;
-    }
-
     // Execute a virtual memory read. All slow paths (memory-mapped IO, tlb miss, page fault and
     // read across page boundary are handled in safe_read_jit_slow
 
@@ -823,167 +819,6 @@ fn gen_safe_read(
     ctx.builder.free_local(entry_local);
 }
 
-fn gen_fastmem_read(
-    ctx: &mut JitContext,
-    bits: BitSize,
-    address_local: &WasmLocal,
-    where_to_write: Option<u32>,
-) -> bool {
-    if ctx.fastmem_generation.is_none() {
-        return false;
-    }
-
-    let bytes = bits.bytes() as u32;
-    let ram_size = unsafe { *global_pointers::memory_size };
-    if ram_size < bytes {
-        return false;
-    }
-
-    // Constants mirror emulator-config.ts; TS checks them before enabling.
-    const LOW_MEM_END: u32 = crate::jit::FASTMEM_LOW_MEM_END;
-    const GUARD_BASE: u32 = crate::jit::FASTMEM_GUARD_BASE;
-    const GUARD_SIZE: u32 = crate::jit::FASTMEM_GUARD_SIZE;
-    const GUARD_END: u32 = GUARD_BASE + GUARD_SIZE;
-
-    // NOACCESS/decommit precision is relaxed; range rejects still go slow.
-    let max_addr = ram_size - bytes;
-    if max_addr < LOW_MEM_END {
-        return false;
-    }
-
-    crate::jit::fastmem_note_speculated_load_compiled();
-
-    if crate::jit::fastmem_read_split_enabled() {
-        gen_fastmem_read_split(ctx, bits, address_local, where_to_write);
-        return true;
-    }
-
-    ctx.builder.const_i32(0);
-    let load_address_local = ctx.builder.set_new_local();
-
-    // Fast condition:
-    //   addr >= LOW_MEM_END
-    //   addr <= RAM_SIZE - bytes
-    //   [addr, addr + bytes) does not intersect the THUNK/ROM guard red zone
-    ctx.builder.get_local(address_local);
-    ctx.builder.const_i32(LOW_MEM_END as i32);
-    ctx.builder.geu_i32();
-
-    ctx.builder.get_local(address_local);
-    ctx.builder.const_i32(max_addr as i32);
-    ctx.builder.leu_i32();
-    ctx.builder.and_i32();
-
-    ctx.builder.get_local(address_local);
-    ctx.builder.const_i32((GUARD_BASE - bytes) as i32);
-    ctx.builder.leu_i32();
-    ctx.builder.get_local(address_local);
-    ctx.builder.const_i32(GUARD_END as i32);
-    ctx.builder.geu_i32();
-    ctx.builder.or_i32();
-    ctx.builder.and_i32();
-
-    // In-range identity-mapped RAM is the accepted set this shape exists for.
-    ctx.builder.if_void_hinted(HINT_GROUP_MEM, HINT_LIKELY);
-    ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
-    ctx.builder.get_local(address_local);
-    ctx.builder.add_i32();
-    ctx.builder.set_local(&load_address_local);
-    ctx.builder.else_();
-
-    if cfg!(feature = "profiler") {
-        ctx.builder.get_local(address_local);
-        ctx.builder.const_i32(0);
-        ctx.builder.call_fn2("report_safe_read_jit_slow");
-    }
-
-    ctx.builder.get_local(address_local);
-    ctx.builder
-        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
-    match bits {
-        BitSize::BYTE => {
-            ctx.builder.call_fn2_ret("safe_read8_slow_jit");
-        },
-        BitSize::WORD => {
-            ctx.builder.call_fn2_ret("safe_read16_slow_jit");
-        },
-        BitSize::DWORD => {
-            ctx.builder.call_fn2_ret("safe_read32s_slow_jit");
-        },
-        BitSize::QWORD => {
-            ctx.builder.call_fn2_ret("safe_read64s_slow_jit");
-        },
-        BitSize::DQWORD => {
-            ctx.builder.call_fn2_ret("safe_read128s_slow_jit");
-        },
-    }
-    let entry_local = ctx.builder.tee_new_local();
-    ctx.builder.const_i32(1);
-    ctx.builder.and_i32();
-
-    if cfg!(feature = "profiler") {
-        ctx.builder.if_void();
-        gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
-        ctx.builder.block_end();
-
-        ctx.builder.get_local(&entry_local);
-        ctx.builder.const_i32(1);
-        ctx.builder.and_i32();
-    }
-
-    // Page fault out of a guest memory access: cold by construction.
-    ctx.builder
-        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
-
-    ctx.builder.get_local(&entry_local);
-    ctx.builder.const_i32(!0xFFF);
-    ctx.builder.and_i32();
-    ctx.builder.get_local(address_local);
-    ctx.builder.xor_i32();
-    ctx.builder.set_local(&load_address_local);
-    ctx.builder.free_local(entry_local);
-
-    ctx.builder.block_end();
-
-    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST);
-
-    dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
-
-    match bits {
-        BitSize::BYTE => {
-            ctx.builder.get_local(&load_address_local);
-            ctx.builder.load_u8(0);
-        },
-        BitSize::WORD => {
-            ctx.builder.get_local(&load_address_local);
-            ctx.builder.load_unaligned_u16(0);
-        },
-        BitSize::DWORD => {
-            ctx.builder.get_local(&load_address_local);
-            ctx.builder.load_unaligned_i32(0);
-        },
-        BitSize::QWORD => {
-            ctx.builder.get_local(&load_address_local);
-            ctx.builder.load_unaligned_i64(0);
-        },
-        BitSize::DQWORD => {
-            let where_to_write = where_to_write.unwrap();
-            ctx.builder.const_i32(0);
-            ctx.builder.get_local(&load_address_local);
-            ctx.builder.load_unaligned_i64(0);
-            ctx.builder.store_unaligned_i64(where_to_write);
-
-            ctx.builder.const_i32(0);
-            ctx.builder.get_local(&load_address_local);
-            ctx.builder.load_unaligned_i64(8);
-            ctx.builder.store_unaligned_i64(where_to_write + 8);
-        },
-    }
-
-    ctx.builder.free_local(load_address_local);
-    true
-}
-
 // Split-range shape of the fastmem read fast path (set_jit_config idx 18, default on).
 // Same acceptance set as the legacy shape — [LOW_MEM_END, min(GUARD_BASE, ram) - bytes]
 // ∪ [GUARD_END, ram - bytes] — decomposed into two early-exit range tests so the hot
@@ -991,12 +826,15 @@ fn gen_fastmem_read(
 // ~10 wasm ops instead of the legacy ~25 (4-compare and/or chain + if/else + local).
 // The value flows on the stack via a result-typed block; no address local at all
 // (except DQWORD, which needs the host address twice).
+#[allow(dead_code)]
 fn gen_fastmem_read_split(
-    ctx: &mut JitContext,
-    bits: BitSize,
-    address_local: &WasmLocal,
-    where_to_write: Option<u32>,
+    _ctx: &mut JitContext,
+    _bits: BitSize,
+    _address_local: &WasmLocal,
+    _where_to_write: Option<u32>,
 ) {
+    unreachable!("read fastmem was removed");
+/*
     let bytes = bits.bytes() as u32;
     let ram_size = unsafe { *global_pointers::memory_size };
     const LOW_MEM_END: u32 = crate::jit::FASTMEM_LOW_MEM_END;
@@ -1136,6 +974,7 @@ fn gen_fastmem_read_split(
             ctx.builder.free_local(virt_address_local);
         },
     }
+*/
 }
 
 pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal) {

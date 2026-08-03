@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// #PF DURING custom-jitted FPU/BCD ops: fnstenv/fldenv (32-bit), fld tbyte, fbld,
-// fbstp, plus a page-crossing fnstenv. These go through the pre-validated
+// #PF DURING custom-jitted FPU/BCD ops and an ordinary dword load: fnstenv/fldenv
+// (32-bit), fld tbyte, fbld, fbstp, plus page-crossing fnstenv. These go through the pre-validated
 // gen_{readable,writable}_or_pagefault path in the JIT (a4ec212b port): the address
 // is checked BEFORE the de-faulted helper runs, and a #PF must exit the compiled
 // block through exit_with_fault_label with all register locals spilled.
@@ -40,7 +40,7 @@ const MEM_SIZE = 16 * 1024 * 1024, TIMEOUT_MS = 30000;
 const GDT_OFF = 0xE00, GDTR_OFF = 0xE20, IDT_OFF = 0xE30, IDTR_OFF = 0xEB8;
 const PF_HANDLER_OFF = 0xF00;      // #PF handler, fixed offset
 
-const N_CASES = 7;
+const N_CASES = 8;
 
 function build_image()
 {
@@ -201,6 +201,13 @@ function build_image()
     emit(0x3D); u32(0x037F);
     value_err_if_ne();
 
+    // ---- case 8: ordinary jitted dword load (the read-map fastmem shape) ----
+    emit(0xC7, 0x05); u32(FAULT_PAGE); u32(0x13579BDF); // while mapped
+    unmap();
+    run_case(0xC0DE0080, FAULT_PAGE, () => emit(0x8B, 0x02)); // mov eax, [edx]
+    emit(0x3D); u32(0x13579BDF);
+    value_err_if_ne();
+
     // ---- results -> registers; halt ----
     emit(0x8B, 0x35); u32(D_FAULTS);                   // mov esi, [faults]
     emit(0x8B, 0x3D); u32(D_MARKER_ERR);               // mov edi, [marker_errors]
@@ -254,6 +261,16 @@ function run({ jit })
             const cpu = emulator.v86.cpu;
             cpu.reboot_internal(); cpu.reset_memory();
             cpu.load_multiboot(buf.buffer);
+            // Arm the exact identity-mapped pages before JIT compilation. INVLPG in the
+            // guest must clear FAULT_PAGE again, so the last iteration takes a real #PF.
+            const ex = cpu.wm.exports;
+            if(jit && (!ex.fastmem_read_map_reset || !ex.fastmem_read_map_set)) {
+                throw new Error("read-map exports missing; rebuild v86.wasm");
+            }
+            if(jit) {
+                ex.fastmem_read_map_reset();
+                ex.fastmem_read_map_set(BASE >> 12, (0x400000 - BASE) >> 12, 1);
+            }
             timer = setTimeout(() => { if(!halted) finish("HANG"); }, TIMEOUT_MS);
             emulator.run();
         });
