@@ -1,7 +1,7 @@
 //! Hypercall page: shared data between WASM and JS for fast thunk dispatch
 //! and preemption control.
 //!
-//! Layout of HYPERCALL_PAGE (8192 bytes):
+//! Layout of HYPERCALL_PAGE (16384 bytes):
 //!   0x000: cycle_limit          u32 — writable replacement for LOOP_COUNTER
 //!   0x004: (reserved)           u32
 //!   0x008: hc_enabled           u32 — hypercall master switch
@@ -51,6 +51,12 @@
 //!     Mutex mirror word: MUX_VALID | MUX_HAS_WAITERS | MUX_ABANDONED | owner:16 | rec:8
 //!   0x1C54: hc_eagl_token_cfg_ptr       u32 — guest addr of the EAGL token-dispatch
 //!     config block for handler 132 (0 = disabled); layout in handle_eagl_token_dispatch
+//!   0x2000: hc_handler_calls     [u32; 256] — per-handler_id count of calls SERVED in WASM
+//!   0x2400: hc_handler_fallbacks [u32; 256] — per-handler_id count of calls that returned
+//!     false and fell through to the JS thunk. calls+fallbacks = times the dispatch table
+//!     routed that id; the ratio is what says whether a fast path is actually fast.
+//!     Both saturate at u32::MAX rather than wrapping, so a reading can never look small
+//!     because it lapped.
 
 use std::ptr::{addr_of, addr_of_mut};
 
@@ -66,7 +72,7 @@ use crate::softfloat::F80;
 /// Dedicated page for hypercall shared data + preemption control.
 /// Lives in WASM data section, not in CPU state area.
 #[no_mangle]
-pub static mut HYPERCALL_PAGE: [u8; 8192] = [0u8; 8192];
+pub static mut HYPERCALL_PAGE: [u8; 16384] = [0u8; 16384];
 
 // Offset constants
 const OFF_CYCLE_LIMIT: usize = 0x000;
@@ -94,6 +100,12 @@ const OFF_HC_HAS_RUNNABLE_PEERS: usize = 0x09C;
 const OFF_HC_SLEEP_STARVATION_COUNTER: usize = 0x0A0;
 const OFF_HC_SLEEP_STARVATION_LIMIT: usize = 0x0A4;
 const OFF_HC_RAND_SEED: usize = 0x0B0;
+/// Mouse-capture owner (GetCapture). Unlike the thread-id / cursor slots, 0 is a
+/// LEGITIMATE answer ("no window holds capture") and is the common case, so this
+/// slot carries no validity sentinel — JS publishes it unconditionally at init,
+/// on every capture mutation and on buffer-change resync, which makes the page
+/// authoritative at all times.
+const OFF_HC_CAPTURE_HWND: usize = 0x0B4;
 const OFF_HC_DISPATCH_TABLE: usize = 0x100;
 const OFF_HC_FLS_ALLOCATED: usize = 0x1100;
 const OFF_HC_FLS_VALUES: usize = 0x1184;
@@ -133,6 +145,25 @@ const OFF_HC_MUTEX_MIRROR_PTR: usize = 0x1C50;
 /// disabled). Written by JS (hle-lib libs/eagl) once the d3d9 WBUF ring +
 /// setter shadow tables exist. Layout: see handle_eagl_token_dispatch.
 pub(crate) const OFF_HC_EAGL_TOKEN_CFG_PTR: usize = 0x1C54;
+
+/// Per-handler_id accounting. Indexed by the dispatch-table byte, so all 256 ids
+/// (WinAPI/CRT tiers 1..=127 AND the engine inner-loop band 128..=255) are covered —
+/// a guard miss in the inner-loop band is exactly as interesting as a CS contention.
+const OFF_HC_HANDLER_CALLS: usize = 0x2000;
+const OFF_HC_HANDLER_FALLBACKS: usize = 0x2400;
+const HC_HANDLER_SLOTS: usize = 256;
+// The tables are the last thing in the page; if a future field pushes them past the end
+// the writes would silently corrupt whatever static follows. Fail the build instead.
+const _: () = assert!(OFF_HC_HANDLER_FALLBACKS + HC_HANDLER_SLOTS * 4 <= 16384);
+
+/// Saturating +1 on a u32 counter in the page. Saturating, not wrapping: a wrapped
+/// counter reads as a plausible small number, which is the failure mode where an
+/// instrument lies instead of admitting it ran out of range.
+#[inline(always)]
+unsafe fn bump_counter(offset: usize) {
+    let p = hp_mut().add(offset) as *mut u32;
+    *p = (*p).saturating_add(1);
+}
 
 const KERNEL_HANDLE_BASE: u32 = 0x30000;
 const EVENT_TABLE_SLOTS: u32 = 2048;
@@ -342,6 +373,7 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         // Uncontended mutex fast paths (see mutex mirror table @ OFF_HC_MUTEX_MIRROR_PTR).
         80 => handle_release_mutex(),
         81 => handle_wait_for_single_object(),
+        82 => handle_get_capture(),
 
         // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels,
         //    kept in a distinct range from the
@@ -354,9 +386,16 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         _ => false,
     };
 
+    // Per-handler accounting. handler_id is a u8 and the tables are 256 slots, so the
+    // index is in range by construction — no bound to silently truncate against.
+    let slot = handler_id as usize * 4;
     if handled {
+        bump_counter(OFF_HC_HANDLER_CALLS + slot);
         let count_ptr = hp_mut().add(OFF_HC_CALL_COUNT) as *mut u32;
         *count_ptr = (*count_ptr).wrapping_add(1);
+    }
+    else {
+        bump_counter(OFF_HC_HANDLER_FALLBACKS + slot);
     }
     handled
 }
@@ -706,6 +745,15 @@ unsafe fn handle_leave_critical_section() -> bool {
     if safe_write32(ptr + 12, 0).is_err() { return false; }  // OwningThread = 0
 
     write_reg32(EAX, 0);
+    true
+}
+
+/// GetCapture — pure read of the capture owner mirrored at OFF_HC_CAPTURE_HWND.
+/// Takes no arguments and touches no scheduler state, so it never falls through:
+/// 0 (no capture) is the correct answer, not an "unpublished" sentinel.
+unsafe fn handle_get_capture() -> bool {
+    let hwnd = *(hp_ptr().add(OFF_HC_CAPTURE_HWND) as *const u32);
+    write_reg32(EAX, hwnd as i32);
     true
 }
 
