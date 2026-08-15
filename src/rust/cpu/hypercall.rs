@@ -57,6 +57,10 @@
 //!     routed that id; the ratio is what says whether a fast path is actually fast.
 //!     Both saturate at u32::MAX rather than wrapping, so a reading can never look small
 //!     because it lapped.
+//!   0x2800: hc_thread_suspend    [u32; 64] — 32 slots of (thread handle, suspend count),
+//!     republished by the JS scheduler whenever a count changes. Read-only here: it exists so
+//!     handle_resume_thread can answer the NO-OP resume (count already 0) without a JS round
+//!     trip. A handle absent from the table, or one with a nonzero count, falls through.
 
 use std::ptr::{addr_of, addr_of_mut};
 
@@ -151,6 +155,8 @@ pub(crate) const OFF_HC_EAGL_TOKEN_CFG_PTR: usize = 0x1C54;
 /// a guard miss in the inner-loop band is exactly as interesting as a CS contention.
 const OFF_HC_HANDLER_CALLS: usize = 0x2000;
 const OFF_HC_HANDLER_FALLBACKS: usize = 0x2400;
+const OFF_HC_THREAD_SUSPEND: usize = 0x2800;
+const HC_THREAD_SUSPEND_SLOTS: usize = 32;
 const HC_HANDLER_SLOTS: usize = 256;
 // The tables are the last thing in the page; if a future field pushes them past the end
 // the writes would silently corrupt whatever static follows. Fail the build instead.
@@ -374,6 +380,7 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         80 => handle_release_mutex(),
         81 => handle_wait_for_single_object(),
         82 => handle_get_capture(),
+        83 => handle_resume_thread(),
 
         // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels,
         //    kept in a distinct range from the
@@ -513,6 +520,41 @@ unsafe fn handle_get_current_thread_id() -> bool {
     if tid == 0 { return false; }
     write_reg32(EAX, tid as i32);
     true
+}
+
+/// ResumeThread(hThread) — stdcall(1). Serves ONLY the case where the target is not
+/// suspended: Win32 returns the PREVIOUS count, which is then 0, and nothing changes — no
+/// state to flip, no run queue to touch, no switch to request. That case is the whole storm:
+/// Discworld Noir's main loop calls ResumeThread once per iteration (~270k/s, ~11k per frame)
+/// against a worker that is usually already running, and each one crossed into JS for a
+/// no-op. A real resume (count > 0), an unknown handle, or a full slot table all return false
+/// so the JS scheduler answers — every state change stays in the one implementation that owns
+/// the thread state machine.
+unsafe fn handle_resume_thread() -> bool {
+    let esp = read_reg32(ESP);
+    let handle = match safe_read32s(esp + 4) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    if handle == 0 {
+        return false;
+    }
+    let table = hp_ptr().add(OFF_HC_THREAD_SUSPEND) as *const u32;
+    for i in 0..HC_THREAD_SUSPEND_SLOTS {
+        let slot_handle = *table.add(i * 2);
+        if slot_handle == 0 {
+            break; // slots are packed from the front
+        }
+        if slot_handle != handle {
+            continue;
+        }
+        if *table.add(i * 2 + 1) != 0 {
+            return false; // a real resume — the JS scheduler owns the transition
+        }
+        write_reg32(EAX, 0); // previous suspend count
+        return true;
+    }
+    false
 }
 
 /// msvcrt/crtdll rand() — MSVCRT LCG, fully in WASM (no JS round-trip). UE1 games flood
