@@ -1,7 +1,7 @@
 use crate::cpu::cpu::*;
 use crate::cpu::global_pointers::*;
 use crate::paging::OrPageFault;
-use crate::softfloat::{Precision, RoundingMode, F80};
+use crate::softfloat::F80;
 
 use std::f64;
 
@@ -303,30 +303,6 @@ pub unsafe fn fpu_finit() {
 pub unsafe fn set_control_word(cw: u16) {
     mark_fpu_simd_dirty();
     *fpu_control_word = cw;
-
-    let rc = cw >> 10 & 3;
-    F80::set_rounding_mode(match rc {
-        0 => RoundingMode::NearEven,
-        1 => RoundingMode::Floor,
-        2 => RoundingMode::Ceil,
-        3 => RoundingMode::Trunc,
-        _ => {
-            dbg_assert!(false);
-            RoundingMode::NearEven
-        },
-    });
-
-    let precision_control = cw >> 8 & 3;
-    F80::set_precision(match precision_control {
-        0 => Precision::P32,
-        1 => Precision::P80, // undefined
-        2 => Precision::P64,
-        3 => Precision::P80,
-        _ => {
-            dbg_assert!(false);
-            Precision::P80
-        },
-    });
 }
 
 pub unsafe fn fpu_invalid_arithmetic() {

@@ -3232,9 +3232,7 @@ struct FpuBitsLocal {
 }
 
 fn x87_local_cache_enabled() -> bool {
-    crate::jit::x87_locals_enabled()
-        && crate::softfloat::is_fpu_relaxed()
-        && !crate::softfloat::is_precision_single()
+    crate::jit::x87_locals_enabled() && crate::softfloat::is_fpu_relaxed()
 }
 
 fn gen_x87_local_slot(ctx: &mut JitContext, i: u32) -> Option<(WasmLocalI64, WasmLocal)> {
@@ -3674,6 +3672,35 @@ fn gen_fpu_clamp_i32_to_i16(ctx: &mut JitContext, value: &WasmLocal) {
     ctx.builder.block_end();
 }
 
+/// x87 PC=00 rounds every arithmetic result to a 24-bit significand. PC is a RUNTIME
+/// value — the CRT saves and restores the control word around every transcendental —
+/// so it can be neither baked into the block (the invalidation that correctness would
+/// then demand empties the JIT cache continuously) nor ignored (a title that compares a
+/// computed value against one it stored as f32 then never sees them equal; GTA III's
+/// CPathFind de-duplicates car path links exactly that way, and overruns the array into
+/// its own map-object table).
+///
+/// Read it here and pick branchlessly instead. The old PC gate did not cost what the
+/// ROUNDING costs — two conversions — it cost the F80 HELPER CALL it fell back to,
+/// which is the whole expense the relaxed path exists to avoid.
+fn gen_fpu_round_f64_by_precision_control(ctx: &mut JitContext) {
+    ctx.builder.reinterpret_f64_as_i64();
+    let raw = ctx.builder.tee_new_local_i64();
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.demote_f64_to_f32();
+    ctx.builder.promote_f32_to_f64();
+    ctx.builder.get_local_i64(&raw);
+    ctx.builder.reinterpret_i64_as_f64();
+    // select() keeps the FIRST value when the condition is non-zero: PC field == 00.
+    ctx.builder
+        .load_fixed_u16(global_pointers::fpu_control_word as u32);
+    ctx.builder.const_i32(0x300);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.select();
+    ctx.builder.free_local_i64(raw);
+}
+
 fn gen_fpu_apply_f64_binop(ctx: &mut JitContext, op: FpuFastBinOp) {
     match op {
         FpuFastBinOp::Add => ctx.builder.add_f64(),
@@ -3683,6 +3710,9 @@ fn gen_fpu_apply_f64_binop(ctx: &mut JitContext, op: FpuFastBinOp) {
         FpuFastBinOp::Div => ctx.builder.div_f64(),
         FpuFastBinOp::DivR => ctx.builder.div_f64(),
     }
+    // The inline path and the F80 fallback are two implementations of one instruction:
+    // whatever softfloat's apply_precision does to the helper result must happen here too.
+    gen_fpu_round_f64_by_precision_control(ctx);
 }
 
 fn gen_fpu_load_m32_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -3793,8 +3823,7 @@ fn gen_fpu_relaxed_binop_mem(
     slow_helper: &str,
     src: FpuMemSrc,
 ) {
-    // PC=single -> slow F80 helper (inline f64 path below skips precision-control).
-    if !crate::softfloat::is_fpu_relaxed() || crate::softfloat::is_precision_single() {
+    if !crate::softfloat::is_fpu_relaxed() {
         ctx.builder.const_i32(target_sti as i32);
         gen_fpu_load_mem_binop_slow(ctx, src, modrm_byte);
         ctx.builder.call_fn3_i32_i64_i32(slow_helper);
@@ -3841,7 +3870,7 @@ pub fn gen_fpu_relaxed_binop_sti(
     op: FpuFastBinOp,
     slow_helper: &str,
 ) {
-    if !crate::softfloat::is_fpu_relaxed() || crate::softfloat::is_precision_single() {
+    if !crate::softfloat::is_fpu_relaxed() {
         ctx.builder.const_i32(target_sti as i32);
         gen_fpu_get_sti(ctx, sti);
         ctx.builder.call_fn3_i32_i64_i32(slow_helper);

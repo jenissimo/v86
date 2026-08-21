@@ -257,5 +257,149 @@ for(const jit of [false, true]) {
                 `out=${hex(r.ebx)}:${hex(r.eax)}`,
                 ok ? "OK" : `<<< BAD (want ${hex(SUBNORM_HI)}:${hex(SUBNORM_LO)})`);
 }
+// ─── Control word written BEHIND set_control_word ──────────────────────────────
+//
+// The host swaps the whole x87 state on every guest-thread switch by writing the
+// 134-byte snapshot straight into wasm memory (src/worker/core/fpu-helper.ts
+// fpuRestore) — fpu_control_word included, and no set_control_word in sight. CPU
+// reset and any state-region restore do the same. So RC/PC must be read from the
+// live control word at use, never from a value derived when FLDCW last ran: a
+// derived copy belongs to whichever thread executed FLDCW last, while the JIT's
+// inline FIST decodes the control word itself (codegen gen_fpu_round_f64_bits_to_i32)
+// — two implementations of one instruction, disagreeing. FRNDINT has no inline path
+// at all, which is what makes it the discriminator here.
+//
+// The OUT is the context switch: the host writes a new control word into wasm
+// memory mid-run, exactly as fpuRestore does, without touching the guest.
+const CW_PORT = 0x8889;
+const CW_ADDR = 1036;               // fpu_control_word (cpu/global_pointers.rs)
+const CW_BOOT = DATA + 128;         // 0x037F: RC=near, PC=extended
+const VAL27 = DATA + 136;           // f64 2.7
+const ONE = DATA + 144;             // f64 1.0
+const THREE = DATA + 152;           // f64 3.0
+const OUT_RND = DATA + 160;         // f64 FRNDINT result
+const OUT_FIST = DATA + 168;        // i32 FISTP result
+const OUT_CW = DATA + 172;          // u16 FNSTCW readback (setup self-check)
+const OUT_DIV = DATA + 176;         // f64 division result
+
+function build_cw_image(kind)
+{
+    const IMG_SIZE = 0x4000;
+    const buf = new Uint8Array(IMG_SIZE);
+    const dv = new DataView(buf.buffer);
+    const MAGIC = 0x1BADB002, FLAGS = 0x10000;
+    dv.setUint32(0x00, MAGIC, true);
+    dv.setUint32(0x04, FLAGS, true);
+    dv.setUint32(0x08, (-(MAGIC + FLAGS)) >>> 0, true);
+    dv.setUint32(0x0c, BASE, true);
+    dv.setUint32(0x10, BASE, true);
+    dv.setUint32(0x14, BASE + IMG_SIZE, true);
+    dv.setUint32(0x18, BASE + IMG_SIZE, true);
+    dv.setUint32(0x1c, BASE + ENTRY_OFF, true);
+
+    dv.setUint16(CW_BOOT - BASE, 0x037F, true);
+    dv.setFloat64(VAL27 - BASE, 2.7, true);
+    dv.setFloat64(ONE - BASE, 1.0, true);
+    dv.setFloat64(THREE - BASE, 3.0, true);
+
+    let o = ENTRY_OFF;
+    const emit = (...b) => { for(const x of b) buf[o++] = x & 0xff; };
+    const imm32 = (v) => { dv.setUint32(o, v >>> 0, true); o += 4; };
+
+    emit(0xBC); imm32(0x200000);            // mov  esp, 0x200000
+    emit(0xDB, 0xE3);                       // fninit
+    // The one FLDCW the guest ever executes. Its only job is to make a cached
+    // RC/PC hold "near / extended" — without it there is nothing stale to catch.
+    emit(0xD9, 0x2D); imm32(CW_BOOT);       // fldcw  [0x037F]
+    emit(0xBA); imm32(CW_PORT);             // mov  edx, CW_PORT
+    emit(0xEE);                             // out  dx, al   -> host rewrites the CW
+    emit(0xD9, 0x3D); imm32(OUT_CW);        // fnstcw [OUT_CW]   (did the write land?)
+
+    if(kind === "rc") {
+        emit(0xDD, 0x05); imm32(VAL27);     // fld   qword [2.7]
+        emit(0xD9, 0xFC);                   // frndint            (helper only)
+        emit(0xDD, 0x1D); imm32(OUT_RND);   // fstp  qword
+        emit(0xDD, 0x05); imm32(VAL27);     // fld   qword [2.7]
+        emit(0xDB, 0x1D); imm32(OUT_FIST);  // fistp dword        (inline under relaxed+JIT)
+        emit(0xA1); imm32(OUT_RND + 4);     // mov  eax, [rnd hi]
+        emit(0x8B, 0x1D); imm32(OUT_FIST);  // mov  ebx, [fist]
+    }
+    else {
+        emit(0xDD, 0x05); imm32(ONE);       // fld  qword [1.0]
+        emit(0xDC, 0x35); imm32(THREE);     // fdiv qword [3.0]
+        emit(0xDD, 0x1D); imm32(OUT_DIV);   // fstp qword
+        emit(0xA1); imm32(OUT_DIV + 4);     // mov  eax, [div hi]
+        emit(0x8B, 0x1D); imm32(OUT_DIV);   // mov  ebx, [div lo]
+    }
+    emit(0x0F, 0xB7, 0x0D); imm32(OUT_CW);  // movzx ecx, word [OUT_CW]
+    emit(0xF4);                             // hlt
+    emit(0xEB, 0xFE);
+    return buf;
+}
+
+function run_cw(kind, cw, { jit, relaxed })
+{
+    return new Promise((resolve) => {
+        const img = build_cw_image(kind);
+        const emulator = new V86({ autostart:false, memory_size:16*1024*1024,
+                                   disable_jit: jit ? 0 : 1, log_level:0 });
+        let timer;
+        const finish = (status) => {
+            clearTimeout(timer);
+            try { emulator.stop(); } catch(e) {}
+            const cpu = emulator.v86.cpu;
+            resolve({ status, eax: cpu.reg32[0]>>>0, ebx: cpu.reg32[3]>>>0,
+                      ecx: cpu.reg32[1]>>>0 });
+        };
+        emulator.bus.register("cpu-event-halt", () => finish("halt"));
+        emulator.add_listener("emulator-loaded", () => {
+            const cpu = emulator.v86.cpu;
+            const setRelaxed = cpu.wm.exports.set_relaxed_fpu;
+            setRelaxed(relaxed ? 1 : 0);
+            cpu.reboot_internal(); cpu.reset_memory();
+            cpu.load_multiboot(img.buffer);
+            setRelaxed(relaxed ? 1 : 0);
+            cpu.io.register_write(CW_PORT, cpu, () => {
+                new DataView(cpu.wasm_memory.buffer).setUint16(CW_ADDR, cw, true);
+            });
+            timer = setTimeout(() => finish("HANG"), 15000);
+            emulator.run();
+        });
+    });
+}
+
+const f64hi = (v) => { const d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, v); return d.getUint32(0); };
+const f64lo = (v) => { const d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, v); return d.getUint32(4); };
+
+// RC=11 (truncate) arrives behind the guest's back: FRNDINT(2.7) and FISTP(2.7) must
+// both yield 2, not the 3 a stale RC=near produces.
+for(const relaxed of [false, true])
+for(const jit of [false, true]) {
+    const r = await run_cw("rc", 0x0F7F, { jit, relaxed });
+    const okCw = r.ecx === 0x0F7F;                  // setup self-check
+    const okRnd = r.eax === f64hi(2.0);
+    const okFist = r.ebx === 2;
+    if(!(okCw && okRnd && okFist)) fail = true;
+    console.log(`live CW rc=trunc relaxed=${relaxed?1:0} jit=${jit?1:0} ${r.status}`,
+                `cw=${r.ecx.toString(16)} ${okCw?"OK":"<<< SETUP INVALID (want 0f7f)"}`,
+                `frndint=${hex(r.eax)} ${okRnd?"OK":`<<< BAD (want ${hex(f64hi(2.0))})`}`,
+                `fistp=${r.ebx} ${okFist?"OK":"<<< BAD (want 2)"}`);
+}
+
+// PC=00 (24-bit single) arrives the same way. Strict mode must round 1/3 to f32;
+// relaxed mode ignores PC by contract (see softfloat apply_precision) and keeps f64.
+for(const relaxed of [false, true])
+for(const jit of [false, true]) {
+    const r = await run_cw("pc", 0x007F, { jit, relaxed });
+    const want = relaxed ? 1/3 : Math.fround(1/3);
+    const okCw = r.ecx === 0x007F;
+    const okDiv = r.eax === f64hi(want) && r.ebx === f64lo(want);
+    if(!(okCw && okDiv)) fail = true;
+    console.log(`live CW pc=single relaxed=${relaxed?1:0} jit=${jit?1:0} ${r.status}`,
+                `cw=${r.ecx.toString(16)} ${okCw?"OK":"<<< SETUP INVALID (want 007f)"}`,
+                `1/3=${hex(r.eax)}:${hex(r.ebx)}`,
+                okDiv ? "OK" : `<<< BAD (want ${hex(f64hi(want))}:${hex(f64lo(want))})`);
+}
+
 console.log(fail ? "VERDICT: FAIL" : "VERDICT: all OK");
 process.exit(fail ? 1 : 0);

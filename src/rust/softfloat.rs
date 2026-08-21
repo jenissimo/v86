@@ -1,21 +1,49 @@
 // Native f64 FPU implementation - replaces Berkeley SoftFloat
 // Trades 80-bit extended precision for 64-bit double precision (acceptable for games).
 
-static mut ROUNDING_MODE: u8 = 0; // 0=NearEven, 1=Trunc, 2=Floor, 3=Ceil
+/// x87 rounding control and precision control are read from the LIVE control word, never
+/// cached. A derived copy is only as fresh as its last sync, and three paths write
+/// fpu_control_word without going through set_control_word: the host's per-thread x87
+/// restore (fpu-helper.ts writes the 134-byte snapshot straight into wasm memory), CPU
+/// reset, and any state-region restore. A cached mode therefore belongs to whichever
+/// thread last executed FLDCW, while the JIT's inline FIST reads the control word itself
+/// (codegen.rs gen_fpu_round_f64_bits_to_i32) — so the two implementations of the same
+/// instruction disagree, and a guest CRT floor/ceil (FLDCW rc; FRNDINT; FLDCW restore)
+/// preempted mid-sequence rounds by another thread's mode.
+#[inline]
+fn control_word() -> u16 { unsafe { *crate::cpu::global_pointers::fpu_control_word } }
 
-// x87 precision-control: PC=00 (24-bit single) rounds every arithmetic result to f32.
-// F80 is f64-backed so P64/P80 already match (53-bit); only P32 needs the extra round.
-static mut PRECISION_SINGLE: bool = false;
+/// RC field, in the x87 encoding the hardware uses: 0=NearEven 1=Down 2=Up 3=Trunc.
+/// Same field, same encoding the JIT's inline path decodes.
+#[inline]
+fn rounding_mode() -> u16 { control_word() >> 10 & 3 }
 
 #[inline]
-fn apply_precision(f: f64) -> f64 {
-    if unsafe { PRECISION_SINGLE } { f as f32 as f64 } else { f }
+fn round_by_rc(f: f64) -> f64 {
+    match rounding_mode() {
+        1 => f.floor(),
+        2 => f.ceil(),
+        3 => f.trunc(),
+        _ => round_ties_even(f),
+    }
 }
 
-// Codegen reads this to skip the relaxed inline binop (raw f64) under PC=single.
-#[allow(dead_code)]
-pub fn is_precision_single() -> bool {
-    unsafe { PRECISION_SINGLE }
+/// PC=00 (24-bit single) rounds every arithmetic result to f32. F80 is f64-backed so
+/// P64/P80 already match (53-bit); only P32 needs the extra round.
+///
+/// Relaxed mode honours PC too — it is the one x87 control it cannot spend. A title that
+/// compares a freshly computed value against one it stored as f32 never sees them equal
+/// once the result keeps f64 mantissa bits, which corrupts the title's own data rather
+/// than merely costing it precision. What must NOT happen is gating the CODEGEN fast path
+/// on PC: that sent every fadd/fmul of a PC=24 title (LS3D sets PC=24 once at init)
+/// through this helper, 19.6% of Mafia's busy time. Nor specializing the compiled block on
+/// PC — the CRT saves and restores the control word around every transcendental, so the
+/// class flips twice per call and the invalidation empties the JIT cache continuously
+/// (measured: 51.7 -> 3.6 FPS). The inline path reads the live control word and rounds
+/// branchlessly instead; see codegen's gen_fpu_round_f64_by_precision_control.
+#[inline]
+fn apply_precision(f: f64) -> f64 {
+    if control_word() >> 8 & 3 == 0 { f as f32 as f64 } else { f }
 }
 
 /// Relaxed FPU mode: store raw f64 bits directly in F80.mantissa with RELAXED_TAG.
@@ -80,12 +108,21 @@ pub fn is_fpu_relaxed() -> bool {
 }
 
 /// When off (default), the relaxed fast path emits no hit/fallback counter increment.
-/// Toggle on (and clear the JIT cache so blocks recompile) only to measure hit-rate.
+/// Toggle on only to measure hit-rate: it is a CODEGEN input, so the flip clears the JIT
+/// cache itself (already-compiled blocks would otherwise stay silent) and participates in
+/// jit_codegen_fingerprint, so an AOT cache cannot bind counter-bearing blocks to a run
+/// that asked for none.
 static mut FPU_RELAXED_STATS: bool = false;
 
 #[no_mangle]
 pub extern "C" fn set_fpu_relaxed_stats(enabled: u32) {
-    unsafe { FPU_RELAXED_STATS = enabled != 0; }
+    unsafe {
+        if FPU_RELAXED_STATS == (enabled != 0) {
+            return;
+        }
+        FPU_RELAXED_STATS = enabled != 0;
+    }
+    crate::jit::jit_clear_cache_js();
 }
 
 #[no_mangle]
@@ -96,18 +133,6 @@ pub extern "C" fn get_fpu_relaxed_stats() -> u32 {
 #[allow(dead_code)]
 pub fn is_fpu_relaxed_stats() -> bool {
     unsafe { FPU_RELAXED_STATS }
-}
-
-pub enum RoundingMode {
-    NearEven,
-    Trunc,
-    Floor,
-    Ceil,
-}
-pub enum Precision {
-    P80,
-    P64,
-    P32,
 }
 
 #[repr(C)]
@@ -339,14 +364,7 @@ impl F80 {
         if f.is_nan() {
             return i32::MIN; // x87 indefinite integer
         }
-        let rounded = unsafe {
-            match ROUNDING_MODE {
-                1 => f.trunc(),
-                2 => f.floor(),
-                3 => f.ceil(),
-                _ => round_ties_even(f),
-            }
-        };
+        let rounded = round_by_rc(f);
         if rounded >= (i32::MAX as f64 + 1.0) || rounded < (i32::MIN as f64) {
             i32::MIN // overflow -> indefinite
         } else {
@@ -359,14 +377,7 @@ impl F80 {
         if f.is_nan() {
             return i64::MIN; // x87 indefinite integer
         }
-        let rounded = unsafe {
-            match ROUNDING_MODE {
-                1 => f.trunc(),
-                2 => f.floor(),
-                3 => f.ceil(),
-                _ => round_ties_even(f),
-            }
-        };
+        let rounded = round_by_rc(f);
         if rounded >= (i64::MAX as f64 + 1.0) || rounded < (i64::MIN as f64) {
             i64::MIN // overflow -> indefinite
         } else {
@@ -447,14 +458,7 @@ impl F80 {
 
     pub fn round(self) -> F80 {
         let f = self.to_f64x();
-        let rounded = unsafe {
-            match ROUNDING_MODE {
-                1 => f.trunc(),
-                2 => f.floor(),
-                3 => f.ceil(),
-                _ => round_ties_even(f),
-            }
-        };
+        let rounded = round_by_rc(f);
         F80::of_f64x(rounded)
     }
 
@@ -471,25 +475,6 @@ impl F80 {
     }
     pub fn is_nan(self) -> bool {
         self != self
-    }
-
-    pub fn set_rounding_mode(mode: RoundingMode) {
-        unsafe {
-            ROUNDING_MODE = match mode {
-                RoundingMode::NearEven => 0,
-                RoundingMode::Trunc => 1,
-                RoundingMode::Floor => 2,
-                RoundingMode::Ceil => 3,
-            }
-        };
-    }
-    pub fn set_precision(precision: Precision) {
-        unsafe {
-            PRECISION_SINGLE = match precision {
-                Precision::P32 => true,
-                Precision::P64 | Precision::P80 => false,
-            };
-        }
     }
 
     pub fn get_exception_flags() -> u8 { 0 }
