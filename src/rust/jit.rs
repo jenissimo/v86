@@ -110,14 +110,64 @@ const RET_SPEC_MAX_CANDIDATES: usize = 4;
 // Fastmem-tracked units (generation != 0) are never cached — their per-dispatch
 // generation check cannot be memoized. No per-thread state: entries are eip-keyed,
 // and the budget/in_hlt guard still runs before every probe.
-const RET_CACHE_SIZE: usize = 512;
-static mut RET_CACHE: [(u32, u32, i32, u64); RET_CACHE_SIZE] = [(0, 0, -1, 0); RET_CACHE_SIZE];
+// Capacity is the ALLOCATED ceiling; the live size is RET_CACHE_MASK + 1 (set_jit_config
+// idx 25, log2). A runtime knob rather than a const because the two candidate answers here
+// ("the memo is too small for a vtable-heavy working set" vs "the memo is fine and the cost
+// is the helper call itself") are only separable by an A/B inside ONE scene — a fresh boot
+// changes the guest's own call mix. Not a codegen input: no emitted byte depends on it, so
+// it stays out of jit_codegen_fingerprint and needs only an epoch bump to take effect.
+// 1 << 9 = the live default, not a ceiling to grow into: the array is emitted whole into
+// the wasm data section, so a 16 K ceiling cost 252 KB of shipped module (10%) for a knob
+// whose own measurement said there was nothing to win — the memo hits 98.9% at 512 and
+// conflict misses are 1%. Raise this deliberately if a title is ever shown to thrash it.
+const RET_CACHE_CAPACITY: usize = 1 << 9;
+
+/// One memo entry, 16 bytes so four share a cache line. The epoch is u32 rather than the
+/// u64 counter it mirrors: on wasm32 a 64-bit compare is two operations on the single
+/// hottest branch in the JIT, and this probe runs ~20M times a second. Wrap is made
+/// impossible rather than argued about — `ret_cache_invalidate_all` wipes the array when
+/// the counter reaches 0 again, so a 2^32-old entry can never alias a current one.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RetMemo {
+    eip: u32,
+    flags: u32,
+    packed: i32,
+    epoch: u32,
+}
+static mut RET_CACHE: [RetMemo; RET_CACHE_CAPACITY] =
+    [RetMemo { eip: 0, flags: 0, packed: -1, epoch: 0 }; RET_CACHE_CAPACITY];
+static mut RET_CACHE_MASK: usize = 512 - 1;
+// Index derivation (set_jit_config idx 26): 0 = stock `virt >> 2`, which uses only bits
+// 2..2+log2(size) — inside one 4 KiB page that is fine, but indirect targets scattered over
+// many pages alias on their page offset alone. 1 folds the page number in.
+static mut RET_CACHE_HASH_MIX: bool = false;
+
+#[inline]
+unsafe fn ret_cache_index(virt_address: u32) -> usize {
+    if RET_CACHE_HASH_MIX {
+        let v = virt_address ^ (virt_address >> 12) ^ (virt_address >> 20);
+        (v >> 2) as usize & RET_CACHE_MASK
+    }
+    else {
+        (virt_address >> 2) as usize & RET_CACHE_MASK
+    }
+}
 // Starts at 1 so zero-initialized entries can never match before their first fill.
-static mut RET_CACHE_EPOCH: u64 = 1;
+static mut RET_CACHE_EPOCH: u32 = 1;
 
 pub fn ret_cache_invalidate_all() {
     unsafe {
-        RET_CACHE_EPOCH += 1;
+        RET_CACHE_EPOCH = RET_CACHE_EPOCH.wrapping_add(1);
+        if RET_CACHE_EPOCH == 0 {
+            // Wrapped: the only way a live entry could carry a current-looking epoch is if
+            // it survived exactly 2^32 invalidations. Wipe instead of reasoning about it.
+            #[allow(static_mut_refs)]
+            for e in RET_CACHE.iter_mut() {
+                e.packed = -1;
+            }
+            RET_CACHE_EPOCH = 1;
+        }
     }
 }
 
@@ -424,10 +474,16 @@ pub fn jit_get_tier2_page_at(i: u32) -> u32 {
 /// JitState lock, no allocation, no map walk. That matters because the chain path is the
 /// hottest dispatch path in the JIT.
 #[inline]
-fn tier2_count_entry(wasm_table_index: u16) -> bool {
+fn tier2_count_entry(wasm_table_index: u16) -> bool { tier2_count_entry_by(wasm_table_index, 1) }
+
+/// As `tier2_count_entry`, but crediting `by` entries at once — what a sampled caller owes
+/// (see `chain_note_execution`). `>=` rather than `==` on the threshold, because a credited
+/// stride can step over it.
+#[inline]
+fn tier2_count_entry_by(wasm_table_index: u16, by: u32) -> bool {
     unsafe {
         let t = &mut (*std::ptr::addr_of_mut!(MODULE_ENTRY_TOTALS))[wasm_table_index as usize];
-        *t = t.wrapping_add(1);
+        *t = t.wrapping_add(by);
     }
     let threshold = unsafe { JIT_TIER2_THRESHOLD };
     if threshold == 0 {
@@ -435,7 +491,7 @@ fn tier2_count_entry(wasm_table_index: u16) -> bool {
     }
     let count = unsafe {
         let c = &mut (*std::ptr::addr_of_mut!(MODULE_EXEC_COUNTS))[wasm_table_index as usize];
-        *c += 1;
+        *c = c.wrapping_add(by);
         *c
     };
     if count < threshold {
@@ -500,6 +556,12 @@ pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
 // Entry-event census, split by the path the entry arrived on. RET chaining (idx 12) changes
 // both the emitted CODE and the hotness COUNTER; the share chain/(chain+direct) is what makes
 // the two separable.
+// Sampling state for chain_note_execution. MASK is (stride - 1); stride is a power of two
+// set through set_jit_config idx 27; stride 1 restores the exact, pre-sampling behaviour
+// and is the arm an A/B compares against.
+static mut CHAIN_NOTE_TICK: u32 = 0;
+static mut CHAIN_NOTE_MASK: u32 = 32 - 1;
+
 static mut TIER2_CHAIN_ENTRIES: u64 = 0;
 static mut TIER2_DIRECT_ENTRIES: u64 = 0;
 
@@ -1777,16 +1839,33 @@ pub fn jit_find_cache_entry_in_page(
 /// target module is still valid and installed.
 #[inline]
 unsafe fn chain_note_execution(packed: i32) {
+    // Stride sampling. The accounting itself is two scattered 64K-array read-modify-writes
+    // plus a u64 add, and it runs on EVERY chained dispatch — ~20M/s in a vtable-dispatch
+    // title, which measured as 1.5% of the whole worker thread purely to feed a counter.
+    // Against a promotion threshold of hundreds of thousands of entries, one sample in
+    // CHAIN_NOTE_STRIDE credited with the whole stride is the same decision: a module needs
+    // ~300k/stride samples, and at stride 32 that is still ~9400 independent observations,
+    // far past where sampling error could reorder the hot set. Cold modules (fewer entries
+    // than one stride) were never promotion candidates. What DOES become approximate is
+    // MODULE_ENTRY_TOTALS as a per-slot execution weight (dbg.jitTierStats) — quantized to
+    // the stride, still unbiased. Stride 1 is exact and is what the A/B compares against.
+    let tick = CHAIN_NOTE_TICK.wrapping_add(1);
+    CHAIN_NOTE_TICK = tick;
+    if tick & CHAIN_NOTE_MASK != 0 {
+        return;
+    }
+
     let idx = (packed >> 16) - cpu::WASM_TABLE_OFFSET as i32;
     if idx < 0 || idx > u16::MAX as i32 {
         return;
     }
-    TIER2_CHAIN_ENTRIES += 1;
+    let credit = CHAIN_NOTE_MASK + 1;
+    TIER2_CHAIN_ENTRIES += credit as u64;
     if !JIT_CHAIN_TIER2_ACCOUNTING {
         return;
     }
     let idx = idx as u16;
-    if !tier2_count_entry(idx) {
+    if !tier2_count_entry_by(idx, credit) {
         return;
     }
     let len = TIER2_PENDING_LEN as usize;
@@ -1818,6 +1897,7 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     if limit == 0 || elapsed >= limit || *global_pointers::in_hlt {
         if dispatch_stats_enabled() {
             profiler::stat_increment_always(stat::RET_CHAIN_MISS);
+            profiler::stat_increment_always(stat::RET_CHAIN_BUDGET);
         }
         return -1;
     }
@@ -1827,12 +1907,12 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
     // B1b: direct-mapped memo probe. An entry is valid only if its epoch is current —
     // any table-slot free or code-TLB eviction since the fill bumps the epoch and
     // invalidates everything (see RET_CACHE).
-    let cache_idx = (virt_address >> 2) as usize & (RET_CACHE_SIZE - 1);
+    let cache_idx = ret_cache_index(virt_address);
     let cached = RET_CACHE[cache_idx];
-    if cached.0 == virt_address
-        && cached.1 == state_flags
-        && cached.2 >= 0
-        && cached.3 == RET_CACHE_EPOCH
+    if cached.eip == virt_address
+        && cached.flags == state_flags
+        && cached.packed >= 0
+        && cached.epoch == RET_CACHE_EPOCH
     {
         // Wrong-entry detector (idx 24; OFF by default): a memo hit bypasses
         // DISPATCH_META entirely, so verify the cached packed target against a fresh
@@ -1841,9 +1921,10 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
         if !wrong_entry_verify_enabled() {
             if dispatch_stats_enabled() {
                 profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+                profiler::stat_increment_always(stat::RET_MEMO_HIT);
             }
-            chain_note_execution(cached.2);
-            return cached.2;
+            chain_note_execution(cached.packed);
+            return cached.packed;
         }
         let meta = dispatch_meta_get(virt_address >> 12);
         let fresh = if meta != 0
@@ -1861,18 +1942,18 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
         else {
             -1
         };
-        if fresh == cached.2 {
+        if fresh == cached.packed {
             if dispatch_stats_enabled() {
                 profiler::stat_increment_always(stat::RET_CHAIN_HIT);
             }
-            chain_note_execution(cached.2);
-            return cached.2;
+            chain_note_execution(cached.packed);
+            return cached.packed;
         }
         RET_MEMO_MISMATCH += 1;
         // Classify the stale target: a LIVE module (primary or hidden) is benign
         // overwrite-staleness — same guest bytes, older module. A dead/recycled slot
         // is genuine wrong-code dispatch.
-        let stale_idx = ((cached.2 >> 16) - cpu::WASM_TABLE_OFFSET as i32) as u16;
+        let stale_idx = ((cached.packed >> 16) - cpu::WASM_TABLE_OFFSET as i32) as u16;
         let target = WasmTableIndex(stale_idx);
         let live = {
             let ctx = get_jit_state();
@@ -1888,12 +1969,12 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
             RET_MEMO_STALE_DEAD += 1;
         }
         if RET_MEMO_MISMATCH <= 8 {
-            wrong_entry_ring_push([virt_address, cached.2 as u32, fresh as u32, 2]);
+            wrong_entry_ring_push([virt_address, cached.packed as u32, fresh as u32, 2]);
         }
         dbg_log!(
             "RET-MEMO-MISMATCH eip={:x} cached={:x} fresh={:x} staleTargetLive={}",
             virt_address,
-            cached.2,
+            cached.packed,
             fresh,
             live
         );
@@ -1902,10 +1983,21 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
             if dispatch_stats_enabled() {
                 profiler::stat_increment_always(stat::RET_CHAIN_HIT);
             }
-            chain_note_execution(cached.2);
-            return cached.2;
+            chain_note_execution(cached.packed);
+            return cached.packed;
         }
-        RET_CACHE[cache_idx].2 = -1;
+        RET_CACHE[cache_idx].packed = -1;
+    }
+
+    if dispatch_stats_enabled() {
+        // Conflict vs cold: a CURRENT-epoch entry for another eip is a slot the memo owned
+        // and lost (capacity/conflict); anything else never held a usable entry.
+        profiler::stat_increment_always(if cached.packed >= 0 && cached.epoch == RET_CACHE_EPOCH {
+            stat::RET_MEMO_ALIAS
+        }
+        else {
+            stat::RET_MEMO_COLD
+        });
     }
 
     let raw_state_flags = state_flags;
@@ -1941,12 +2033,18 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32
             if verified || !wrong_entry_refuse() {
                 if dispatch_stats_enabled() {
                     profiler::stat_increment_always(stat::RET_CHAIN_HIT);
+                    profiler::stat_increment_always(stat::RET_META_HIT);
                 }
 
                 let table_slot =
                     dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
                 let packed = table_slot << 16 | unit_state as i32;
-                RET_CACHE[cache_idx] = (virt_address, raw_state_flags, packed, RET_CACHE_EPOCH);
+                RET_CACHE[cache_idx] = RetMemo {
+                    eip: virt_address,
+                    flags: raw_state_flags,
+                    packed,
+                    epoch: RET_CACHE_EPOCH,
+                };
                 chain_note_execution(packed);
                 return packed;
             }
@@ -5015,7 +5113,7 @@ pub fn enter_basic_block(phys_eip: u32) {
 }
 
 pub const JIT_CONFIG_ABI_VERSION: u32 = 1;
-const JIT_CONFIG_SUPPORTED_MASK: u32 = 0x01FB_FDEF;
+const JIT_CONFIG_SUPPORTED_MASK: u32 = 0x0FFB_FDEF;
 const JIT_CONFIG_UNSUPPORTED: u32 = u32::MAX;
 
 #[inline]
@@ -5102,6 +5200,23 @@ pub unsafe fn set_jit_config(index: u32, value: u32) -> u32 {
         22 => JIT_BRANCH_HINTS = value,
         23 => JIT_BRANCH_HINT_OFFSET_FUZZ = value,
         24 => WRONG_ENTRY_REFUSE = value,
+        25 => {
+            // log2 of the live memo size, clamped to the allocated ceiling. Every entry's
+            // index changes, so the old ones must not be probed again.
+            let log = value.clamp(4, RET_CACHE_CAPACITY.trailing_zeros());
+            RET_CACHE_MASK = (1usize << log) - 1;
+            ret_cache_invalidate_all();
+        },
+        26 => {
+            RET_CACHE_HASH_MIX = value != 0;
+            ret_cache_invalidate_all();
+        },
+        27 => {
+            // Chain-accounting sample stride, rounded DOWN to a power of two (the mask is
+            // the whole point) and clamped so a typo cannot silently stop promotion.
+            let stride = value.clamp(1, 1024);
+            CHAIN_NOTE_MASK = (1u32 << (31 - stride.leading_zeros())) - 1;
+        },
         _ => unreachable!(),
     }
     0
@@ -5135,6 +5250,9 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         22 => JIT_BRANCH_HINTS,
         23 => JIT_BRANCH_HINT_OFFSET_FUZZ,
         24 => WRONG_ENTRY_REFUSE,
+        25 => (RET_CACHE_MASK + 1).trailing_zeros(),
+        26 => RET_CACHE_HASH_MIX as u32,
+        27 => CHAIN_NOTE_MASK + 1,
         _ => unreachable!(),
     }
 }

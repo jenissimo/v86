@@ -182,6 +182,22 @@ pub enum stat {
     X87_CACHE_INVALIDATE,
     PUSH_RUN_HIT,
     PUSH_RUN_FILL,
+
+    // Dynamic-chaining path split (read via profiler_dispatch_stat_get 18-22, gated by
+    // jit::DISPATCH_STATS). RET_CHAIN_HIT alone cannot say WHICH tier served the dispatch,
+    // and "the memo is too small" and "the memo is fine, the helper call is the cost" are
+    // opposite conclusions with opposite fixes.
+    //   RET_MEMO_HIT   — served by the direct-mapped memo (one probe, no meta walk).
+    //   RET_MEMO_ALIAS — probe slot held a CURRENT-epoch entry for a different eip/flags:
+    //                    a genuine capacity/conflict miss the memo could have served.
+    //   RET_MEMO_COLD  — probe slot empty or stale-epoch (nothing to evict; not a conflict).
+    //   RET_META_HIT   — resolved through DISPATCH_META after the memo missed (memo refilled).
+    //   RET_CHAIN_BUDGET — bailed before probing (cycle budget exhausted / in_hlt).
+    RET_MEMO_HIT,
+    RET_MEMO_ALIAS,
+    RET_MEMO_COLD,
+    RET_META_HIT,
+    RET_CHAIN_BUDGET,
 }
 
 #[allow(non_upper_case_globals)]
@@ -255,6 +271,11 @@ pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
         15 => stat::X87_CACHE_INVALIDATE,
         16 => stat::PUSH_RUN_HIT,
         17 => stat::PUSH_RUN_FILL,
+        18 => stat::RET_MEMO_HIT,
+        19 => stat::RET_MEMO_ALIAS,
+        20 => stat::RET_MEMO_COLD,
+        21 => stat::RET_META_HIT,
+        22 => stat::RET_CHAIN_BUDGET,
         _ => return 0.0,
     };
     unsafe { stat_array[stat as usize] as f64 }
