@@ -242,3 +242,12 @@ c!(SIMD_I64X2_SHR_U_LEB0, 0xcd); c!(SIMD_I64X2_SHR_U_LEB1, 0x01); // 205
 // i64x2 arithmetic.
 c!(SIMD_I64X2_ADD_LEB0, 0xce); c!(SIMD_I64X2_ADD_LEB1, 0x01);   // 206
 c!(SIMD_I64X2_SUB_LEB0, 0xd1); c!(SIMD_I64X2_SUB_LEB1, 0x01);   // 209
+
+// Sub-opcodes below are the RAW values from the table linked above; the builder
+// LEB-encodes them (`WasmBuilder::simd_op`) rather than each site hand-splitting
+// a two-byte pair, which is the transcription error this style avoids.
+c!(SIMD_I8X16_SHUFFLE, 0x0d);    // i8x16.shuffle — 16 lane-index bytes follow
+c!(SIMD_V128_ANDNOT, 0x4f);      // v128.andnot: a AND NOT b
+c!(SIMD_I8X16_SUB_SAT_U, 0x73);  // i8x16.sub_sat_u
+c!(SIMD_I16X8_ADD_SAT_S, 0x8f);  // i16x8.add_sat_s
+c!(SIMD_I16X8_MUL, 0x95);        // i16x8.mul

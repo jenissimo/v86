@@ -257,6 +257,82 @@ fn sse_i64x2_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseI64x2Op) {
     ctx.builder.store_aligned_v128(0);
 }
 
+/// Integer-lane SSE2 ops that map 1:1 onto a single WASM SIMD instruction.
+///
+/// Every one of these follows the x86 shape `dest = dest OP source`, which in
+/// JIT-call terms (`f(source = r1, dest = r2)`) is `r2 = r2 OP r1`. A WASM
+/// binop pops `b` then `a` and computes `a OP b`, so the destination is pushed
+/// FIRST and the source second. That order is load-bearing for the
+/// non-commutative members (`SubSatU8`, `UnpackLowBytes`) and harmless for the
+/// rest, so it is applied uniformly rather than per-op.
+#[repr(u8)]
+enum SseLaneOp {
+    /// PADDSW: signed-saturating word add.
+    AddSatS16,
+    /// PMULLW: low 16 bits of the word product (wrapping — `overflow-checks`
+    /// is off, matching the scalar helper).
+    MulLow16,
+    /// PSUBUSB: unsigned-saturating byte subtract. Only underflows, which is
+    /// why it must not share a helper with PADDUSB (which only overflows).
+    SubSatU8,
+    /// PUNPCKLBW: interleave the low 8 bytes, destination byte first.
+    UnpackLowBytes,
+}
+
+/// Emit the op itself. Split out so the reg/reg and reg/mem forms cannot drift.
+fn sse_lane_op(ctx: &mut JitContext, op: &SseLaneOp) {
+    match op {
+        SseLaneOp::AddSatS16 => ctx.builder.add_sat_s_i16x8(),
+        SseLaneOp::MulLow16 => ctx.builder.mul_i16x8(),
+        SseLaneOp::SubSatU8 => ctx.builder.sub_sat_u_i8x16(),
+        // dest.u8[i] -> lane 2i, source.u8[i] -> lane 2i+1, for i in 0..8.
+        // Lanes 0..15 index the first operand (dest), 16..31 the second (source).
+        SseLaneOp::UnpackLowBytes => ctx.builder.shuffle_i8x16(&[
+            0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23,
+        ]),
+    }
+}
+
+/// reg/reg form: `r2 = r2 OP r1`, entirely inline.
+///
+/// The scratch copy that `sse_read128_xmm_xmm` makes to dodge aliasing is not
+/// needed here: both v128 loads complete before the store, so `r1 == r2` is
+/// handled correctly by construction.
+fn sse_lane_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseLaneOp) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    // Destination address for the final store.
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
+    // a = destination
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
+    ctx.builder.load_aligned_v128(0);
+    // b = source
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
+    ctx.builder.load_aligned_v128(0);
+    sse_lane_op(ctx, &op);
+    ctx.builder.store_aligned_v128(0);
+}
+
+/// reg/mem form. The `safe_read128`-into-scratch prologue stays exactly as the
+/// call-based path had it — it is what raises the page fault — and only the
+/// call is replaced by load/op/store.
+fn sse_lane_xmm_mem(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32, op: SseLaneOp) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let source = global_pointers::sse_scratch_register as u32;
+    codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, source);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r) as i32);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r) as i32);
+    ctx.builder.load_aligned_v128(0);
+    ctx.builder.const_i32(source as i32);
+    ctx.builder.load_aligned_v128(0);
+    sse_lane_op(ctx, &op);
+    ctx.builder.store_aligned_v128(0);
+}
+
 #[repr(u8)]
 enum SseScalarOp { Add, Sub, Mul, Div }
 
@@ -298,6 +374,74 @@ fn sse_scalar_f32_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: SseScalarO
     }
     ctx.builder.store_aligned_f32(0);
 }
+/// ANDNPS/ANDNPD/PANDN reg/reg: `r2 = source AND NOT dest` = `r1 & !r2`.
+///
+/// The odd one out among the bitwise ops, in two ways. x86 negates the
+/// DESTINATION, not the source, so it is not the `dest = dest OP source` shape
+/// the others share; and `v128.andnot(a, b)` is `a AND NOT b`, so `a` must be
+/// the source and `b` the destination. Both inversions cancel to "push r1 then
+/// r2" — the same textual order as the commutative ops above, for a completely
+/// different reason.
+/// reg/mem counterpart of `sse_bitwise_xmm_xmm_v128`. These ops are
+/// commutative, so unlike `sse_lane_xmm_mem` the operand order carries no
+/// meaning; the shape is kept identical anyway so the two read the same.
+fn sse_bitwise_xmm_mem_v128(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    r: u32,
+    op: SseBitOp,
+) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let source = global_pointers::sse_scratch_register as u32;
+    codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, source);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r) as i32);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r) as i32);
+    ctx.builder.load_aligned_v128(0);
+    ctx.builder.const_i32(source as i32);
+    ctx.builder.load_aligned_v128(0);
+    match op {
+        SseBitOp::And => ctx.builder.and_v128(),
+        SseBitOp::Or => ctx.builder.or_v128(),
+        SseBitOp::Xor => ctx.builder.xor_v128(),
+    }
+    ctx.builder.store_aligned_v128(0);
+}
+
+/// reg/mem ANDNPS/ANDNPD/PANDN — see `sse_andnot_xmm_xmm_v128` for why the
+/// source is the first operand and the destination the negated second.
+fn sse_andnot_xmm_mem_v128(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let source = global_pointers::sse_scratch_register as u32;
+    codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, source);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r) as i32);
+    ctx.builder.const_i32(source as i32);
+    ctx.builder.load_aligned_v128(0);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r) as i32);
+    ctx.builder.load_aligned_v128(0);
+    ctx.builder.andnot_v128();
+    ctx.builder.store_aligned_v128(0);
+}
+
+fn sse_andnot_xmm_xmm_v128(ctx: &mut JitContext, r1: u32, r2: u32) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
+    // a = source
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
+    ctx.builder.load_aligned_v128(0);
+    // b = destination, the operand that gets negated
+    ctx.builder
+        .const_i32(global_pointers::get_reg_xmm_offset(r2) as i32);
+    ctx.builder.load_aligned_v128(0);
+    ctx.builder.andnot_v128();
+    ctx.builder.store_aligned_v128(0);
+}
+
 fn sse_bitwise_xmm_xmm_v128(ctx: &mut JitContext, r1: u32, r2: u32, op: SseBitOp) {
     codegen::gen_mark_fpu_simd_dirty_once(ctx);
     // Pre-push destination addr for the final store.
@@ -6184,14 +6328,14 @@ pub fn instr_F30F53_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F54_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F54", modrm_byte, r);
+    sse_bitwise_xmm_mem_v128(ctx, modrm_byte, r, SseBitOp::And);
 }
 pub fn instr_0F54_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     // ANDPS xmm, xmm — inline v128.and instead of call_fn2 roundtrip.
     sse_bitwise_xmm_xmm_v128(ctx, r1, r2, SseBitOp::And);
 }
 pub fn instr_660F54_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660F54", modrm_byte, r);
+    sse_bitwise_xmm_mem_v128(ctx, modrm_byte, r, SseBitOp::And);
 }
 pub fn instr_660F54_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     // ANDPD xmm, xmm — inline v128.and.
@@ -6199,27 +6343,29 @@ pub fn instr_660F54_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F55_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F55", modrm_byte, r);
+    sse_andnot_xmm_mem_v128(ctx, modrm_byte, r);
 }
 pub fn instr_0F55_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_0F55", r1, r2);
+    // ANDNPS xmm, xmm — inline v128.andnot.
+    sse_andnot_xmm_xmm_v128(ctx, r1, r2);
 }
 pub fn instr_660F55_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660F55", modrm_byte, r);
+    sse_andnot_xmm_mem_v128(ctx, modrm_byte, r);
 }
 pub fn instr_660F55_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_660F55", r1, r2);
+    // ANDNPD xmm, xmm — inline v128.andnot.
+    sse_andnot_xmm_xmm_v128(ctx, r1, r2);
 }
 
 pub fn instr_0F56_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F56", modrm_byte, r);
+    sse_bitwise_xmm_mem_v128(ctx, modrm_byte, r, SseBitOp::Or);
 }
 pub fn instr_0F56_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     // ORPS xmm, xmm — inline v128.or.
     sse_bitwise_xmm_xmm_v128(ctx, r1, r2, SseBitOp::Or);
 }
 pub fn instr_660F56_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660F56", modrm_byte, r);
+    sse_bitwise_xmm_mem_v128(ctx, modrm_byte, r, SseBitOp::Or);
 }
 pub fn instr_660F56_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     // ORPD xmm, xmm — inline v128.or.
@@ -6227,14 +6373,14 @@ pub fn instr_660F56_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F57_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F57", modrm_byte, r);
+    sse_bitwise_xmm_mem_v128(ctx, modrm_byte, r, SseBitOp::Xor);
 }
 pub fn instr_0F57_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     // XORPS xmm, xmm — inline v128.xor.
     sse_bitwise_xmm_xmm_v128(ctx, r1, r2, SseBitOp::Xor);
 }
 pub fn instr_660F57_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660F57", modrm_byte, r);
+    sse_bitwise_xmm_mem_v128(ctx, modrm_byte, r, SseBitOp::Xor);
 }
 pub fn instr_660F57_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     // XORPD xmm, xmm — inline v128.xor. Very hot: compilers use XORPD reg,reg
@@ -6519,11 +6665,13 @@ pub fn instr_0F6B_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_660F60_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    // PUNPCKLBW xmm, m128 — inline i8x16.shuffle.
     // Note: Only requires 64-bit read, but is allowed to do 128-bit read
-    sse_read128_xmm_mem(ctx, "instr_660F60", modrm_byte, r);
+    sse_lane_xmm_mem(ctx, modrm_byte, r, SseLaneOp::UnpackLowBytes);
 }
 pub fn instr_660F60_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_660F60", r1, r2);
+    // PUNPCKLBW xmm, xmm — inline i8x16.shuffle.
+    sse_lane_xmm_xmm(ctx, r1, r2, SseLaneOp::UnpackLowBytes);
 }
 pub fn instr_660F61_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     // Note: Only requires 64-bit read, but is allowed to do 128-bit read
@@ -7500,6 +7648,19 @@ pub fn instr_0FDF_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     mmx_read64_mm_mm(ctx, "instr_0FDF", r1, r2);
 }
 
+pub fn instr_660FD0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    sse_read128_xmm_mem(ctx, "instr_660FD0", modrm_byte, r);
+}
+pub fn instr_660FD0_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    sse_read128_xmm_xmm(ctx, "instr_660FD0", r1, r2);
+}
+pub fn instr_F20FD0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    sse_read128_xmm_mem(ctx, "instr_F20FD0", modrm_byte, r);
+}
+pub fn instr_F20FD0_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    sse_read128_xmm_xmm(ctx, "instr_F20FD0", r1, r2);
+}
+
 pub fn instr_660FD1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     sse_read128_xmm_mem(ctx, "instr_660FD1", modrm_byte, r);
 }
@@ -7526,10 +7687,12 @@ pub fn instr_660FD4_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_i64x2_xmm_xmm(ctx, r1, r2, SseI64x2Op::Add);
 }
 pub fn instr_660FD5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660FD5", modrm_byte, r);
+    // PMULLW xmm, m128 — inline i16x8.mul.
+    sse_lane_xmm_mem(ctx, modrm_byte, r, SseLaneOp::MulLow16);
 }
 pub fn instr_660FD5_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_660FD5", r1, r2);
+    // PMULLW xmm, xmm — inline i16x8.mul.
+    sse_lane_xmm_xmm(ctx, r1, r2, SseLaneOp::MulLow16);
 }
 
 pub fn instr_660FD6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -7565,10 +7728,12 @@ pub fn instr_660FD7_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_660FD8_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660FD8", modrm_byte, r);
+    // PSUBUSB xmm, m128 — inline i8x16.sub_sat_u.
+    sse_lane_xmm_mem(ctx, modrm_byte, r, SseLaneOp::SubSatU8);
 }
 pub fn instr_660FD8_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_660FD8", r1, r2);
+    // PSUBUSB xmm, xmm — inline i8x16.sub_sat_u.
+    sse_lane_xmm_xmm(ctx, r1, r2, SseLaneOp::SubSatU8);
 }
 pub fn instr_660FD9_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     sse_read128_xmm_mem(ctx, "instr_660FD9", modrm_byte, r);
@@ -7583,7 +7748,7 @@ pub fn instr_660FDA_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660FDA", r1, r2);
 }
 pub fn instr_660FDB_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660FDB", modrm_byte, r);
+    sse_bitwise_xmm_mem_v128(ctx, modrm_byte, r, SseBitOp::And);
 }
 pub fn instr_660FDB_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     // PAND xmm, xmm — inline v128.and (same bit-level op as ANDPD).
@@ -7608,10 +7773,11 @@ pub fn instr_660FDE_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660FDE", r1, r2);
 }
 pub fn instr_660FDF_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660FDF", modrm_byte, r);
+    sse_andnot_xmm_mem_v128(ctx, modrm_byte, r);
 }
 pub fn instr_660FDF_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_660FDF", r1, r2);
+    // PANDN xmm, xmm — inline v128.andnot (same bit-level op as ANDNPD).
+    sse_andnot_xmm_xmm_v128(ctx, r1, r2);
 }
 
 pub fn instr_0FE0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -7782,7 +7948,7 @@ pub fn instr_660FEA_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660FEA", r1, r2);
 }
 pub fn instr_660FEB_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660FEB", modrm_byte, r);
+    sse_bitwise_xmm_mem_v128(ctx, modrm_byte, r, SseBitOp::Or);
 }
 pub fn instr_660FEB_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     // POR xmm, xmm — inline v128.or.
@@ -7795,10 +7961,12 @@ pub fn instr_660FEC_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660FEC", r1, r2);
 }
 pub fn instr_660FED_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660FED", modrm_byte, r);
+    // PADDSW xmm, m128 — inline i16x8.add_sat_s.
+    sse_lane_xmm_mem(ctx, modrm_byte, r, SseLaneOp::AddSatS16);
 }
 pub fn instr_660FED_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_660FED", r1, r2);
+    // PADDSW xmm, xmm — inline i16x8.add_sat_s.
+    sse_lane_xmm_xmm(ctx, r1, r2, SseLaneOp::AddSatS16);
 }
 pub fn instr_660FEE_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     sse_read128_xmm_mem(ctx, "instr_660FEE", modrm_byte, r);
@@ -7807,7 +7975,7 @@ pub fn instr_660FEE_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660FEE", r1, r2);
 }
 pub fn instr_660FEF_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_660FEF", modrm_byte, r);
+    sse_bitwise_xmm_mem_v128(ctx, modrm_byte, r, SseBitOp::Xor);
 }
 pub fn instr_660FEF_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     // PXOR xmm, xmm — inline v128.xor (zero-idiom in XORPS/PXOR reg,same).
@@ -7912,6 +8080,14 @@ pub fn instr_0FFE_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
 }
 pub fn instr_0FFE_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     mmx_read64_mm_mm(ctx, "instr_0FFE", r1, r2);
+}
+
+pub fn instr_F20FF0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    // lddqu — same observable effect as an unaligned 128-bit load
+    instr_F30F6F_mem_jit(ctx, modrm_byte, r);
+}
+pub fn instr_F20FF0_reg_jit(ctx: &mut JitContext, _r1: u32, _r2: u32) {
+    codegen::gen_trigger_ud(ctx);
 }
 
 pub fn instr_660FF1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {

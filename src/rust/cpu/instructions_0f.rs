@@ -1,11 +1,32 @@
 #![allow(non_snake_case)]
 
-unsafe fn undefined_instruction() {
-    dbg_assert!(false, "Undefined instructions");
+// dbg_assert! is compiled out of the release wasm, so without this the resulting #UD reaches the
+// guest with nothing in the log naming the opcode that produced it — and an HLE layer maps it to
+// EXCEPTION_ILLEGAL_INSTRUCTION handled by some SEH frame far from the cause. Rate-limited because
+// a guest that hits one usually hits it in a loop.
+static mut UD_LOG_BUDGET: u32 = 32;
+
+unsafe fn log_ud(kind: &str, opcode: u32) {
+    if UD_LOG_BUDGET == 0 {
+        return;
+    }
+    UD_LOG_BUDGET -= 1;
+    console_log!(
+        "[v86] {} 0f{:02x} at cs:eip={:x} (prefixes={:x}){}",
+        kind,
+        opcode,
+        *crate::cpu::global_pointers::previous_ip as u32,
+        *crate::cpu::global_pointers::prefixes as u32,
+        if UD_LOG_BUDGET == 0 { " [further #UD logs suppressed]" } else { "" },
+    );
+}
+
+unsafe fn undefined_instruction(opcode: u32) {
+    log_ud("undefined instruction", opcode);
     trigger_ud()
 }
-unsafe fn unimplemented_sse() {
-    dbg_assert!(false, "Unimplemented SSE instruction");
+unsafe fn unimplemented_sse(opcode: u32) {
+    log_ud("unimplemented SSE instruction", opcode);
     trigger_ud()
 }
 
@@ -410,9 +431,9 @@ pub unsafe fn instr32_0F03_reg(r1: i32, r: i32) {
     write_reg32(r, lsl(read_reg16(r1), read_reg32(r)));
 }
 #[no_mangle]
-pub unsafe fn instr_0F04() { undefined_instruction(); }
+pub unsafe fn instr_0F04() { undefined_instruction(0x04); }
 #[no_mangle]
-pub unsafe fn instr_0F05() { undefined_instruction(); }
+pub unsafe fn instr_0F05() { undefined_instruction(0x05); }
 #[no_mangle]
 pub unsafe fn instr_0F06() {
     // clts
@@ -428,11 +449,11 @@ pub unsafe fn instr_0F06() {
     };
 }
 #[no_mangle]
-pub unsafe fn instr_0F07() { undefined_instruction(); }
+pub unsafe fn instr_0F07() { undefined_instruction(0x07); }
 #[no_mangle]
 pub unsafe fn instr_0F08() {
     // invd
-    undefined_instruction();
+    undefined_instruction(0x08);
 }
 #[no_mangle]
 pub unsafe fn instr_0F09() {
@@ -445,22 +466,22 @@ pub unsafe fn instr_0F09() {
     };
 }
 #[no_mangle]
-pub unsafe fn instr_0F0A() { undefined_instruction(); }
+pub unsafe fn instr_0F0A() { undefined_instruction(0x0A); }
 pub unsafe fn instr_0F0B() {
     // UD2
     trigger_ud();
 }
 #[no_mangle]
-pub unsafe fn instr_0F0C() { undefined_instruction(); }
+pub unsafe fn instr_0F0C() { undefined_instruction(0x0C); }
 #[no_mangle]
 pub unsafe fn instr_0F0D() {
     // nop
-    undefined_instruction();
+    undefined_instruction(0x0D);
 }
 #[no_mangle]
-pub unsafe fn instr_0F0E() { undefined_instruction(); }
+pub unsafe fn instr_0F0E() { undefined_instruction(0x0E); }
 #[no_mangle]
-pub unsafe fn instr_0F0F() { undefined_instruction(); }
+pub unsafe fn instr_0F0F() { undefined_instruction(0x0F); }
 
 pub unsafe fn instr_0F10(source: reg128, r: i32) {
     // movups xmm, xmm/m128
@@ -713,9 +734,9 @@ pub unsafe fn instr_0F19_reg(_r1: i32, _r2: i32) {}
 pub unsafe fn instr_0F19_mem(_addr: i32, _r: i32) {}
 
 #[no_mangle]
-pub unsafe fn instr_0F1A() { undefined_instruction(); }
+pub unsafe fn instr_0F1A() { undefined_instruction(0x1A); }
 #[no_mangle]
-pub unsafe fn instr_0F1B() { undefined_instruction(); }
+pub unsafe fn instr_0F1B() { undefined_instruction(0x1B); }
 
 pub unsafe fn instr_0F1C_reg(_r1: i32, _r2: i32) {}
 pub unsafe fn instr_0F1C_mem(_addr: i32, _r: i32) {}
@@ -748,7 +769,7 @@ pub unsafe fn instr_0F20(r: i32, creg: i32) {
         },
         _ => {
             dbg_log!("{}", creg);
-            undefined_instruction();
+            undefined_instruction(0x20);
         },
     }
 }
@@ -824,7 +845,7 @@ pub unsafe fn instr_0F22(r: i32, creg: i32) {
         },
         _ => {
             dbg_log!("{}", creg);
-            undefined_instruction();
+            undefined_instruction(0x22);
         },
     }
 }
@@ -856,13 +877,13 @@ pub unsafe fn instr_0F23(r: i32, mut dreg_index: i32) {
     }
 }
 #[no_mangle]
-pub unsafe fn instr_0F24() { undefined_instruction(); }
+pub unsafe fn instr_0F24() { undefined_instruction(0x24); }
 #[no_mangle]
-pub unsafe fn instr_0F25() { undefined_instruction(); }
+pub unsafe fn instr_0F25() { undefined_instruction(0x25); }
 #[no_mangle]
-pub unsafe fn instr_0F26() { undefined_instruction(); }
+pub unsafe fn instr_0F26() { undefined_instruction(0x26); }
 #[no_mangle]
-pub unsafe fn instr_0F27() { undefined_instruction(); }
+pub unsafe fn instr_0F27() { undefined_instruction(0x27); }
 
 pub unsafe fn instr_0F28(source: reg128, r: i32) {
     // movaps xmm, xmm/m128
@@ -1326,7 +1347,7 @@ pub unsafe fn instr_0F32() {
 #[no_mangle]
 pub unsafe fn instr_0F33() {
     // rdpmc
-    undefined_instruction();
+    undefined_instruction(0x33);
 }
 #[no_mangle]
 pub unsafe fn instr_0F34() {
@@ -1388,28 +1409,28 @@ pub unsafe fn instr_0F35() {
     };
 }
 #[no_mangle]
-pub unsafe fn instr_0F36() { undefined_instruction(); }
+pub unsafe fn instr_0F36() { undefined_instruction(0x36); }
 #[no_mangle]
 pub unsafe fn instr_0F37() {
     // getsec
-    undefined_instruction();
+    undefined_instruction(0x37);
 }
 #[no_mangle]
-pub unsafe fn instr_0F38() { unimplemented_sse(); }
+pub unsafe fn instr_0F38() { unimplemented_sse(0x38); }
 #[no_mangle]
-pub unsafe fn instr_0F39() { unimplemented_sse(); }
+pub unsafe fn instr_0F39() { unimplemented_sse(0x39); }
 #[no_mangle]
-pub unsafe fn instr_0F3A() { unimplemented_sse(); }
+pub unsafe fn instr_0F3A() { unimplemented_sse(0x3A); }
 #[no_mangle]
-pub unsafe fn instr_0F3B() { unimplemented_sse(); }
+pub unsafe fn instr_0F3B() { unimplemented_sse(0x3B); }
 #[no_mangle]
-pub unsafe fn instr_0F3C() { unimplemented_sse(); }
+pub unsafe fn instr_0F3C() { unimplemented_sse(0x3C); }
 #[no_mangle]
-pub unsafe fn instr_0F3D() { unimplemented_sse(); }
+pub unsafe fn instr_0F3D() { unimplemented_sse(0x3D); }
 #[no_mangle]
-pub unsafe fn instr_0F3E() { unimplemented_sse(); }
+pub unsafe fn instr_0F3E() { unimplemented_sse(0x3E); }
 #[no_mangle]
-pub unsafe fn instr_0F3F() { unimplemented_sse(); }
+pub unsafe fn instr_0F3F() { unimplemented_sse(0x3F); }
 
 pub unsafe fn instr16_0F40_mem(addr: i32, r: i32) {
     cmovcc16(test_o(), return_on_pagefault!(safe_read16(addr)), r);
@@ -2969,18 +2990,18 @@ pub unsafe fn instr_0F77() {
 }
 
 #[no_mangle]
-pub unsafe fn instr_0F78() { unimplemented_sse(); }
+pub unsafe fn instr_0F78() { unimplemented_sse(0x78); }
 #[no_mangle]
-pub unsafe fn instr_0F79() { unimplemented_sse(); }
+pub unsafe fn instr_0F79() { unimplemented_sse(0x79); }
 #[no_mangle]
-pub unsafe fn instr_0F7A() { unimplemented_sse(); }
+pub unsafe fn instr_0F7A() { unimplemented_sse(0x7A); }
 #[no_mangle]
-pub unsafe fn instr_0F7B() { unimplemented_sse(); }
+pub unsafe fn instr_0F7B() { unimplemented_sse(0x7B); }
 
 #[no_mangle]
-pub unsafe fn instr_0F7C() { unimplemented_sse(); }
+pub unsafe fn instr_0F7C() { unimplemented_sse(0x7C); }
 #[no_mangle]
-pub unsafe fn instr_0F7D() { unimplemented_sse(); }
+pub unsafe fn instr_0F7D() { unimplemented_sse(0x7D); }
 
 #[no_mangle]
 pub unsafe fn instr_660F7C(source: reg128, r: i32) {
@@ -3315,9 +3336,32 @@ pub unsafe fn instr_0FA2() {
         },
 
         0x80000000 => {
-            // maximum supported extended level
-            eax = 5;
-            // other registers are reserved
+            // Maximum supported extended level. Must be either < 0x80000000 (no extended leaves
+            // at all) or >= 0x80000004 (brand string present); the previous 5 was neither, so a
+            // guest comparing against 0x80000002 read the brand string out of leaf 5's cache
+            // descriptors.
+            eax = 0x80000004u32 as i32;
+        },
+
+        0x80000001 => {
+            // Extended feature flags: a 32-bit P6 has neither SYSCALL/XD/LM nor any AMD extension.
+        },
+
+        0x80000002 | 0x80000003 | 0x80000004 => {
+            // Processor brand string, 48 bytes across the three leaves. Kept consistent with the
+            // family/model/stepping reported by leaf 1 (6/7/3 == Pentium III).
+            const BRAND: &[u8; 48] = b"Intel(R) Pentium(R) III CPU\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+            let word = |i: usize| -> i32 {
+                BRAND[i] as i32
+                    | (BRAND[i + 1] as i32) << 8
+                    | (BRAND[i + 2] as i32) << 16
+                    | (BRAND[i + 3] as i32) << 24
+            };
+            let off = (level - 0x80000002) as usize * 16;
+            eax = word(off);
+            ebx = word(off + 4);
+            ecx = word(off + 8);
+            edx = word(off + 12);
         },
 
         0x40000000 => {
@@ -3412,7 +3456,7 @@ pub unsafe fn instr_0FA6() {
     trigger_ud();
 }
 #[no_mangle]
-pub unsafe fn instr_0FA7() { undefined_instruction(); }
+pub unsafe fn instr_0FA7() { undefined_instruction(0xA7); }
 pub unsafe fn instr16_0FA8() {
     return_on_pagefault!(push16(*sreg.offset(GS as isize) as i32));
 }
@@ -3443,7 +3487,7 @@ pub unsafe fn instr32_0FA9() {
 #[no_mangle]
 pub unsafe fn instr_0FAA() {
     // rsm
-    undefined_instruction();
+    undefined_instruction(0xAA);
 }
 #[no_mangle]
 pub unsafe fn instr16_0FAB_reg(r1: i32, r2: i32) {
@@ -3496,7 +3540,7 @@ pub unsafe fn instr_0FAE_1_reg(_r: i32) { trigger_ud(); }
 #[no_mangle]
 pub unsafe fn instr_0FAE_1_mem(addr: i32) { fxrstor(addr); }
 #[no_mangle]
-pub unsafe fn instr_0FAE_2_reg(_r: i32) { unimplemented_sse(); }
+pub unsafe fn instr_0FAE_2_reg(_r: i32) { unimplemented_sse(0xAE); }
 #[no_mangle]
 pub unsafe fn instr_0FAE_2_mem(addr: i32) {
     // ldmxcsr
@@ -3523,14 +3567,14 @@ pub unsafe fn instr_0FAE_4_reg(_r: i32) { trigger_ud(); }
 #[no_mangle]
 pub unsafe fn instr_0FAE_4_mem(_addr: i32) {
     // xsave
-    undefined_instruction();
+    undefined_instruction(0xAE);
 }
 pub unsafe fn instr_0FAE_5_reg(_r: i32) {
     // lfence
 }
 pub unsafe fn instr_0FAE_5_mem(_addr: i32) {
     // xrstor
-    undefined_instruction();
+    undefined_instruction(0xAE);
 }
 #[no_mangle]
 pub unsafe fn instr_0FAE_6_reg(_r: i32) {
@@ -3539,7 +3583,7 @@ pub unsafe fn instr_0FAE_6_reg(_r: i32) {
 #[no_mangle]
 pub unsafe fn instr_0FAE_6_mem(_addr: i32) {
     // xsaveopt
-    undefined_instruction();
+    undefined_instruction(0xAE);
 }
 #[no_mangle]
 pub unsafe fn instr_0FAE_7_reg(_r: i32) {
@@ -3548,7 +3592,7 @@ pub unsafe fn instr_0FAE_7_reg(_r: i32) {
 #[no_mangle]
 pub unsafe fn instr_0FAE_7_mem(_addr: i32) {
     // clflush
-    undefined_instruction();
+    undefined_instruction(0xAE);
 }
 pub unsafe fn instr16_0FAF_mem(addr: i32, r: i32) {
     write_reg16(
@@ -3987,7 +4031,47 @@ pub unsafe fn instr_0FCE() { bswap(ESI); }
 #[no_mangle]
 pub unsafe fn instr_0FCF() { bswap(EDI); }
 #[no_mangle]
-pub unsafe fn instr_0FD0() { unimplemented_sse(); }
+pub unsafe fn instr_0FD0() { unimplemented_sse(0xD0); }
+
+#[no_mangle]
+pub unsafe fn instr_660FD0(source: reg128, r: i32) {
+    // addsubpd xmm1, xmm2/m128
+    let destination = read_xmm128s(r);
+    write_xmm_reg128(
+        r,
+        reg128 {
+            f64: [
+                destination.f64[0] - source.f64[0],
+                destination.f64[1] + source.f64[1],
+            ],
+        },
+    );
+}
+pub unsafe fn instr_660FD0_reg(r1: i32, r2: i32) { instr_660FD0(read_xmm128s(r1), r2); }
+pub unsafe fn instr_660FD0_mem(addr: i32, r: i32) {
+    instr_660FD0(return_on_pagefault!(safe_read128s(addr)), r);
+}
+
+#[no_mangle]
+pub unsafe fn instr_F20FD0(source: reg128, r: i32) {
+    // addsubps xmm1, xmm2/m128
+    let destination = read_xmm128s(r);
+    write_xmm_reg128(
+        r,
+        reg128 {
+            f32: [
+                destination.f32[0] - source.f32[0],
+                destination.f32[1] + source.f32[1],
+                destination.f32[2] - source.f32[2],
+                destination.f32[3] + source.f32[3],
+            ],
+        },
+    );
+}
+pub unsafe fn instr_F20FD0_reg(r1: i32, r2: i32) { instr_F20FD0(read_xmm128s(r1), r2); }
+pub unsafe fn instr_F20FD0_mem(addr: i32, r: i32) {
+    instr_F20FD0(return_on_pagefault!(safe_read128s(addr)), r);
+}
 #[no_mangle]
 pub unsafe fn instr_0FD1(source: u64, r: i32) {
     // psrlw mm, mm/m64
@@ -4845,7 +4929,16 @@ pub unsafe fn instr_660FEF_mem(addr: i32, r: i32) {
     instr_660FEF(return_on_pagefault!(safe_read128s(addr)), r);
 }
 #[no_mangle]
-pub unsafe fn instr_0FF0() { unimplemented_sse(); }
+pub unsafe fn instr_0FF0() { unimplemented_sse(0xF0); }
+
+#[no_mangle]
+pub unsafe fn instr_F20FF0_reg(_r1: i32, _r2: i32) { trigger_ud(); }
+#[no_mangle]
+pub unsafe fn instr_F20FF0_mem(addr: i32, r: i32) {
+    // lddqu xmm, m128. Architecturally free to over-fetch and reassemble; a plain unaligned
+    // load is a valid (and the only observable-equivalent) implementation.
+    mov_rm_r128(return_on_pagefault!(safe_read128s(addr)), r);
+}
 #[no_mangle]
 pub unsafe fn instr_0FF1(source: u64, r: i32) {
     // psllw mm, mm/m64

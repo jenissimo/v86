@@ -381,12 +381,15 @@ build/capstone-x86.min.js:
 	mkdir -p build
 	wget -nv -P build https://github.com/AlexAltea/capstone.js/releases/download/v3.0.5-rc1/capstone-x86.min.js
 
+# 1.0.39, not the 1.0.6 demo build this used to fetch: 1.0.6 predates the SIMD
+# proposal and cannot decode a v128 opcode, so it turned every SSE expect test
+# into a disassembler error instead of a reviewable diff. The npm tarball ships
+# the whole library as index.js; there is no demo/libwabt.js any more.
 build/libwabt.cjs:
 	mkdir -p build
-	wget -nv -P build https://github.com/WebAssembly/wabt/archive/1.0.6.zip
-	unzip -j -d build/ build/1.0.6.zip wabt-1.0.6/demo/libwabt.js
-	mv build/libwabt.js build/libwabt.cjs
-	rm build/1.0.6.zip
+	curl -sfL -o build/wabt.tgz https://registry.npmjs.org/wabt/-/wabt-1.0.39.tgz
+	tar -xzOf build/wabt.tgz package/index.js > build/libwabt.cjs
+	rm build/wabt.tgz
 
 build/xterm.js:
 	curl https://cdn.jsdelivr.net/npm/xterm@5.2.1/lib/xterm.min.js > build/xterm.js

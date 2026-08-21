@@ -12,9 +12,18 @@ const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 const TEST_RELEASE_BUILD = +process.env.TEST_RELEASE_BUILD;
 const { V86 } = await import(TEST_RELEASE_BUILD ? "../../build/libv86.mjs" : "../../src/main.js");
 
-const libwabt = wabt();
+// wabt >= 1.0.7 initialises asynchronously. The pinned 1.0.6 could not decode
+// v128 at all, so every SSE expect test failed to disassemble -- which made the
+// expect suite silently blind to exactly the SIMD code generation it is meant
+// to review.
+const libwabt = await wabt();
 
-const TEST_NAME = process.env.TEST_NAME;
+// A regex, like tests/nasm/run.js, so a related GROUP can be run in one command
+// (TEST_NAME=sse- for the SIMD snapshots). An exact name is still a valid regex,
+// so the previous single-test usage is unchanged. This matters because the suite
+// stops at the first failing test, which would otherwise make every snapshot
+// after it unreachable.
+const TEST_NAME = new RegExp(process.env.TEST_NAME || "", "i");
 
 const LOG_LEVEL = 0;
 const MIN_MEMORY_OFFSET = 4096;
@@ -38,7 +47,7 @@ function run_all()
             asm_file: path.join(TEST_DIR, name + ".asm"),
             executable_file: path.join(BUILD_DIR, name + ".bin"),
         };
-    }).filter(({ name }) => !TEST_NAME || name === TEST_NAME);
+    }).filter(({ name }) => TEST_NAME.test(name));
 
     next_test(0);
 

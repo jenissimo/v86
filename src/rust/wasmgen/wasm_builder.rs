@@ -984,6 +984,30 @@ impl WasmBuilder {
         self.instruction_body.push(op::SIMD_I64X2_SUB_LEB1);
     }
 
+    /// Emit `0xfd` + the LEB128 encoding of a SIMD sub-opcode. Sub-opcodes are a
+    /// u32 immediate, so anything >= 0x80 is two bytes; encoding here keeps the
+    /// call sites naming one raw value from the spec table instead of a
+    /// hand-split byte pair.
+    fn simd_op(&mut self, sub_opcode: u8) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        write_leb_u32(&mut self.instruction_body, sub_opcode as u32);
+    }
+
+    pub fn andnot_v128(&mut self) { self.simd_op(op::SIMD_V128_ANDNOT); }
+    pub fn add_sat_s_i16x8(&mut self) { self.simd_op(op::SIMD_I16X8_ADD_SAT_S); }
+    pub fn mul_i16x8(&mut self) { self.simd_op(op::SIMD_I16X8_MUL); }
+    pub fn sub_sat_u_i8x16(&mut self) { self.simd_op(op::SIMD_I8X16_SUB_SAT_U); }
+
+    /// `i8x16.shuffle` — the 16 lane indices are an immediate, not stack
+    /// operands. Index 0..15 selects from the first vector, 16..31 the second.
+    pub fn shuffle_i8x16(&mut self, lanes: &[u8; 16]) {
+        self.simd_op(op::SIMD_I8X16_SHUFFLE);
+        for &l in lanes {
+            dbg_assert!(l < 32);
+            self.instruction_body.push(l);
+        }
+    }
+
     // ─── Scalar float arithmetic (for SSE2 scalar ops) ──────────────────
     // MULSD/ADDSD/SUBSD/DIVSD write ONLY the low 64 bits of the XMM — the
     // upper 64 bits must be preserved. In WASM the cleanest way is to do
