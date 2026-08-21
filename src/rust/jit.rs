@@ -5030,9 +5030,9 @@ pub fn jit_config_abi_version() -> u32 { JIT_CONFIG_ABI_VERSION }
 pub fn jit_config_supported_mask() -> u32 { JIT_CONFIG_SUPPORTED_MASK }
 
 // FNV-1a over the exact inputs that affect emitted JIT wasm. Field order is ABI-stable:
-// configuration indices 1-3, 5-8, 10-14, 16-17, 19, and 21-23; relaxed-FPU mode;
-// DISPATCH_STATS; and the fixed fastmem layout constants. Policy/accounting/diagnostic
-// indices 0, 15, 20, and 24 deliberately do not participate.
+// configuration indices 1-3, 5-8, 10-14, 16-17, 19, and 21-23; relaxed-FPU mode and its
+// hit/fallback counters; DISPATCH_STATS; and the fixed fastmem layout constants.
+// Policy/accounting/diagnostic indices 0, 15, 20, and 24 deliberately do not participate.
 fn jit_codegen_fingerprint() -> u64 {
     let mut hash = 0xCBF2_9CE4_8422_2325u64;
     let mut add = |value: u32| {
@@ -5061,6 +5061,7 @@ fn jit_codegen_fingerprint() -> u64 {
         add(DISPATCH_STATS as u32);
     }
     add(crate::softfloat::get_relaxed_fpu());
+    add(crate::softfloat::get_fpu_relaxed_stats());
     add(FASTMEM_LOW_MEM_END);
     add(FASTMEM_GUARD_BASE);
     add(FASTMEM_GUARD_SIZE);
