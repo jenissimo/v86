@@ -1,7 +1,7 @@
 //! Hypercall page: shared data between WASM and JS for fast thunk dispatch
 //! and preemption control.
 //!
-//! Layout of HYPERCALL_PAGE (16384 bytes):
+//! Layout of HYPERCALL_PAGE (81920 bytes):
 //!   0x000: cycle_limit          u32 — writable replacement for LOOP_COUNTER
 //!   0x004: (reserved)           u32
 //!   0x008: hc_enabled           u32 — hypercall master switch
@@ -61,6 +61,9 @@
 //!     republished by the JS scheduler whenever a count changes. Read-only here: it exists so
 //!     handle_resume_thread can answer the NO-OP resume (count already 0) without a JS round
 //!     trip. A handle absent from the table, or one with a nonzero count, falls through.
+//!   0x4000: hc_dispatch_table_ext [u8; 61440] — ids 4096..65535. Kept separate so all
+//!     established ABI offsets remain stable while synthetic HLE images can use the same
+//!     WASM handlers as ordinary import stubs.
 
 use std::ptr::{addr_of, addr_of_mut};
 
@@ -76,7 +79,7 @@ use crate::softfloat::F80;
 /// Dedicated page for hypercall shared data + preemption control.
 /// Lives in WASM data section, not in CPU state area.
 #[no_mangle]
-pub static mut HYPERCALL_PAGE: [u8; 16384] = [0u8; 16384];
+pub static mut HYPERCALL_PAGE: [u8; 81920] = [0u8; 81920];
 
 // Offset constants
 const OFF_CYCLE_LIMIT: usize = 0x000;
@@ -111,6 +114,8 @@ const OFF_HC_RAND_SEED: usize = 0x0B0;
 /// authoritative at all times.
 const OFF_HC_CAPTURE_HWND: usize = 0x0B4;
 const OFF_HC_DISPATCH_TABLE: usize = 0x100;
+const OFF_HC_DISPATCH_TABLE_EXT: usize = 0x4000;
+const HC_DISPATCH_LIMIT: i32 = 0x10000;
 const OFF_HC_FLS_ALLOCATED: usize = 0x1100;
 const OFF_HC_FLS_VALUES: usize = 0x1184;
 const HC_FLS_SLOT_COUNT: usize = 129;
@@ -285,12 +290,17 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         return false;
     }
 
-    // Bounds check dispatch table (4096 entries at offset 0x100)
-    if function_id <= 0 || function_id >= 4096 {
+    if function_id <= 0 || function_id >= HC_DISPATCH_LIMIT {
         return false;
     }
 
-    let handler_id = *page.add(OFF_HC_DISPATCH_TABLE + function_id as usize);
+    let fid = function_id as usize;
+    let entry = if fid < 4096 {
+        OFF_HC_DISPATCH_TABLE + fid
+    } else {
+        OFF_HC_DISPATCH_TABLE_EXT + fid - 4096
+    };
+    let handler_id = *page.add(entry);
     if handler_id == 0 {
         return false;
     }

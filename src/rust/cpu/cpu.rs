@@ -438,6 +438,20 @@ pub static mut DBG_WW_LAST_VAL: u32 = 0;
 pub static mut DBG_WW_ZERO_EIP: u32 = 0;  // EIP of the most recent write that stored 0
 pub static mut DBG_WW_ZERO_PREV: u32 = 0;
 pub static mut DBG_WW_ZERO_HITS: u32 = 0;
+pub static mut DBG_WW_MATCH_ENABLED: bool = false;
+pub static mut DBG_WW_MATCH_VAL: u32 = 0;
+pub static mut DBG_WW_MATCH_EIP: u32 = 0;
+pub static mut DBG_WW_MATCH_PREV: u32 = 0;
+pub static mut DBG_WW_MATCH_HITS: u32 = 0;
+pub static mut DBG_WW_MATCH_REGS: [u32; 8] = [0; 8];
+pub static mut DBG_WW_MATCH_CODE_BASE: u32 = 0;
+pub static mut DBG_WW_MATCH_CODE: [u8; 256] = [0; 256];
+const DBG_WW_TRACE_CAP: usize = 4096;
+pub static mut DBG_WW_TRACE_ARM: u32 = 0;
+pub static mut DBG_WW_TRACE_REMAINING: u32 = 0;
+pub static mut DBG_WW_TRACE_COUNT: u32 = 0;
+pub static mut DBG_WW_TRACE_EIP: [u32; DBG_WW_TRACE_CAP] = [0; DBG_WW_TRACE_CAP];
+pub static mut DBG_WW_TRACE_REGS: [[u32; 8]; DBG_WW_TRACE_CAP] = [[0; 8]; DBG_WW_TRACE_CAP];
 
 #[no_mangle] pub unsafe fn dbg_set_write_watch(addr: u32) {
     // Force the watched page onto the store slow path so dbg_check_write
@@ -449,9 +463,21 @@ pub static mut DBG_WW_ZERO_HITS: u32 = 0;
     if addr != 0 {
         crate::jit::fastmem_write_map_set_watch(addr >> 12);
     }
-    DBG_WRITE_WATCH = addr; DBG_WW_HITS = 0; DBG_WW_ZERO_HITS = 0;
+    DBG_WRITE_WATCH = addr; DBG_WW_HITS = 0; DBG_WW_ZERO_HITS = 0; DBG_WW_MATCH_HITS = 0;
     DBG_WW_LAST_EIP = 0; DBG_WW_LAST_PREV = 0; DBG_WW_LAST_VAL = 0;
     DBG_WW_ZERO_EIP = 0; DBG_WW_ZERO_PREV = 0;
+    DBG_WW_MATCH_EIP = 0; DBG_WW_MATCH_PREV = 0; DBG_WW_MATCH_REGS = [0; 8];
+}
+#[no_mangle] pub unsafe fn dbg_set_write_watch_match(enabled: u32, value: u32) {
+    DBG_WW_MATCH_ENABLED = enabled != 0;
+    DBG_WW_MATCH_VAL = value;
+    DBG_WW_MATCH_HITS = 0; DBG_WW_MATCH_EIP = 0; DBG_WW_MATCH_PREV = 0;
+    DBG_WW_MATCH_REGS = [0; 8];
+}
+#[no_mangle] pub unsafe fn dbg_set_ww_trace(n: u32) {
+    DBG_WW_TRACE_ARM = n.min(DBG_WW_TRACE_CAP as u32);
+    DBG_WW_TRACE_REMAINING = 0;
+    DBG_WW_TRACE_COUNT = 0;
 }
 #[no_mangle] pub unsafe fn dbg_ww_hits() -> u32 { DBG_WW_HITS }
 #[no_mangle] pub unsafe fn dbg_ww_last_eip() -> u32 { DBG_WW_LAST_EIP }
@@ -460,6 +486,23 @@ pub static mut DBG_WW_ZERO_HITS: u32 = 0;
 #[no_mangle] pub unsafe fn dbg_ww_zero_eip() -> u32 { DBG_WW_ZERO_EIP }
 #[no_mangle] pub unsafe fn dbg_ww_zero_prev() -> u32 { DBG_WW_ZERO_PREV }
 #[no_mangle] pub unsafe fn dbg_ww_zero_hits() -> u32 { DBG_WW_ZERO_HITS }
+#[no_mangle] pub unsafe fn dbg_ww_match_eip() -> u32 { DBG_WW_MATCH_EIP }
+#[no_mangle] pub unsafe fn dbg_ww_match_prev() -> u32 { DBG_WW_MATCH_PREV }
+#[no_mangle] pub unsafe fn dbg_ww_match_hits() -> u32 { DBG_WW_MATCH_HITS }
+#[no_mangle] pub unsafe fn dbg_ww_match_reg(index: u32) -> u32 {
+    if index < 8 { DBG_WW_MATCH_REGS[index as usize] } else { 0 }
+}
+#[no_mangle] pub unsafe fn dbg_ww_match_code_base() -> u32 { DBG_WW_MATCH_CODE_BASE }
+#[no_mangle] pub unsafe fn dbg_ww_match_code_byte(index: u32) -> u32 {
+    if index < 256 { DBG_WW_MATCH_CODE[index as usize] as u32 } else { 0 }
+}
+#[no_mangle] pub unsafe fn dbg_ww_trace_count() -> u32 { DBG_WW_TRACE_COUNT }
+#[no_mangle] pub unsafe fn dbg_ww_trace_eip(index: u32) -> u32 {
+    if index < DBG_WW_TRACE_COUNT { DBG_WW_TRACE_EIP[index as usize] } else { 0 }
+}
+#[no_mangle] pub unsafe fn dbg_ww_trace_reg(index: u32, reg: u32) -> u32 {
+    if index < DBG_WW_TRACE_COUNT && reg < 8 { DBG_WW_TRACE_REGS[index as usize][reg as usize] } else { 0 }
+}
 
 #[inline(always)]
 pub unsafe fn dbg_check_write(addr: u32, len: u32, value: i32) {
@@ -478,11 +521,47 @@ pub unsafe fn dbg_check_write(addr: u32, len: u32, value: i32) {
             DBG_WW_ZERO_PREV = prev;
             DBG_WW_ZERO_HITS = DBG_WW_ZERO_HITS.wrapping_add(1);
         }
+        if DBG_WW_MATCH_ENABLED && value as u32 == DBG_WW_MATCH_VAL {
+            DBG_WW_MATCH_EIP = eip;
+            DBG_WW_MATCH_PREV = prev;
+            DBG_WW_MATCH_HITS = DBG_WW_MATCH_HITS.wrapping_add(1);
+            let mut i = 0;
+            while i < 8 {
+                DBG_WW_MATCH_REGS[i] = *crate::cpu::global_pointers::reg32.add(i) as u32;
+                i += 1;
+            }
+            // Clamped to guest memory: eip below 128 wraps the base to near 4 GiB, and
+            // a 256-byte read from there walks off linear memory and traps the whole
+            // emulator — from a debug capture nobody asked to be fatal.
+            let mem_end = *crate::cpu::global_pointers::memory_size;
+            let base = if eip >= 128 { eip - 128 } else { 0 };
+            let base = if base >= mem_end { mem_end.saturating_sub(1) } else { base };
+            DBG_WW_MATCH_CODE_BASE = base;
+            i = 0;
+            while i < 256 {
+                let at = base.wrapping_add(i as u32);
+                DBG_WW_MATCH_CODE[i] = if at < mem_end { *memory::mem8.offset(at as isize) } else { 0 };
+                i += 1;
+            }
+            DBG_WW_TRACE_COUNT = 0;
+            DBG_WW_TRACE_REMAINING = DBG_WW_TRACE_ARM;
+        }
     }
 }
 
 #[inline(always)]
 pub unsafe fn dbg_on_instruction(eip: u32) {
+    if DBG_WW_TRACE_REMAINING > 0 && (DBG_WW_TRACE_COUNT as usize) < DBG_WW_TRACE_CAP {
+        let slot = DBG_WW_TRACE_COUNT as usize;
+        DBG_WW_TRACE_EIP[slot] = eip;
+        let mut reg = 0;
+        while reg < 8 {
+            DBG_WW_TRACE_REGS[slot][reg] = *crate::cpu::global_pointers::reg32.add(reg) as u32;
+            reg += 1;
+        }
+        DBG_WW_TRACE_COUNT += 1;
+        DBG_WW_TRACE_REMAINING -= 1;
+    }
     if !DBG_ENABLED { return; }
     let stepping = DBG_STEP_REMAINING > 0;
     let mut is_bp = false;
