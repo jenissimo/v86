@@ -33,6 +33,8 @@
 //!   vsConstVersion/psConstVersion   u32 x2 — bumped by JS on every SetVertexShaderConstantF/
 //!                                   SetPixelShaderConstantF (coarse change signal for the
 //!                                   draw-state reuse memo, see LAST_DRAW_STATE below)
+//!   pipelineIdentity   u32[16]   — canonical programmable pipeline identity supplied by TS;
+//!                                   Rust hashes every word into the command key
 //!
 //! Command SoA (written only by d3d9_record_draw*, capacity headroom for ~2560 draws/frame):
 //!   commandTypes/A/B/C   u32[CMD_CAP] x4 — same 4-parallel-array shape as RenderFrame
@@ -68,6 +70,9 @@ const PS_CONST_FLOATS: usize = 224 * 4;
 // so CMD_CAP is sized at 16384 (~5400 draws of headroom) to avoid arena overflow.
 pub const CMD_CAP: usize = 16384;
 const BUMP_CAP: usize = 16 * 1024 * 1024;
+/// Shared-memory ABI version. Increment whenever the layout or exported command
+/// signatures change in a way the JS adapter cannot safely infer.
+const D3D9_ARENA_ABI_VERSION: u32 = 2;
 
 const OFF_RENDER_STATES: usize = 0;
 const OFF_SAMPLER_STAGE0: usize = OFF_RENDER_STATES + RENDER_STATE_COUNT * 4;
@@ -85,8 +90,10 @@ const OFF_VS_CONSTANTS: usize = OFF_SHADER_CONST_LEN_PS + SHADER_HANDLE_SLOTS * 
 const OFF_PS_CONSTANTS: usize = OFF_VS_CONSTANTS + VS_CONST_FLOATS * 4;
 const OFF_VS_CONST_VERSION: usize = OFF_PS_CONSTANTS + PS_CONST_FLOATS * 4;
 const OFF_PS_CONST_VERSION: usize = OFF_VS_CONST_VERSION + 4;
+const PIPELINE_IDENTITY_WORDS: usize = 16;
+const OFF_PIPELINE_IDENTITY: usize = OFF_PS_CONST_VERSION + 4;
 
-const OFF_CMD_TYPES: usize = (OFF_PS_CONST_VERSION + 4 + 15) & !15; // 16-byte align
+const OFF_CMD_TYPES: usize = (OFF_PIPELINE_IDENTITY + PIPELINE_IDENTITY_WORDS * 4 + 15) & !15; // 16-byte align
 const OFF_CMD_A: usize = OFF_CMD_TYPES + CMD_CAP * 4;
 const OFF_CMD_B: usize = OFF_CMD_A + CMD_CAP * 4;
 const OFF_CMD_C: usize = OFF_CMD_B + CMD_CAP * 4;
@@ -177,7 +184,7 @@ const CMD_DRAW_INDEXED_UP: u32 = 8;
 // once did (see memory: slab-hpbase-guest-unreachable). Order here IS the contract —
 // the TS-side LAYOUT_IDX_* constants must list the same names in the same order.
 // ---------------------------------------------------------------------------
-const LAYOUT_LEN: usize = 44;
+const LAYOUT_LEN: usize = 45;
 const LAYOUT_TABLE: [u32; LAYOUT_LEN] = [
     OFF_RENDER_STATES as u32,      // 0
     OFF_SAMPLER_STAGE0 as u32,     // 1
@@ -195,40 +202,41 @@ const LAYOUT_TABLE: [u32; LAYOUT_LEN] = [
     OFF_PS_CONSTANTS as u32,       // 13
     OFF_VS_CONST_VERSION as u32,   // 14
     OFF_PS_CONST_VERSION as u32,   // 15
-    OFF_CMD_TYPES as u32,          // 16
-    OFF_CMD_A as u32,              // 17
-    OFF_CMD_B as u32,              // 18
-    OFF_CMD_C as u32,              // 19
-    OFF_PIPELINE_KEY as u32,       // 20
-    OFF_BIND_GROUP_KEY as u32,     // 21
-    OFF_COMMAND_COUNT as u32,      // 22
-    OFF_BUMP_ARENA as u32,         // 23
-    OFF_BUMP_CURSOR as u32,        // 24
-    OFF_COMMANDS_EMITTED as u32,   // 25
-    OFF_ARENA_HIGH_WATER as u32,   // 26
-    OFF_OVERFLOW_COUNT as u32,     // 27
-    OFF_FFP_FALLBACK_COUNT as u32, // 28
-    OFF_MISMATCH_COUNT as u32,     // 29
-    CMD_CAP as u32,                // 30 — capacity, not an offset
-    ARENA_SIZE as u32,             // 31 — total size, not an offset
-    OFF_BLOCK_SLOTS as u32,        // 32
-    BLOCK_SLOT_SIZE as u32,        // 33 — stride, not an offset
-    BLOCK_SLOT_COUNT as u32,       // 34 — capacity, not an offset
-    OFF_BLOCK_CHANGED as u32,      // 35
-    BLOCK_CHANGED_CAP as u32,      // 36 — capacity (u32 pairs), not an offset
-    BLOCK_MASK_RS as u32,          // 37 — intra-slot offsets from here down
-    BLOCK_MASK_SAMP as u32,        // 38
-    BLOCK_VS_RANGES as u32,        // 39
-    BLOCK_PS_RANGES as u32,        // 40
-    BLOCK_RS_VALUES as u32,        // 41
-    BLOCK_SAMP_VALUES as u32,      // 42
-    BLOCK_CONST_POOL as u32,       // 43
+    OFF_PIPELINE_IDENTITY as u32,  // 16
+    OFF_CMD_TYPES as u32,          // 17
+    OFF_CMD_A as u32,              // 18
+    OFF_CMD_B as u32,              // 19
+    OFF_CMD_C as u32,              // 20
+    OFF_PIPELINE_KEY as u32,       // 21
+    OFF_BIND_GROUP_KEY as u32,     // 22
+    OFF_COMMAND_COUNT as u32,      // 23
+    OFF_BUMP_ARENA as u32,         // 24
+    OFF_BUMP_CURSOR as u32,        // 25
+    OFF_COMMANDS_EMITTED as u32,   // 26
+    OFF_ARENA_HIGH_WATER as u32,   // 27
+    OFF_OVERFLOW_COUNT as u32,     // 28
+    OFF_FFP_FALLBACK_COUNT as u32, // 29
+    OFF_MISMATCH_COUNT as u32,     // 30
+    CMD_CAP as u32,                // 31 — capacity, not an offset
+    ARENA_SIZE as u32,             // 32 — total size, not an offset
+    OFF_BLOCK_SLOTS as u32,        // 33
+    BLOCK_SLOT_SIZE as u32,        // 34 — stride, not an offset
+    BLOCK_SLOT_COUNT as u32,       // 35 — capacity, not an offset
+    OFF_BLOCK_CHANGED as u32,      // 36
+    BLOCK_CHANGED_CAP as u32,      // 37 — capacity (u32 pairs), not an offset
+    BLOCK_MASK_RS as u32,          // 38 — intra-slot offsets from here down
+    BLOCK_MASK_SAMP as u32,        // 39
+    BLOCK_VS_RANGES as u32,        // 40
+    BLOCK_PS_RANGES as u32,        // 41
+    BLOCK_RS_VALUES as u32,        // 42
+    BLOCK_SAMP_VALUES as u32,      // 43
+    BLOCK_CONST_POOL as u32,       // 44
 ];
 
 #[no_mangle]
 pub static LAYOUT_TABLE_STATIC: [u32; LAYOUT_LEN] = LAYOUT_TABLE;
 
-/// Pointer to the 32-entry u32 layout table (see LAYOUT_TABLE above for the order
+/// Pointer to the u32 layout table (see LAYOUT_TABLE above for the order
 /// contract). JS reads this once at boot to build its typed views — no offset is ever
 /// hardcoded on the JS side.
 #[no_mangle]
@@ -261,7 +269,9 @@ static mut LAST_DRAW_STATE_VALID: bool = false;
 static mut LAST_DRAW_STATE_PIPELINE_KEY: u32 = 0;
 static mut LAST_DRAW_STATE_VS_VERSION: u32 = 0;
 static mut LAST_DRAW_STATE_PS_VERSION: u32 = 0;
+static mut LAST_DRAW_STATE_BIND_GROUP_KEY: u32 = 0;
 static mut LAST_DRAW_STATE_OFFSET: u32 = 0;
+static mut LAST_DRAW_STATE_IDENTITY: [u32; PIPELINE_IDENTITY_WORDS] = [0; PIPELINE_IDENTITY_WORDS];
 
 #[inline(always)]
 unsafe fn arena_ptr() -> *mut u8 {
@@ -294,15 +304,61 @@ pub fn get_d3d9_arena_ptr() -> u32 {
     unsafe { arena_ptr() as u32 }
 }
 
+/// Runtime guard for the JS wrapper. The wrapper must reject older binaries before
+/// constructing typed views or calling the i64-returning draw exports.
+#[no_mangle]
+pub fn get_d3d9_arena_abi_version() -> u32 {
+    D3D9_ARENA_ABI_VERSION
+}
+
 /// Reset per-frame cursors (command count, bump arena). Called from JS's existing
 /// Present/EndScene handler, alongside RenderFrame::reset().
 #[no_mangle]
 pub unsafe fn d3d9_reset_frame() {
     wr_u32(OFF_COMMAND_COUNT, 0);
     wr_u32(OFF_BUMP_CURSOR, 0);
+    d3d9_clear_pipeline_identity();
     LAST_BOUND_STREAM = (0, 0, 0);
     LAST_BOUND_INDEX = (0, 0);
     LAST_DRAW_STATE_VALID = false;
+    LAST_DRAW_STATE_BIND_GROUP_KEY = 0;
+    LAST_DRAW_STATE_IDENTITY = [0; PIPELINE_IDENTITY_WORDS];
+}
+
+/// Roll back a speculative draw recording transaction.  JS records the compact arena row
+/// before resolving the full TS pipeline identity so a cache hit can avoid the legacy key
+/// construction.  If that resolution declines the draw, restore both cursors; stale rows or
+/// UP capture bytes must never become visible to the next draw in the same frame.
+#[no_mangle]
+pub unsafe fn d3d9_truncate_frame(command_count: u32, bump_cursor: u32) {
+    let current_command_count = rd_u32(OFF_COMMAND_COUNT);
+    let current_bump_cursor = rd_u32(OFF_BUMP_CURSOR);
+    // A truncate is a rollback, never a write-forward operation. Refuse a JS-side
+    // validation bug instead of exposing uninitialised command rows or bump bytes.
+    if command_count > current_command_count || bump_cursor > current_bump_cursor
+        || (command_count as usize) > CMD_CAP || (bump_cursor as usize) > BUMP_CAP {
+        return;
+    }
+    wr_u32(OFF_COMMAND_COUNT, command_count);
+    wr_u32(OFF_BUMP_CURSOR, bump_cursor);
+    // A rollback may remove the last binding rows; force the next prelude to re-emit them.
+    LAST_BOUND_STREAM = (0, 0, 0);
+    LAST_BOUND_INDEX = (0, 0);
+    LAST_DRAW_STATE_VALID = false;
+    LAST_DRAW_STATE_BIND_GROUP_KEY = 0;
+    LAST_DRAW_STATE_IDENTITY = [0; PIPELINE_IDENTITY_WORDS];
+}
+
+/// Clear the canonical programmable pipeline identity. JS normally writes a fresh identity
+/// through its zero-copy view before each arena draw; this export is useful for teardown and
+/// compatibility with hosts that do not yet provide the extended identity.
+#[no_mangle]
+pub unsafe fn d3d9_clear_pipeline_identity() {
+    std::ptr::write_bytes(
+        arena_ptr().add(OFF_PIPELINE_IDENTITY),
+        0,
+        PIPELINE_IDENTITY_WORDS * 4,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +431,10 @@ unsafe fn derive_blend_alpha_fields() -> (u32, u32, u32) {
     (blend_key, blend_alpha_key, alpha_key)
 }
 
-/// Numeric pipeline identity for the programmable path — same fields as
+/// Numeric pipeline identity for the programmable path — the canonical identity supplied by
+/// TypeScript is hashed first, followed by the legacy local fields. Keeping the legacy fields
+/// in the digest preserves compatibility for callers that leave the canonical words zeroed.
+/// Same fields as
 /// resolveProgrammablePipeline's `stateBits` (cull/zEnable/zWrite only), plus
 /// vs/ps/decl/stride/topology/blend/alpha/cubeMask. NOT a GPU pipeline object — a stable
 /// numeric key the JS executor looks up in its own `Map<number, GPURenderPipeline>`,
@@ -399,8 +458,14 @@ unsafe fn derive_pipeline_key(
     let (blend_key, blend_alpha_key, alpha_key) = derive_blend_alpha_fields();
 
     // FNV-1a style mix — a stable numeric identity is all that's required (the executor
-    // never derives a GPU object from this key directly, only looks it up).
+    // never derives a GPU object from this key directly, only looks it up). Include every
+    // canonical word before the legacy fields so additions to the TS cache identity do not
+    // require duplicating shader/attachment policy in Rust.
     let mut h: u32 = 0x811c9dc5;
+    for i in 0..PIPELINE_IDENTITY_WORDS {
+        h ^= rd_u32(OFF_PIPELINE_IDENTITY + i * 4);
+        h = h.wrapping_mul(0x01000193);
+    }
     for v in [
         vs_handle,
         ps_handle,
@@ -481,7 +546,8 @@ unsafe fn bump_alloc(len: usize) -> u32 {
 
 /// Slot header field count (see layout comment below) — used by the executor to find
 /// where the VS/PS constant bytes start within a captured slot.
-const DRAW_STATE_HEADER_LEN: usize = 2 + 2 + 4 + 4 + TEXTURE_ID_SLOTS * 4 + 4 * 4 + 4;
+const DRAW_STATE_HEADER_LEN: usize = 2 + 2 + 4 + 4 + TEXTURE_ID_SLOTS * 4 + 4 * 4 + 4
+    + PIPELINE_IDENTITY_WORDS * 4;
 
 /// Snapshot everything the executor needs to either (a) build a NEW GPURenderPipeline/
 /// bind group on a cache miss, or (b) upload this draw's VS/PS constants — captured at
@@ -489,15 +555,15 @@ const DRAW_STATE_HEADER_LEN: usize = 2 + 2 + 4 + 4 + TEXTURE_ID_SLOTS * 4 + 4 * 
 /// at end-of-frame drain (same capture-at-call discipline as UP vertex/index bytes;
 /// this is the pipeline-creation analogue of that problem: pipelineKey is only a HASH,
 /// the executor needs the raw ingredients back on a miss). Reuses the previous draw's
-/// slot when `pipeline_key`+constant versions are unchanged (single-entry memo, mirrors
-/// `_lrValid`) — reusing on `pipeline_key` match (not just vs/ps handle match) is
-/// required for correctness: pipeline_key already hashes every raw field below, so an
-/// unchanged key guarantees the previously-captured raw fields are still accurate.
+/// slot when `pipeline_key`+constant versions+bind-group key are unchanged (single-entry memo,
+/// mirrors `_lrValid`). Texture ids are not part of the 16 pipeline-identity words, so the
+/// explicit bind-group comparison prevents a SetTexture between otherwise-identical draws from
+/// reusing the previous slot's textureIds/bindGroupKey.
 ///
 /// Slot layout: u16 vsLen, u16 psLen, u32 cubeMask, u32 bindGroupKey, u32[8] texIds,
 /// u32[4] renderStateBits (packed: [0]=cull|zEnable<<8|zWrite<<9|topology<<16|
 /// forceCullNone<<24, [1]=blendKey, [2]=blendAlphaKey, [3]=alphaKey), u32 declHandle,
-/// then f32[vsLen] vsConstants, f32[psLen] psConstants.
+/// u32[16] canonical pipeline identity, then f32[vsLen] vsConstants, f32[psLen] psConstants.
 #[allow(clippy::too_many_arguments)]
 unsafe fn capture_draw_state(
     vs_handle: u32,
@@ -510,11 +576,22 @@ unsafe fn capture_draw_state(
 ) -> u32 {
     let vs_version = rd_u32(OFF_VS_CONST_VERSION);
     let ps_version = rd_u32(OFF_PS_CONST_VERSION);
+    let cmask = cube_mask();
+    let bind_group_key = derive_bind_group_key(cmask);
 
+    let mut identity_unchanged = true;
+    for i in 0..PIPELINE_IDENTITY_WORDS {
+        if rd_u32(OFF_PIPELINE_IDENTITY + i * 4) != LAST_DRAW_STATE_IDENTITY[i] {
+            identity_unchanged = false;
+            break;
+        }
+    }
     if LAST_DRAW_STATE_VALID
         && LAST_DRAW_STATE_PIPELINE_KEY == pipeline_key
         && LAST_DRAW_STATE_VS_VERSION == vs_version
         && LAST_DRAW_STATE_PS_VERSION == ps_version
+        && LAST_DRAW_STATE_BIND_GROUP_KEY == bind_group_key
+        && identity_unchanged
     {
         return LAST_DRAW_STATE_OFFSET;
     }
@@ -529,9 +606,6 @@ unsafe fn capture_draw_state(
     if offset == u32::MAX {
         return offset;
     }
-
-    let cmask = cube_mask();
-    let bind_group_key = derive_bind_group_key(cmask);
 
     let cull = (rs(D3DRS_CULLMODE) & 0xff) as u32;
     let z_enable = (rs(D3DRS_ZENABLE) != 0) as u32;
@@ -555,6 +629,9 @@ unsafe fn capture_draw_state(
     *(slot.add(rs_off + 8) as *mut u32) = blend_alpha_key;
     *(slot.add(rs_off + 12) as *mut u32) = alpha_key;
     *(slot.add(rs_off + 16) as *mut u32) = decl_handle;
+    for i in 0..PIPELINE_IDENTITY_WORDS {
+        *(slot.add(64 + i * 4) as *mut u32) = rd_u32(OFF_PIPELINE_IDENTITY + i * 4);
+    }
     let _ = stride; // stride already folded into pipeline_key; kept as a param for clarity/future use
 
     let vs_src = arena_ptr().add(OFF_VS_CONSTANTS);
@@ -566,7 +643,11 @@ unsafe fn capture_draw_state(
     LAST_DRAW_STATE_PIPELINE_KEY = pipeline_key;
     LAST_DRAW_STATE_VS_VERSION = vs_version;
     LAST_DRAW_STATE_PS_VERSION = ps_version;
+    LAST_DRAW_STATE_BIND_GROUP_KEY = bind_group_key;
     LAST_DRAW_STATE_OFFSET = offset;
+    for i in 0..PIPELINE_IDENTITY_WORDS {
+        LAST_DRAW_STATE_IDENTITY[i] = rd_u32(OFF_PIPELINE_IDENTITY + i * 4);
+    }
     offset
 }
 
@@ -659,13 +740,15 @@ pub unsafe fn d3d9_record_draw(
     start_vertex: u32,
     stride: u32,
     force_cull_none: u32,
-) -> i32 {
+) -> i64 {
     match emit_draw_prelude(topology, stride, force_cull_none) {
         Some((pipeline_key, _bind_group_key)) => {
             if !push_command(CMD_DRAW, vertex_count, start_vertex, 0, pipeline_key, 0) {
                 return -1;
             }
-            pipeline_key as i32
+            // Return a signed 64-bit status so every u32 pipeline hash, including
+            // 0xffffffff, remains distinguishable from the -1 decline sentinel in JS.
+            pipeline_key as i64
         }
         None => -1,
     }
@@ -680,13 +763,13 @@ pub unsafe fn d3d9_record_draw_indexed(
     base_vertex: u32,
     stride: u32,
     force_cull_none: u32,
-) -> i32 {
+) -> i64 {
     match emit_draw_prelude(topology, stride, force_cull_none) {
         Some((pipeline_key, _bind_group_key)) => {
             if !push_command(CMD_DRAW_INDEXED, index_count, start_index, base_vertex, pipeline_key, 0) {
                 return -1;
             }
-            pipeline_key as i32
+            pipeline_key as i64
         }
         None => -1,
     }
@@ -705,7 +788,7 @@ pub unsafe fn d3d9_record_draw_up(
     stride: u32,
     byte_len: u32,
     force_cull_none: u32,
-) -> i32 {
+) -> i64 {
     let capture_offset = bump_alloc(byte_len as usize);
     if capture_offset == u32::MAX {
         return -1;
@@ -721,7 +804,7 @@ pub unsafe fn d3d9_record_draw_up(
             if !push_command(CMD_DRAW_UP, vertex_count, capture_offset, byte_len, pipeline_key, 0) {
                 return -1;
             }
-            pipeline_key as i32
+            pipeline_key as i64
         }
         None => -1,
     }
@@ -740,7 +823,7 @@ pub unsafe fn d3d9_record_draw_indexed_up(
     stride: u32,
     vertex_byte_len: u32,
     force_cull_none: u32,
-) -> i32 {
+) -> i64 {
     let vertex_capture_offset = bump_alloc(vertex_byte_len as usize);
     if vertex_capture_offset == u32::MAX {
         return -1;
@@ -772,7 +855,7 @@ pub unsafe fn d3d9_record_draw_indexed_up(
             ) {
                 return -1;
             }
-            pipeline_key as i32
+            pipeline_key as i64
         }
         None => -1,
     }

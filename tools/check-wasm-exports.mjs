@@ -10,6 +10,7 @@ const REQUIRED = [
     // crates/d3d9-webgpu (arena.rs)
     'get_d3d9_arena_ptr',
     'get_d3d9_arena_layout_ptr',
+    'get_d3d9_arena_abi_version',
     'd3d9_reset_frame',
     'd3d9_record_draw',
     'd3d9_record_draw_indexed',
