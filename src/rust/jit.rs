@@ -647,6 +647,18 @@ static mut JIT_BRANCH_HINTS: u32 = 0;
 // produce identical results — that is the property being asserted.
 static mut JIT_BRANCH_HINT_OFFSET_FUZZ: u32 = 0;
 
+// Guest attribution for the host profiler (idx 28). Emit a wasm `name` section naming each
+// generated module's function body with the guest address it was compiled from, so Chrome's
+// sampler shows `g005ca1b0@t842` instead of `wasm-function[21]` — a module-local index that
+// cannot be joined to v86's global wasm TABLE index (measured: 0 of 6660 samples resolved).
+// Without it there is NO time-proportional guest attribution at all: the embedded EIP sampler
+// fires at yield points and ranks where the guest PARKS, not where it spends time.
+//
+// ON by default: the cost is a FIXED 26 bytes per module — 0.021 % of a 125 KB module,
+// measured end-to-end (tools/probes/jit-function-names.mjs) — and attribution is only free to
+// future investigations if a trace captured without foreknowledge already has it.
+static mut JIT_FUNCTION_NAMES: bool = true;
+
 // Tier-2R region recompiler: grow page groups across
 // indirect edges using trace_profiler target histograms, and make hot indirect
 // targets dispatcher entries so AbsoluteEip re-dispatches stay intra-module.
@@ -4433,6 +4445,31 @@ fn jit_generate_module(
         .free_local(ctx.instruction_counter.unsafe_clone());
     ctx.builder.free_flag_locals();
 
+    if unsafe { JIT_FUNCTION_NAMES } {
+        // `g<entry addr, 8 hex>@t<wasm table index>`. The ADDRESS is authoritative (table
+        // slots are recycled — 28 were observed under more than one code offset); the table
+        // index is the cross-check that joins a frame to a `bottleship.hotblocks` row.
+        // Entry blocks are sorted, so the name is stable for a given module shape.
+        let primary = entry_blocks.iter().copied().min().unwrap_or(0);
+        let name = &mut ctx.builder.function_name;
+        name.clear();
+        name.push(b'g');
+        for i in (0..8).rev() {
+            name.push(b"0123456789abcdef"[((primary >> (i * 4)) & 0xF) as usize]);
+        }
+        name.extend(b"@t");
+        let mut n = wasm_table_index.to_u16();
+        let start = name.len();
+        loop {
+            name.push(b'0' + (n % 10) as u8);
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        name[start..].reverse();
+    }
+
     ctx.builder.finish();
 
     let entries = Vec::from_iter(entry_blocks.iter().map(|addr| {
@@ -5113,7 +5150,7 @@ pub fn enter_basic_block(phys_eip: u32) {
 }
 
 pub const JIT_CONFIG_ABI_VERSION: u32 = 1;
-const JIT_CONFIG_SUPPORTED_MASK: u32 = 0x0FFB_FDEF;
+const JIT_CONFIG_SUPPORTED_MASK: u32 = 0x1FFB_FDEF;
 const JIT_CONFIG_UNSUPPORTED: u32 = u32::MAX;
 
 #[inline]
@@ -5128,9 +5165,12 @@ pub fn jit_config_abi_version() -> u32 { JIT_CONFIG_ABI_VERSION }
 pub fn jit_config_supported_mask() -> u32 { JIT_CONFIG_SUPPORTED_MASK }
 
 // FNV-1a over the exact inputs that affect emitted JIT wasm. Field order is ABI-stable:
-// configuration indices 1-3, 5-8, 10-14, 16-17, 19, and 21-23; relaxed-FPU mode and its
+// configuration indices 1-3, 5-8, 10-14, 16-17, 19, 21-23, and 28; relaxed-FPU mode and its
 // hit/fallback counters; DISPATCH_STATS; and the fixed fastmem layout constants.
 // Policy/accounting/diagnostic indices 0, 15, 20, and 24 deliberately do not participate.
+// Index 28 (function names) emits no code, but it DOES change module bytes, and the AOT
+// cache replays stored bytes: without it here, a cache captured names-off would silently
+// serve unnamed modules to a profiling run that asked for names.
 fn jit_codegen_fingerprint() -> u64 {
     let mut hash = 0xCBF2_9CE4_8422_2325u64;
     let mut add = |value: u32| {
@@ -5156,6 +5196,7 @@ fn jit_codegen_fingerprint() -> u64 {
         add(JIT_FLAG_LOCALS as u32);
         add(JIT_BRANCH_HINTS);
         add(JIT_BRANCH_HINT_OFFSET_FUZZ);
+        add(JIT_FUNCTION_NAMES as u32);
         add(DISPATCH_STATS as u32);
     }
     add(crate::softfloat::get_relaxed_fpu());
@@ -5217,6 +5258,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) -> u32 {
             let stride = value.clamp(1, 1024);
             CHAIN_NOTE_MASK = (1u32 << (31 - stride.leading_zeros())) - 1;
         },
+        28 => JIT_FUNCTION_NAMES = value != 0,
         _ => unreachable!(),
     }
     0
@@ -5253,6 +5295,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         25 => (RET_CACHE_MASK + 1).trailing_zeros(),
         26 => RET_CACHE_HASH_MIX as u32,
         27 => CHAIN_NOTE_MASK + 1,
+        28 => JIT_FUNCTION_NAMES as u32,
         _ => unreachable!(),
     }
 }

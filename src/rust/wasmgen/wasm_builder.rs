@@ -74,6 +74,8 @@ pub const WASM_MODULE_ARGUMENT_COUNT: u8 = 1;
 // value of their condition. Consumed by V8's optimizing tier only (Liftoff ignores it);
 // a malformed section can never invalidate the module — the decoder drops the hints.
 pub const BRANCH_HINT_SECTION_NAME: &str = "metadata.code.branch_hint";
+/// The standard wasm `name` custom section (BinaryFormatAnnotations.md).
+pub const NAME_SECTION_NAME: &str = "name";
 /// Condition is expected to be false (the hinted branch is NOT taken).
 pub const HINT_UNLIKELY: u8 = 0;
 /// Condition is expected to be true (the hinted branch IS taken).
@@ -131,6 +133,11 @@ pub struct WasmBuilder {
     // Robustness self-test (jit config idx 23): shift every emitted offset by N so the
     // hints deliberately miss their instruction. The module must still compile and run.
     pub branch_hint_offset_fuzz: u32,
+
+    /// Name for this module's single function body, emitted as a wasm `name` section.
+    /// Empty = no section (the default; the JIT fills it only when its naming knob is on).
+    /// Owned buffer reused across modules so naming costs no allocation per compile.
+    pub function_name: Vec<u8>,
 }
 
 // Helpers proven not to touch the lazy-flag globals. Everything else
@@ -196,6 +203,7 @@ impl WasmBuilder {
             branch_hints: Vec::new(),
             branch_hint_mask: 0,
             branch_hint_offset_fuzz: 0,
+            function_name: Vec::new(),
         };
         b.init();
         b
@@ -229,6 +237,7 @@ impl WasmBuilder {
         self.local_count = 0;
         self.flag_locals = None;
         self.branch_hints.clear();
+        self.function_name.clear();
 
         dbg_assert!(self.label_to_depth.is_empty());
         dbg_assert!(self.label_stack.is_empty());
@@ -319,7 +328,54 @@ impl WasmBuilder {
         let code_section_size = (self.output.len() - idx_code_section_size - 4) as u32;
         write_fixed_leb32_at_idx(&mut self.output, idx_code_section_size, code_section_size);
 
+        // Convention (and what V8 expects to find): the name section comes last.
+        self.write_name_section();
+
         self.output.len()
+    }
+
+    /// Emit the wasm `name` custom section naming this module's single function body.
+    ///
+    /// Chrome's CPU sampler renders a wasm frame as `wasm-function[N] @ wasm://wasm/<hash>`,
+    /// where N is the index WITHIN the module — a different namespace from v86's global wasm
+    /// TABLE index, which is what `bottleship.hotblocks` reports. The two cannot be joined
+    /// (measured: 0 of 6660 samples resolved, and 28 table slots were observed under more
+    /// than one code offset, so slots are recycled and a numeric coincidence would mean
+    /// nothing). A name section closes the gap at the source: Chrome reads it and the frame
+    /// self-attributes, which is the only time-proportional guest attribution available —
+    /// the embedded EIP sampler fires at yield points and ranks where the guest PARKS.
+    ///
+    /// Granularity is the MODULE, not the basic block: a JIT module contains exactly one
+    /// function body (a br_table over its blocks), and the name section can only name
+    /// functions. The name carries the module's primary entry address, which is
+    /// authoritative, plus its table index as a cross-check.
+    fn write_name_section(&mut self) {
+        if self.function_name.is_empty() {
+            return;
+        }
+
+        // Name subsection 1 = function names: count, then (funcidx, name) pairs. The single
+        // defined function follows the imports, so its index is function_import_count.
+        let mut names: Vec<u8> = Vec::with_capacity(8 + self.function_name.len());
+        write_leb_u32(&mut names, 1); // one named function
+        write_leb_u32(&mut names, self.function_import_count as u32);
+        write_leb_u32(&mut names, self.function_name.len() as u32);
+        names.extend(&self.function_name);
+
+        let mut payload: Vec<u8> = Vec::with_capacity(6 + names.len());
+        payload.push(1); // subsection id: function names
+        write_leb_u32(&mut payload, names.len() as u32);
+        payload.extend(&names);
+
+        let mut section: Vec<u8> =
+            Vec::with_capacity(1 + NAME_SECTION_NAME.len() + payload.len());
+        write_leb_u32(&mut section, NAME_SECTION_NAME.len() as u32);
+        section.extend(NAME_SECTION_NAME.as_bytes());
+        section.extend(&payload);
+
+        self.output.push(0); // custom section id
+        write_leb_u32(&mut self.output, section.len() as u32);
+        self.output.extend(&section);
     }
 
     /// Emit the "metadata.code.branch_hint" custom section for the single function body.
