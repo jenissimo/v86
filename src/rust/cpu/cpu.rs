@@ -2389,6 +2389,8 @@ pub unsafe fn do_page_walk(
 #[no_mangle]
 pub unsafe fn full_clear_tlb() {
     profiler::stat_increment(stat::FULL_CLEAR_TLB);
+    // The EAGL read cursor is a one-entry TLB over the same translations.
+    crate::cpu::hypercall_eagl::eagl_read_cursor_invalidate();
     // TLB flush only; read-map maintenance belongs to mapping/protect sites.
     // clear tlb including global pages
     *last_virt_eip = -1;
@@ -2410,6 +2412,8 @@ pub unsafe fn full_clear_tlb() {
 #[no_mangle]
 pub unsafe fn clear_tlb() {
     profiler::stat_increment(stat::CLEAR_TLB);
+    // Global entries survive here, the EAGL cursor does not distinguish them — drop it.
+    crate::cpu::hypercall_eagl::eagl_read_cursor_invalidate();
     // Software TLB eviction only; it does not change the read-map.
     // clear tlb excluding global pages
     *last_virt_eip = -1;
@@ -2510,6 +2514,7 @@ pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: boo
     *cr.offset(2) = addr;
     // invalidate tlb entry
     let page = ((addr as u32) >> 12) as i32;
+    crate::cpu::hypercall_eagl::eagl_read_cursor_invalidate();
     clear_tlb_code(page);
     tlb_data[page as usize] = 0;
     let error_code = (user as i32) << 2 | (write as i32) << 1 | present as i32;
@@ -3155,9 +3160,21 @@ pub unsafe fn modrm_resolve(modrm_byte: i32) -> OrPageFault<i32> {
     }
 }
 
-pub unsafe fn run_instruction(opcode: i32) { gen::interpreter::run(opcode as u32) }
-pub unsafe fn run_instruction0f_16(opcode: i32) { gen::interpreter0f::run(opcode as u32) }
-pub unsafe fn run_instruction0f_32(opcode: i32) { gen::interpreter0f::run(opcode as u32 | 0x100) }
+pub unsafe fn run_instruction(opcode: i32) {
+    let prev = ga_enter(GA_INTERP);
+    gen::interpreter::run(opcode as u32);
+    ga_leave(prev);
+}
+pub unsafe fn run_instruction0f_16(opcode: i32) {
+    let prev = ga_enter(GA_INTERP);
+    gen::interpreter0f::run(opcode as u32);
+    ga_leave(prev);
+}
+pub unsafe fn run_instruction0f_32(opcode: i32) {
+    let prev = ga_enter(GA_INTERP);
+    gen::interpreter0f::run(opcode as u32 | 0x100);
+    ga_leave(prev);
+}
 
 pub unsafe fn cycle_internal() {
     profiler::stat_increment(stat::CYCLE_INTERNAL);
@@ -3727,11 +3744,79 @@ pub unsafe fn virt_boundary_write32(low: u32, high: u32, value: i32) {
     memory::write8(high as u32, value >> 24);
 }
 
+// ── Attribution of HOST-side guest memory accesses ──────────────────────────────────
+// A JIT block's own read/write never enters safe_read*/safe_write*: the fast path is
+// inlined (codegen gen_safe_read) and its miss calls safe_read*_slow_jit, a different
+// function. So every sample in these is HOST code touching guest memory, and the profile
+// alone cannot say whose — the residual UNATTRIBUTED class is exactly "an instruction
+// helper called by a JIT block", which is what we need named before optimising it.
+// Off by default: one predictable branch, and a census that must be armed cannot report
+// a number for a window nobody armed.
+pub const GA_OTHER: usize = 0;
+pub const GA_INTERP: usize = 1;
+pub const GA_HYPERCALL: usize = 2;
+pub const GA_EAGL: usize = 3;
+pub const GA_CLASSES: usize = 4;
+pub static mut GUEST_ACCESS_TRACKING: bool = false;
+pub static mut GUEST_ACCESS_CLASS: usize = GA_OTHER;
+pub static mut GUEST_ACCESS_READS: [u32; GA_CLASSES] = [0; GA_CLASSES];
+pub static mut GUEST_ACCESS_WRITES: [u32; GA_CLASSES] = [0; GA_CLASSES];
+
+#[inline(always)]
+unsafe fn ga_note_read() {
+    if GUEST_ACCESS_TRACKING {
+        GUEST_ACCESS_READS[GUEST_ACCESS_CLASS] = GUEST_ACCESS_READS[GUEST_ACCESS_CLASS].wrapping_add(1);
+    }
+}
+
+#[inline(always)]
+unsafe fn ga_note_write() {
+    if GUEST_ACCESS_TRACKING {
+        GUEST_ACCESS_WRITES[GUEST_ACCESS_CLASS] = GUEST_ACCESS_WRITES[GUEST_ACCESS_CLASS].wrapping_add(1);
+    }
+}
+
+/// Set the class for a run of accesses; returns the previous one for the caller to restore.
+/// Save/restore rather than assign: a hypercall can run while the interpreter class is set.
+#[inline(always)]
+pub unsafe fn ga_enter(class: usize) -> usize {
+    let prev = GUEST_ACCESS_CLASS;
+    GUEST_ACCESS_CLASS = class;
+    prev
+}
+
+#[inline(always)]
+pub unsafe fn ga_leave(prev: usize) { GUEST_ACCESS_CLASS = prev; }
+
+#[no_mangle]
+pub unsafe fn guest_access_set_tracking(on: u32) { GUEST_ACCESS_TRACKING = on != 0; }
+
+#[no_mangle]
+pub unsafe fn guest_access_get_tracking() -> u32 { GUEST_ACCESS_TRACKING as u32 }
+
+#[no_mangle]
+pub unsafe fn guest_access_reads(class: u32) -> u32 {
+    if (class as usize) < GA_CLASSES { GUEST_ACCESS_READS[class as usize] } else { 0 }
+}
+
+#[no_mangle]
+pub unsafe fn guest_access_writes(class: u32) -> u32 {
+    if (class as usize) < GA_CLASSES { GUEST_ACCESS_WRITES[class as usize] } else { 0 }
+}
+
+#[no_mangle]
+pub unsafe fn guest_access_reset() {
+    GUEST_ACCESS_READS = [0; GA_CLASSES];
+    GUEST_ACCESS_WRITES = [0; GA_CLASSES];
+}
+
 pub unsafe fn safe_read8(addr: i32) -> OrPageFault<i32> {
+    ga_note_read();
     Ok(memory::read8(translate_address_read(addr)?))
 }
 
 pub unsafe fn safe_read16(addr: i32) -> OrPageFault<i32> {
+    ga_note_read();
     if addr & 0xFFF == 0xFFF {
         Ok(safe_read8(addr)? | safe_read8(addr + 1)? << 8)
     }
@@ -3741,6 +3826,7 @@ pub unsafe fn safe_read16(addr: i32) -> OrPageFault<i32> {
 }
 
 pub unsafe fn safe_read32s(addr: i32) -> OrPageFault<i32> {
+    ga_note_read();
     if addr & 0xFFF >= 0xFFD {
         Ok(safe_read16(addr)? | safe_read16(addr + 2)? << 16)
     }
@@ -4143,6 +4229,7 @@ pub unsafe fn safe_write128_slow_jit(
 }
 
 pub unsafe fn safe_write8(addr: i32, value: i32) -> OrPageFault<()> {
+    ga_note_write();
     let (phys_addr, can_skip_dirty_page) = translate_address_write_and_can_skip_dirty(addr)?;
     if memory::in_mapped_range(phys_addr) {
         memory::mmap_write8(phys_addr, value);
@@ -4160,6 +4247,7 @@ pub unsafe fn safe_write8(addr: i32, value: i32) -> OrPageFault<()> {
 }
 
 pub unsafe fn safe_write16(addr: i32, value: i32) -> OrPageFault<()> {
+    ga_note_write();
     let (phys_addr, can_skip_dirty_page) = translate_address_write_and_can_skip_dirty(addr)?;
     dbg_assert!(value >= 0 && value < 0x10000);
     if addr & 0xFFF == 0xFFF {
@@ -4181,6 +4269,7 @@ pub unsafe fn safe_write16(addr: i32, value: i32) -> OrPageFault<()> {
 }
 
 pub unsafe fn safe_write32(addr: i32, value: i32) -> OrPageFault<()> {
+    ga_note_write();
     let (phys_addr, can_skip_dirty_page) = translate_address_write_and_can_skip_dirty(addr)?;
     if addr & 0xFFF > 0x1000 - 4 {
         virt_boundary_write32(
@@ -4699,6 +4788,8 @@ pub fn clear_tlb_code(page: i32) {
 
 pub unsafe fn invlpg(addr: i32) {
     let page = (addr as u32 >> 12) as i32;
+    // Page-granular for the TLB; the one-entry EAGL cursor is dropped wholesale.
+    crate::cpu::hypercall_eagl::eagl_read_cursor_invalidate();
     // A guest may have rewritten this PTE before INVLPG. Clear only this map byte;
     // all subsequent reads use the authoritative TLB/page walk until TS re-arms it.
     // Note: Doesn't remove this page from valid_tlb_entries: This isn't

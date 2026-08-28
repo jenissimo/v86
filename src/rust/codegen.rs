@@ -819,7 +819,9 @@ fn gen_safe_read(
     ctx.builder.free_local(entry_local);
 }
 
-// Split-range shape of the fastmem read fast path (set_jit_config idx 18, default on).
+// Split-range shape of the fastmem read fast path. DEAD: reads go through the inlined TLB
+// probe in gen_safe_read. Idx 18 is NOT in JIT_CONFIG_SUPPORTED_MASK, so set_jit_config(18)
+// answers UNSUPPORTED — this is not a knob anything can turn.
 // Same acceptance set as the legacy shape — [LOW_MEM_END, min(GUARD_BASE, ram) - bytes]
 // ∪ [GUARD_END, ram - bytes] — decomposed into two early-exit range tests so the hot
 // case (below-guard HEAP/image data) costs one sub+cmp+br_if and a direct load:

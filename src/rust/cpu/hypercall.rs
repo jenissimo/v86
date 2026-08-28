@@ -305,6 +305,9 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         return false;
     }
 
+    // Guest accesses made by a handler are attributed to the hypercall, not left in the
+    // UNATTRIBUTED bucket that names JIT-called instruction helpers.
+    let ga_prev = crate::cpu::cpu::ga_enter(crate::cpu::cpu::GA_HYPERCALL);
     let handled = match handler_id {
         1 => handle_get_tick_count(),
         2 => handle_get_tick_count(), // GetTickCount64 → same 32-bit value
@@ -399,9 +402,15 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         //    dispatch byte alone. Engine-specific handlers do NOT live in this
         //    file — the whole band delegates to the engine module(s); a second
         //    engine graduates this into a dedicated band router. ──
-        128..=255 => super::hypercall_eagl::dispatch_inner_loop(handler_id),
+        128..=255 => {
+            let prev = crate::cpu::cpu::ga_enter(crate::cpu::cpu::GA_EAGL);
+            let r = super::hypercall_eagl::dispatch_inner_loop(handler_id);
+            crate::cpu::cpu::ga_leave(prev);
+            r
+        },
         _ => false,
     };
+    crate::cpu::cpu::ga_leave(ga_prev);
 
     // Per-handler accounting. handler_id is a u8 and the tables are 256 slots, so the
     // index is in range by construction — no bound to silently truncate against.

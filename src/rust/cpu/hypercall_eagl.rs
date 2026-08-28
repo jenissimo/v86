@@ -23,6 +23,12 @@ use crate::cpu::hypercall::{hc_safe_read8, hp_ptr, OFF_HC_EAGL_TOKEN_CFG_PTR};
 /// promote this into its own band-router module and keep one file per engine.
 /// False = guard miss → the JS tier (shadow-validated kernels) completes.
 pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
+    // Per-dispatch policy: a cached translation never outlives the hypercall that
+    // observed it. Under the TLB-driven policy the entry is dropped where v86 drops
+    // its own TLB instead (see EAGL_READ_CURSOR_POLICY_TLB).
+    if !EAGL_READ_CURSOR_POLICY_TLB {
+        eagl_read_cursor_reset();
+    }
     match handler_id {
         // 128 = shader-constant converter (FUN_005cbd17): kilo-calls/frame;
         // the JS tier's per-call OUT round-trip was a net regression there.
@@ -73,14 +79,14 @@ fn ftol_low32(x: f64) -> u32 {
 ///   unknown mode → EAX=0x8876086C (D3DERR_INVALIDCALL), no writes
 unsafe fn handle_eagl_shader_const_convert() -> bool {
     let esp = read_reg32(ESP);
-    let desc = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
-    let dst = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
-    let src = match safe_read32s(esp + 12) { Ok(v) => v, Err(_) => return false };
-    let count = match safe_read32s(esp + 16) { Ok(v) => v as u32, Err(_) => return false };
+    let desc = match eagl_read32(esp + 4) { Ok(v) => v, Err(_) => return false };
+    let dst = match eagl_read32(esp + 8) { Ok(v) => v, Err(_) => return false };
+    let src = match eagl_read32(esp + 12) { Ok(v) => v, Err(_) => return false };
+    let count = match eagl_read32(esp + 16) { Ok(v) => v as u32, Err(_) => return false };
 
-    let mode = match safe_read32s(desc) { Ok(v) => v as u32, Err(_) => return false };
-    let rows = match safe_read32s(desc + 0x14) { Ok(v) => v as u32, Err(_) => return false };
-    let cols = match safe_read32s(desc + 0x18) { Ok(v) => v as u32, Err(_) => return false };
+    let mode = match eagl_read32(desc) { Ok(v) => v as u32, Err(_) => return false };
+    let rows = match eagl_read32(desc + 0x14) { Ok(v) => v as u32, Err(_) => return false };
+    let cols = match eagl_read32(desc + 0x18) { Ok(v) => v as u32, Err(_) => return false };
 
     if mode < 1 || mode > 3 {
         write_reg32(EAX, 0x8876086Cu32 as i32);
@@ -103,7 +109,7 @@ unsafe fn handle_eagl_shader_const_convert() -> bool {
             let s = src_item + rr * 0x10;
             let d = dst_item + rr * dst_row_stride;
             for cc in 0..c as i32 {
-                let sv = match safe_read32s(s + cc * 4) { Ok(v) => v, Err(_) => return false };
+                let sv = match eagl_read32(s + cc * 4) { Ok(v) => v, Err(_) => return false };
                 let out = match mode {
                     3 => sv,
                     2 => ftol_low32(f32::from_bits(sv as u32) as f64) as i32,
@@ -115,6 +121,225 @@ unsafe fn handle_eagl_shader_const_convert() -> bool {
     }
     write_reg32(EAX, 0);
     true
+}
+
+/// One-entry TLB for guest READS made by the EAGL hypercalls.
+///
+/// `safe_read32s` pays a full `translate_address_read` per dword. Measured in-race on NFSU
+/// (harness `guestAccessCensus`): this one hypercall makes 97.7 % of ALL host-side guest
+/// reads — ~1.08 M per frame — and consecutive reads almost always land on the page the
+/// previous one just translated. Module state rather than a threaded parameter so every
+/// read site benefits without plumbing.
+///
+/// READS ONLY. A write keeps going through `translate_address_write`, which owns the
+/// dirty / TLB_HAS_CODE bookkeeping that guest-code invalidation depends on — the same
+/// reason fastmem writes are refused in the JIT.
+///
+/// LIFETIME. Two policies, selectable at runtime so both can be compared on ONE build:
+///  - per-dispatch (default, `EAGL_READ_CURSOR_POLICY_TLB == false`): the entry is dropped
+///    at every `dispatch_inner_loop` entry, so it cannot outlive the hypercall that observed
+///    it. Trivially safe, and expensive: EAGL dispatches ~1.15 M times/s, so the first read
+///    of nearly every dispatch re-translates the page the previous dispatch just translated.
+///  - TLB-driven (`policy = 1`): the entry lives until a mapping can change. This is a TLB,
+///    so it is dropped exactly where v86 drops its own TLB entries —
+///    `full_clear_tlb`, `clear_tlb`, `invlpg`, `trigger_pagefault` (see
+///    `eagl_read_cursor_invalidate` call sites in cpu.rs). Those four are the ONLY places
+///    that clear a `tlb_data` entry; `tlb_set_has_code*` only flips TLB_HAS_CODE and keeps
+///    the translation. CR0/CR3/CR4 writes, task switches, state restore and BottleShip's
+///    own PageTableManager (MEM_DECOMMIT/recommit) all reach us through those functions.
+///    The cursor's lifetime is therefore a subset of the lifetime of v86's own TLB entry
+///    for the same page, which is the invariant that makes it safe.
+///
+/// The tag folds CPL into the free low 12 bits of the page: a read translation depends on
+/// `*cpl == 3` (TLB_NO_USER), and under the TLB-driven policy a cached entry can outlive a
+/// privilege change. Comparing the folded tag is one load and an OR — cheaper and more
+/// airtight than trying to enumerate every site that writes `cpl`.
+/// An EMPTY tag rather than a validity flag: a real tag is `(addr & !0xFFF) | (cpl & 3)`, so
+/// bits 2..=11 are always zero and `u32::MAX` can never be one. An invalidated or disabled
+/// cursor therefore has no tag that can match, and neither the kill switch nor a validity
+/// flag needs a load in the hot path.
+const RC_TAG_EMPTY: u32 = u32::MAX;
+static mut RC_TAG: u32 = RC_TAG_EMPTY;
+static mut RC_HOST_PAGE: u32 = 0;
+
+/// Kill switch: off => every read falls back to `safe_read32s`, so an A/B compares the two
+/// paths on ONE build and a regression is one call away from being ruled out.
+static mut EAGL_READ_CURSOR: bool = true;
+/// Cursor lifetime policy. Defaults to the SAFE per-dispatch reset; the measurement pass
+/// opts into the TLB-driven one so a regression is one call away from being ruled out.
+static mut EAGL_READ_CURSOR_POLICY_TLB: bool = false;
+/// How often the TLB sites dropped the entry. Distinguishes "the policy is on and the entry
+/// survives across dispatches" from "something invalidates it constantly anyway" — without
+/// it a null result from the A/B has two explanations.
+static mut EAGL_READ_CURSOR_INVALIDATIONS: u32 = 0;
+/// Differential oracle: run BOTH paths and count disagreements. A memory-path change taken
+/// on reasoning alone is exactly the class this project keeps paying for.
+static mut EAGL_READ_CURSOR_VERIFY: bool = false;
+static mut EAGL_READ_CURSOR_CHECKED: u32 = 0;
+static mut EAGL_READ_CURSOR_MISMATCH: u32 = 0;
+
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_set(on: u32) {
+    EAGL_READ_CURSOR = on != 0;
+    eagl_read_cursor_drop();
+}
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_get() -> u32 { EAGL_READ_CURSOR as u32 }
+/// 0 = per-dispatch reset (default, safe), 1 = TLB-driven invalidation.
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_set_policy(tlb_driven: u32) {
+    EAGL_READ_CURSOR_POLICY_TLB = tlb_driven != 0;
+    eagl_read_cursor_drop();
+}
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_get_policy() -> u32 { EAGL_READ_CURSOR_POLICY_TLB as u32 }
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_invalidations() -> u32 { EAGL_READ_CURSOR_INVALIDATIONS }
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_set_verify(on: u32) { EAGL_READ_CURSOR_VERIFY = on != 0; }
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_checked() -> u32 { EAGL_READ_CURSOR_CHECKED }
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_mismatch() -> u32 { EAGL_READ_CURSOR_MISMATCH }
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_reset_stats() {
+    EAGL_READ_CURSOR_CHECKED = 0;
+    EAGL_READ_CURSOR_MISMATCH = 0;
+    EAGL_READ_CURSOR_INVALIDATIONS = 0;
+}
+
+#[inline]
+unsafe fn eagl_read_cursor_drop() {
+    RC_TAG = RC_TAG_EMPTY;
+    RC_HOST_PAGE = 0;
+}
+
+/// Drop the cached translation. Called at every dispatch entry under the per-dispatch policy.
+#[inline]
+unsafe fn eagl_read_cursor_reset() { eagl_read_cursor_drop(); }
+
+/// Drop the cached translation from a v86 TLB-invalidation site (cpu.rs). Unconditional:
+/// under the per-dispatch policy it is redundant, never wrong, and two stores on paths that
+/// already walk the whole TLB is not measurable.
+#[inline]
+pub unsafe fn eagl_read_cursor_invalidate() {
+    if RC_TAG != RC_TAG_EMPTY {
+        EAGL_READ_CURSOR_INVALIDATIONS = EAGL_READ_CURSOR_INVALIDATIONS.wrapping_add(1);
+    }
+    eagl_read_cursor_drop();
+}
+
+/// Cursor tag for `addr`: page number in the high 20 bits, CPL folded into the low bits the
+/// page number leaves free. The `& 3` is what makes RC_TAG_EMPTY unreachable.
+#[inline(always)]
+unsafe fn rc_tag(a: u32) -> u32 {
+    (a & !0xFFF) | (*crate::cpu::global_pointers::cpl as u32 & 3)
+}
+
+/// Drop-in for `safe_read32s` — same signature, same answer, one translation per page.
+///
+/// Split hot/cold on purpose. At 99 call sites the whole body would either not inline (it
+/// measured 1.06 % of the frame as its OWN self-time, i.e. a real call per read) or inline
+/// 99 copies of the translate + oracle path. The hot half is a page-tag compare and a load;
+/// everything else — first touch of a page, the straddling dword, the kill switch, the
+/// differential oracle — lives in the outlined half.
+#[inline(always)]
+unsafe fn eagl_read32(addr: i32) -> Result<i32, ()> {
+    let a = addr as u32;
+    if a & 0xFFF <= 0xFFC {
+        if let Some(host) = rc_lookup(rc_tag(a)) {
+            return Ok(eagl_cursor_load(addr, host));
+        }
+    }
+    eagl_read32_cold(addr)
+}
+
+/// The single funnel EVERY cursor hit goes through, the cold fill included, so the oracle
+/// covers the code that ships. Verifying only the cold half would leave the branch that
+/// answers almost every read unchecked: an oracle that passes without having looked at the
+/// code under test.
+#[inline(always)]
+unsafe fn eagl_cursor_load(addr: i32, host: u32) -> i32 {
+    let v = crate::cpu::memory::read32s(host | (addr as u32 & 0xFFF));
+    if EAGL_READ_CURSOR_VERIFY { eagl_read32_verify(addr, v); }
+    v
+}
+
+/// The lookup the hot path performs, named so the self-test drives the shipped code rather
+/// than a copy of it.
+#[inline(always)]
+unsafe fn rc_lookup(t: u32) -> Option<u32> {
+    if t == RC_TAG {
+        return Some(RC_HOST_PAGE);
+    }
+    None
+}
+
+#[inline(never)]
+unsafe fn eagl_read32_verify(addr: i32, v: i32) {
+    EAGL_READ_CURSOR_CHECKED = EAGL_READ_CURSOR_CHECKED.wrapping_add(1);
+    match safe_read32s(addr) {
+        Ok(reference) if reference == v => {},
+        _ => EAGL_READ_CURSOR_MISMATCH = EAGL_READ_CURSOR_MISMATCH.wrapping_add(1),
+    }
+}
+
+/// A true miss: first touch of a page, a dword straddling the page boundary, or the kill
+/// switch. Outlined so the 99 call sites inline only the probe.
+#[inline(never)]
+unsafe fn eagl_read32_cold(addr: i32) -> Result<i32, ()> {
+    let a = addr as u32;
+    if !EAGL_READ_CURSOR || a & 0xFFF > 0xFFC {
+        return safe_read32s(addr);
+    }
+    let host = crate::cpu::cpu::translate_address_read(addr)? & !0xFFF;
+    RC_TAG = rc_tag(a);
+    RC_HOST_PAGE = host;
+    Ok(eagl_cursor_load(addr, host))
+}
+
+/// Structural self-test of the cursor's bookkeeping — the empty-tag sentinel, replacement,
+/// and whole-cursor invalidation — driven through the SAME `rc_lookup` the hot path uses.
+/// Returns 0 on pass, else a bitmask of failing case numbers.
+///
+/// It answers the half of the change the differential oracle cannot: the oracle proves every
+/// answered read matches `safe_read32s`, but it runs only where the guest happens to take the
+/// code. This needs no guest and no translation, so it runs in a headless emulator.
+///
+/// It WRITES the cursor, so it is for a test harness, not for a live guest; it leaves the
+/// cursor dropped.
+#[no_mangle]
+pub unsafe fn eagl_read_cursor_selftest() -> u32 {
+    const A: u32 = 0x0011_0000;
+    const B: u32 = 0x0022_0000;
+
+    let mut fail = 0u32;
+
+    // 0: a real tag can never collide with the empty sentinel, for any address or CPL. This
+    //    is what lets the hot path drop the validity and kill-switch loads.
+    if rc_tag(0xFFFF_FFFF) == RC_TAG_EMPTY || rc_tag(0) == RC_TAG_EMPTY {
+        fail |= 1 << 0;
+    }
+
+    // 1: the entry answers for the page it holds, and only that page.
+    eagl_read_cursor_drop();
+    RC_TAG = A;
+    RC_HOST_PAGE = 0x1000;
+    if rc_lookup(A) != Some(0x1000) || rc_lookup(B).is_some() { fail |= 1 << 1; }
+
+    // 2: a new page replaces the old one outright.
+    RC_TAG = B;
+    RC_HOST_PAGE = 0x2000;
+    if rc_lookup(B) != Some(0x2000) || rc_lookup(A).is_some() { fail |= 1 << 2; }
+
+    // 3: invalidation leaves nothing that can answer — the containment property the four
+    //    TLB sites depend on.
+    eagl_read_cursor_invalidate();
+    if rc_lookup(A).is_some() || rc_lookup(B).is_some() { fail |= 1 << 3; }
+
+    eagl_read_cursor_drop();
+    EAGL_READ_CURSOR_INVALIDATIONS = 0;
+    fail
 }
 
 // --- EAGL shader-parameter APPLY converter family (handlers 129-131) ------
@@ -160,16 +385,16 @@ unsafe fn handle_eagl_apply_packed() -> bool {
 
 unsafe fn handle_eagl_apply(family: ApplyFamily, layout: ApplyLayout) -> bool {
     let esp = read_reg32(ESP);
-    let desc_cur = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
-    let src_cur = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
-    let dst_cur = match safe_read32s(esp + 12) { Ok(v) => v, Err(_) => return false };
-    let budget = match safe_read32s(esp + 16) { Ok(v) => v, Err(_) => return false };
+    let desc_cur = match eagl_read32(esp + 4) { Ok(v) => v, Err(_) => return false };
+    let src_cur = match eagl_read32(esp + 8) { Ok(v) => v, Err(_) => return false };
+    let dst_cur = match eagl_read32(esp + 12) { Ok(v) => v, Err(_) => return false };
+    let budget = match eagl_read32(esp + 16) { Ok(v) => v, Err(_) => return false };
 
     // Entry snapshot of the by-ref cells for clean fall-through on abort.
-    let d0 = match safe_read32s(desc_cur) { Ok(v) => v, Err(_) => return false };
-    let s0 = match safe_read32s(src_cur) { Ok(v) => v, Err(_) => return false };
-    let t0 = match safe_read32s(dst_cur) { Ok(v) => v, Err(_) => return false };
-    let b0 = match safe_read32s(budget) { Ok(v) => v, Err(_) => return false };
+    let d0 = match eagl_read32(desc_cur) { Ok(v) => v, Err(_) => return false };
+    let s0 = match eagl_read32(src_cur) { Ok(v) => v, Err(_) => return false };
+    let t0 = match eagl_read32(dst_cur) { Ok(v) => v, Err(_) => return false };
+    let b0 = match eagl_read32(budget) { Ok(v) => v, Err(_) => return false };
     // Same sane envelope as the JS guard — beyond it, defer to the guest.
     if b0 as u32 > 4096 {
         return false;
@@ -211,9 +436,9 @@ unsafe fn eagl_apply_walk(
     if depth > APPLY_MAX_DEPTH {
         return Err(());
     }
-    let d = safe_read32s(desc_cur).map_err(|_| ())?;
-    let cls = safe_read32s(d + 4).map_err(|_| ())?;
-    let mut items = safe_read32s(d + 0x10).map_err(|_| ())? as u32;
+    let d = eagl_read32(desc_cur).map_err(|_| ())?;
+    let cls = eagl_read32(d + 4).map_err(|_| ())?;
+    let mut items = eagl_read32(d + 0x10).map_err(|_| ())? as u32;
     if items == 0 {
         items = 1;
     }
@@ -222,9 +447,9 @@ unsafe fn eagl_apply_walk(
     }
 
     if cls >= 0 && cls <= 3 {
-        let mode = safe_read32s(d).map_err(|_| ())? as u32;
-        let rows = safe_read32s(d + 0x14).map_err(|_| ())? as u32;
-        let cols = safe_read32s(d + 0x18).map_err(|_| ())? as u32;
+        let mode = eagl_read32(d).map_err(|_| ())? as u32;
+        let rows = eagl_read32(d + 0x14).map_err(|_| ())? as u32;
+        let cols = eagl_read32(d + 0x18).map_err(|_| ())? as u32;
         if mode < 1 || mode > 3 {
             return Ok(APPLY_E_FAIL);
         }
@@ -238,12 +463,12 @@ unsafe fn eagl_apply_walk(
         let mut n = rows;
 
         for _ in 0..items {
-            if safe_read32s(budget).map_err(|_| ())? == 0 {
+            if eagl_read32(budget).map_err(|_| ())? == 0 {
                 break;
             }
-            let src_base = safe_read32s(src_cur).map_err(|_| ())?;
+            let src_base = eagl_read32(src_cur).map_err(|_| ())?;
             for j in 0..cols as i32 {
-                let rem = safe_read32s(budget).map_err(|_| ())? as u32;
+                let rem = eagl_read32(budget).map_err(|_| ())? as u32;
                 if rem == 0 {
                     break;
                 }
@@ -262,11 +487,11 @@ unsafe fn eagl_apply_walk(
                         (n, n * 4, n)
                     },
                 };
-                let dst_base = safe_read32s(dst_cur).map_err(|_| ())?;
+                let dst_base = eagl_read32(dst_cur).map_err(|_| ())?;
                 for e in 0..count as i32 {
                     let s = src_base + (j + e * cols as i32) * 4;
                     let dst = dst_base + e * 4;
-                    let sv = safe_read32s(s).map_err(|_| ())?;
+                    let sv = eagl_read32(s).map_err(|_| ())?;
                     let out = match family {
                         ApplyFamily::Int => match mode {
                             1 => ((sv as f64) as f32).to_bits() as i32,        // FILD i32 → FSTP f32
@@ -297,19 +522,19 @@ unsafe fn eagl_apply_walk(
     }
 
     if cls == 5 {
-        let children = safe_read32s(d + 0x14).map_err(|_| ())? as u32;
+        let children = eagl_read32(d + 0x14).map_err(|_| ())? as u32;
         if children > 64 {
             return Err(());
         }
         safe_write32(desc_cur, d.wrapping_add(0x18)).map_err(|_| ())?;
         let mut ret = 0i32;
         for _ in 0..items {
-            if safe_read32s(budget).map_err(|_| ())? == 0 {
+            if eagl_read32(budget).map_err(|_| ())? == 0 {
                 return Ok(ret);
             }
             safe_write32(desc_cur, d.wrapping_add(0x18)).map_err(|_| ())?;
             for _ in 0..children {
-                if safe_read32s(budget).map_err(|_| ())? == 0 {
+                if eagl_read32(budget).map_err(|_| ())? == 0 {
                     break;
                 }
                 // FUN_005cad01's container recurses into the REGISTER-layout
@@ -422,7 +647,7 @@ static mut EAGL_TOKEN_CFG: EaglTokenCfg = EaglTokenCfg {
 };
 
 unsafe fn eagl_token_cfg_refresh(cfg: i32) -> Result<(), ()> {
-    let r = |off: i32| safe_read32s(cfg + off).map_err(|_| ());
+    let r = |off: i32| eagl_read32(cfg + off).map_err(|_| ());
     let c = &mut *addr_of_mut!(EAGL_TOKEN_CFG);
     c.token_table = r(0x04)?;
     c.ring_ctrl = r(0x08)?;
@@ -470,13 +695,13 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
     if cfg == 0 {
         return false;
     }
-    let ver = match safe_read32s(cfg) { Ok(v) => v, Err(_) => return false };
+    let ver = match eagl_read32(cfg) { Ok(v) => v, Err(_) => return false };
     // v2 fields are a prefix of v3 (phase 3 adds validate/scratch cells only).
     if ver < 2 || ver > 3 {
         return false;
     }
     // (ptr, generation) cache key — generation is one read instead of ~16.
-    let generation = match safe_read32s(cfg + 0x38) { Ok(v) => v, Err(_) => return false };
+    let generation = match eagl_read32(cfg + 0x38) { Ok(v) => v, Err(_) => return false };
     {
         let c = &*addr_of!(EAGL_TOKEN_CFG);
         if c.ptr != cfg || c.generation != generation {
@@ -488,33 +713,33 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
 
     let esp = read_reg32(ESP);
     let this_ctx = read_reg32(ECX);
-    let node = match safe_read32s(esp + 4) { Ok(v) => v, Err(_) => return false };
-    let mut stage = match safe_read32s(esp + 8) { Ok(v) => v, Err(_) => return false };
+    let node = match eagl_read32(esp + 4) { Ok(v) => v, Err(_) => return false };
+    let mut stage = match eagl_read32(esp + 8) { Ok(v) => v, Err(_) => return false };
     if node == 0 {
         return false;
     }
     // Original entry semantics: param_3 == -1 → param_2[1] (the RAW node,
     // before alias resolution).
     if stage == -1 {
-        stage = match safe_read32s(node + 4) { Ok(v) => v, Err(_) => return false };
+        stage = match eagl_read32(node + 4) { Ok(v) => v, Err(_) => return false };
     }
     // *node == -1 → the aliased/compiled node at node[0x19].
     let mut n = node;
-    let mut tok = match safe_read32s(n) { Ok(v) => v, Err(_) => return false };
+    let mut tok = match eagl_read32(n) { Ok(v) => v, Err(_) => return false };
     if tok == -1 {
-        n = match safe_read32s(node + 0x64) { Ok(v) => v, Err(_) => return false };
-        tok = match safe_read32s(n) { Ok(v) => v, Err(_) => return false };
+        n = match eagl_read32(node + 0x64) { Ok(v) => v, Err(_) => return false };
+        tok = match eagl_read32(n) { Ok(v) => v, Err(_) => return false };
     }
 
     let c = &*addr_of!(EAGL_TOKEN_CFG);
-    let desc = match safe_read32s(c.token_table.wrapping_add(tok.wrapping_mul(0x1c))) {
+    let desc = match eagl_read32(c.token_table.wrapping_add(tok.wrapping_mul(0x1c))) {
         Ok(v) => v as u32,
         Err(_) => return false,
     };
     let class = desc >> 24;
     // dev = *(this + 8); vtable = *dev.
-    let dev = match safe_read32s(this_ctx + 8) { Ok(v) => v, Err(_) => return false };
-    let vt = match safe_read32s(dev) { Ok(v) => v, Err(_) => return false };
+    let dev = match eagl_read32(this_ctx + 8) { Ok(v) => v, Err(_) => return false };
+    let vt = match eagl_read32(dev) { Ok(v) => v, Err(_) => return false };
 
     match class {
         1 | 2 | 8 => eagl_dispatch_simple(c, dev, vt, class, desc, stage, n),
@@ -529,7 +754,7 @@ unsafe fn eagl_dispatch_simple(
 ) -> bool {
     let d3d_enum = (desc & 0xff_ffff) as i32;
     // Value = node[0x1a] for all three classes.
-    let value = match safe_read32s(n + 0x68) { Ok(v) => v, Err(_) => return false };
+    let value = match eagl_read32(n + 0x68) { Ok(v) => v, Err(_) => return false };
 
     // (vtable offset, expected funcId, shadow table/skip addr, shadow slot key, argc)
     let (vt_off, expect_fid, shadow_base, skip_addr, slot, argc): (i32, i32, i32, i32, i32, i32) =
@@ -554,7 +779,7 @@ unsafe fn eagl_dispatch_simple(
     // pre-dispatch drain) completes the call.
     let ring_ctrl = c.ring_ctrl;
     let ring_base = c.ring_base;
-    let head = match safe_read32s(ring_ctrl) { Ok(v) => v, Err(_) => return false };
+    let head = match eagl_read32(ring_ctrl) { Ok(v) => v, Err(_) => return false };
     if head < 0 || head >= c.capacity - 36 {
         return false;
     }
@@ -567,15 +792,15 @@ unsafe fn eagl_dispatch_simple(
     // invisible, so this order makes every abort point safe.
     let mut shadow_slot_addr = 0i32;
     if shadow_base != 0 && slot >= 0 && c.owner_global != 0 {
-        let owner = match safe_read32s(c.owner_global) { Ok(v) => v, Err(_) => return false };
+        let owner = match eagl_read32(c.owner_global) { Ok(v) => v, Err(_) => return false };
         if owner == dev {
             let slot_addr = shadow_base + slot * 4;
-            let cur = match safe_read32s(slot_addr) { Ok(v) => v, Err(_) => return false };
+            let cur = match eagl_read32(slot_addr) { Ok(v) => v, Err(_) => return false };
             if cur == value {
                 // Redundant set: bump the skip counter, EAX = D3D_OK.
                 EAGL_TOK_SKIP += 1;
                 if skip_addr != 0 {
-                    let cnt = match safe_read32s(skip_addr) { Ok(v) => v, Err(_) => return false };
+                    let cnt = match eagl_read32(skip_addr) { Ok(v) => v, Err(_) => return false };
                     if safe_write32(skip_addr, cnt.wrapping_add(1)).is_err() { return false; }
                 }
                 write_reg32(EAX, 0);
@@ -687,11 +912,11 @@ impl EaglPass {
 /// Resolve a device vtable slot and require the KNOWN callee shape: our WBUF
 /// setter stub `B8 <funcId:u32>` with the expected id. Err = decline.
 unsafe fn eagl_stub_fid(vt: i32, vt_off: i32, expect_fid: i32) -> Result<i32, ()> {
-    let target = safe_read32s(vt + vt_off).map_err(|_| ())?;
+    let target = eagl_read32(vt + vt_off).map_err(|_| ())?;
     if hc_safe_read8(target).map_err(|_| ())? != 0xB8 {
         return Err(());
     }
-    let fid = safe_read32s(target + 1).map_err(|_| ())?;
+    let fid = eagl_read32(target + 1).map_err(|_| ())?;
     if fid != expect_fid || fid == 0 {
         return Err(());
     }
@@ -719,7 +944,7 @@ unsafe fn eagl_emit_state(
 
     let mut shadow_slot_addr = 0i32;
     if shadow_base != 0 && slot >= 0 && c.owner_global != 0 {
-        let owner = safe_read32s(c.owner_global).map_err(|_| ())?;
+        let owner = eagl_read32(c.owner_global).map_err(|_| ())?;
         if owner == dev {
             let slot_addr = shadow_base + slot * 4;
             // Scan consults its local model first so earlier same-crossing
@@ -727,7 +952,7 @@ unsafe fn eagl_emit_state(
             // commit reads the real slot (its own writes ARE the model).
             let cur = match if p.commit { None } else { p.model_get(slot_addr) } {
                 Some(v) => v,
-                None => safe_read32s(slot_addr).map_err(|_| ())?,
+                None => eagl_read32(slot_addr).map_err(|_| ())?,
             };
             // Post-overflow the scan's view may miss an untracked earlier
             // write — stop skipping (over-reserve is safe, under-reserve is
@@ -735,7 +960,7 @@ unsafe fn eagl_emit_state(
             if cur == value && (p.commit || !p.model_ovf) {
                 if p.commit {
                     if skip_addr != 0 {
-                        let cnt = safe_read32s(skip_addr).map_err(|_| ())?;
+                        let cnt = eagl_read32(skip_addr).map_err(|_| ())?;
                         safe_write32(skip_addr, cnt.wrapping_add(1)).map_err(|_| ())?;
                     }
                 }
@@ -811,8 +1036,8 @@ unsafe fn eagl_emit_const_f(
     if !p.commit {
         // Payload readability: ≤4KB spans at most two pages — first and last
         // dword touch both. The commit pass then reads every dword safely.
-        safe_read32s(src).map_err(|_| ())?;
-        safe_read32s(src.wrapping_add(bytes - 4)).map_err(|_| ())?;
+        eagl_read32(src).map_err(|_| ())?;
+        eagl_read32(src.wrapping_add(bytes - 4)).map_err(|_| ())?;
     } else {
         let entry = c.ring_base + p.head;
         safe_write32(entry, fid).map_err(|_| ())?;
@@ -820,7 +1045,7 @@ unsafe fn eagl_emit_const_f(
         safe_write32(entry + 8, start_reg).map_err(|_| ())?;
         safe_write32(entry + 12, cnt).map_err(|_| ())?;
         for i in 0..cnt * 4 {
-            let v = safe_read32s(src.wrapping_add(i * 4)).map_err(|_| ())?;
+            let v = eagl_read32(src.wrapping_add(i * 4)).map_err(|_| ())?;
             safe_write32(entry + 16 + i * 4, v).map_err(|_| ())?;
         }
     }
@@ -842,19 +1067,19 @@ unsafe fn eagl_dispatch_token(
     }
     let mut stage = stage_in;
     if stage == -1 {
-        stage = safe_read32s(node + 4).map_err(|_| ())?;
+        stage = eagl_read32(node + 4).map_err(|_| ())?;
     }
     let mut n = node;
-    let mut tok = safe_read32s(n).map_err(|_| ())?;
+    let mut tok = eagl_read32(n).map_err(|_| ())?;
     if tok == -1 {
-        n = safe_read32s(node + 0x64).map_err(|_| ())?;
-        tok = safe_read32s(n).map_err(|_| ())?;
+        n = eagl_read32(node + 0x64).map_err(|_| ())?;
+        tok = eagl_read32(n).map_err(|_| ())?;
     }
-    let desc = safe_read32s(c.token_table.wrapping_add(tok.wrapping_mul(0x1c)))
+    let desc = eagl_read32(c.token_table.wrapping_add(tok.wrapping_mul(0x1c)))
         .map_err(|_| ())? as u32;
     match desc >> 24 {
         cls @ (1 | 2 | 8) => {
-            let value = safe_read32s(n + 0x68).map_err(|_| ())?;
+            let value = eagl_read32(n + 0x68).map_err(|_| ())?;
             eagl_emit_state(c, dev, vt, cls, (desc & 0xff_ffff) as i32, stage, value, p)?;
             Ok(0)
         },
@@ -885,7 +1110,7 @@ unsafe fn eagl_class6(
     if desc == 0x6000008 {
         // SetFVF — the one class-6 token that also runs in mode 1 (degraded
         // mode forces FVF = 2 = D3DFVF_XYZ).
-        let mut value = safe_read32s(n + 0x68).map_err(|_| ())?;
+        let mut value = eagl_read32(n + 0x68).map_err(|_| ())?;
         if mode == 1 {
             value = 2;
         }
@@ -900,14 +1125,14 @@ unsafe fn eagl_class6(
         // Direct constant-F uploads: (dev, stage, node[0x13] = data ptr,
         // node[0x2a] = vec4 count).
         0x6000002 | 0x6000102 | 0x6000202 | 0x6000302 | 0x6000402 => {
-            let src = safe_read32s(n + 0x4c).map_err(|_| ())?;
-            let cnt = safe_read32s(n + 0xa8).map_err(|_| ())?;
+            let src = eagl_read32(n + 0x4c).map_err(|_| ())?;
+            let cnt = eagl_read32(n + 0xa8).map_err(|_| ())?;
             eagl_emit_const_f(c, vt, false, dev, stage, src, cnt, p)?;
             Ok(0)
         },
         0x6000005 | 0x6000105 | 0x6000205 | 0x6000305 | 0x6000405 => {
-            let src = safe_read32s(n + 0x4c).map_err(|_| ())?;
-            let cnt = safe_read32s(n + 0xa8).map_err(|_| ())?;
+            let src = eagl_read32(n + 0x4c).map_err(|_| ())?;
+            let cnt = eagl_read32(n + 0xa8).map_err(|_| ())?;
             eagl_emit_const_f(c, vt, true, dev, stage, src, cnt, p)?;
             Ok(0)
         },
@@ -941,22 +1166,22 @@ unsafe fn eagl_class6(
 /// same chain): *(ctx+0x8c)[node[3]] → per-resource record → index (direct
 /// or via the double-indirect table) → the 0x1c-stride record at ctx+0x24.
 unsafe fn eagl_resolve_record(ctx: i32, n: i32) -> Result<i32, ()> {
-    let page_tbl = safe_read32s(ctx + 0x8c).map_err(|_| ())?;
-    let nid = safe_read32s(n + 0xc).map_err(|_| ())?;
-    let r = safe_read32s(page_tbl.wrapping_add(nid.wrapping_mul(4))).map_err(|_| ())?;
-    let t = safe_read32s(r + 0x38).map_err(|_| ())?;
-    let a = safe_read32s(r + 0x28).map_err(|_| ())?
-        .wrapping_add(safe_read32s(n + 0x14).map_err(|_| ())?);
+    let page_tbl = eagl_read32(ctx + 0x8c).map_err(|_| ())?;
+    let nid = eagl_read32(n + 0xc).map_err(|_| ())?;
+    let r = eagl_read32(page_tbl.wrapping_add(nid.wrapping_mul(4))).map_err(|_| ())?;
+    let t = eagl_read32(r + 0x38).map_err(|_| ())?;
+    let a = eagl_read32(r + 0x28).map_err(|_| ())?
+        .wrapping_add(eagl_read32(n + 0x14).map_err(|_| ())?);
     let idx = if t == 0 {
-        let off = safe_read32s(ctx + 0x2c).map_err(|_| ())?;
-        safe_read32s(a.wrapping_add(off)).map_err(|_| ())?
+        let off = eagl_read32(ctx + 0x2c).map_err(|_| ())?;
+        eagl_read32(a.wrapping_add(off)).map_err(|_| ())?
     } else {
-        let inner_off = safe_read32s(safe_read32s(ctx + 0xc).map_err(|_| ())? + 8).map_err(|_| ())?;
-        let inner = safe_read32s(a.wrapping_add(inner_off)).map_err(|_| ())?;
-        safe_read32s(safe_read32s(t + 8).map_err(|_| ())?.wrapping_add(inner.wrapping_mul(4)))
+        let inner_off = eagl_read32(eagl_read32(ctx + 0xc).map_err(|_| ())? + 8).map_err(|_| ())?;
+        let inner = eagl_read32(a.wrapping_add(inner_off)).map_err(|_| ())?;
+        eagl_read32(eagl_read32(t + 8).map_err(|_| ())?.wrapping_add(inner.wrapping_mul(4)))
             .map_err(|_| ())?
     };
-    Ok(idx.wrapping_mul(0x1c).wrapping_add(safe_read32s(ctx + 0x24).map_err(|_| ())?))
+    Ok(idx.wrapping_mul(0x1c).wrapping_add(eagl_read32(ctx + 0x24).map_err(|_| ())?))
 }
 
 /// Class 5 — SetTexture (guest case 5, non-record mode): resolve the texture
@@ -971,7 +1196,7 @@ unsafe fn eagl_class5_texture(
         return Err(());
     }
     let rec = eagl_resolve_record(ctx, n)?;
-    let value = safe_read32s(rec + 4).map_err(|_| ())?;
+    let value = eagl_read32(rec + 4).map_err(|_| ())?;
     let fid = eagl_stub_fid(vt, VT_SET_TEXTURE, c.tex_fid)?;
     if p.commit {
         let entry = c.ring_base + p.head;
@@ -989,30 +1214,30 @@ unsafe fn eagl_class6_bind(
     n: i32, pix: bool, depth: u32, p: &mut EaglPass,
 ) -> Result<i32, ()> {
     let rec = eagl_resolve_record(ctx, n)?;
-    if safe_read32s(rec + 0xc).map_err(|_| ())? == 0 {
+    if eagl_read32(rec + 0xc).map_err(|_| ())? == 0 {
         // Unbound shader record: guest returns E_FAIL before any device call.
         return Ok(EAGL_E_FAIL);
     }
-    let handle = safe_read32s(rec + 4).map_err(|_| ())?;
+    let handle = eagl_read32(rec + 4).map_err(|_| ())?;
     if pix {
         eagl_emit_2arg(c, vt, VT_SET_PIXEL_SHADER, c.sps_fid, dev, handle, p)?;
     } else {
         eagl_emit_2arg(c, vt, VT_SET_VERTEX_SHADER, c.svs_fid, dev, handle, p)?;
     }
 
-    let ct = safe_read32s(rec + 0x14).map_err(|_| ())?;
+    let ct = eagl_read32(rec + 0x14).map_err(|_| ())?;
     if ct == 0 {
         return Ok(0);
     }
-    let hdr_ptr = safe_read32s(rec + 0x18).map_err(|_| ())?;
-    let hdr = safe_read32s(hdr_ptr + 0x44).map_err(|_| ())?;
+    let hdr_ptr = eagl_read32(rec + 0x18).map_err(|_| ())?;
+    let hdr = eagl_read32(hdr_ptr + 0x44).map_err(|_| ())?;
     let f_base = hdr.wrapping_add(8);
-    let total = safe_read32s(ct + 0xc).map_err(|_| ())?;
+    let total = eagl_read32(ct + 0xc).map_err(|_| ())?;
     if total as u32 > 1024 {
         return Err(());
     }
     let mut ep = ct
-        .wrapping_add(safe_read32s(ct + 0x10).map_err(|_| ())?)
+        .wrapping_add(eagl_read32(ct + 0x10).map_err(|_| ())?)
         .wrapping_add(6);
     for k in 0..total {
         let typ = safe_read16(ep - 2).map_err(|_| ())?;
@@ -1031,19 +1256,19 @@ unsafe fn eagl_class6_bind(
                 if depth != 0 {
                     return Err(());
                 }
-                let sub_arr = safe_read32s(hdr_ptr + 0x30).map_err(|_| ())?;
-                let sub = safe_read32s(sub_arr.wrapping_add(k.wrapping_mul(4))).map_err(|_| ())?;
+                let sub_arr = eagl_read32(hdr_ptr + 0x30).map_err(|_| ())?;
+                let sub = eagl_read32(sub_arr.wrapping_add(k.wrapping_mul(4))).map_err(|_| ())?;
                 if sub != 0 {
-                    let pass_id = safe_read32s(safe_read32s(sub + 4).map_err(|_| ())? + 4)
+                    let pass_id = eagl_read32(eagl_read32(sub + 4).map_err(|_| ())? + 4)
                         .map_err(|_| ())?;
-                    let page_tbl = safe_read32s(ctx + 0x8c).map_err(|_| ())?;
-                    let pr = safe_read32s(page_tbl.wrapping_add(pass_id.wrapping_mul(4)))
+                    let page_tbl = eagl_read32(ctx + 0x8c).map_err(|_| ())?;
+                    let pr = eagl_read32(page_tbl.wrapping_add(pass_id.wrapping_mul(4)))
                         .map_err(|_| ())?;
-                    let m = safe_read32s(pr + 0x3c).map_err(|_| ())?;
+                    let m = eagl_read32(pr + 0x3c).map_err(|_| ())?;
                     if m as u32 > 256 {
                         return Err(());
                     }
-                    let base = safe_read32s(pr + 0x40).map_err(|_| ())?;
+                    let base = eagl_read32(pr + 0x40).map_err(|_| ())?;
                     for i in 0..m {
                         let sub_node = base.wrapping_add(i.wrapping_mul(0xac));
                         let hr = eagl_dispatch_token(c, ctx, mode, dev, vt, sub_node, reg, depth + 1, p)?;
@@ -1076,11 +1301,11 @@ unsafe fn eagl_class6_bind(
 unsafe fn eagl_dispatch_class6_batch(
     c: &EaglTokenCfg, ctx: i32, dev: i32, vt: i32, node: i32, stage: i32,
 ) -> bool {
-    let mode = match safe_read32s(ctx + 0x84) { Ok(v) => v, Err(_) => return false };
+    let mode = match eagl_read32(ctx + 0x84) { Ok(v) => v, Err(_) => return false };
     if mode == 2 {
         return false;
     }
-    let head0 = match safe_read32s(c.ring_ctrl) { Ok(v) => v, Err(_) => return false };
+    let head0 = match eagl_read32(c.ring_ctrl) { Ok(v) => v, Err(_) => return false };
     if head0 < 0 || head0 > c.capacity {
         return false;
     }
