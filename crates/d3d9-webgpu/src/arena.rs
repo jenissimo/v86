@@ -70,9 +70,12 @@ const PS_CONST_FLOATS: usize = 224 * 4;
 // so CMD_CAP is sized at 16384 (~5400 draws of headroom) to avoid arena overflow.
 pub const CMD_CAP: usize = 16384;
 const BUMP_CAP: usize = 16 * 1024 * 1024;
+/** The x86 thunk write-buffer is 512 KiB. One static scratch lets a whole alternating
+ * constant/draw run cross the paging-aware guest-memory callback exactly once. */
+const WBUF_RUN_CAP: usize = 512 * 1024;
 /// Shared-memory ABI version. Increment whenever the layout or exported command
 /// signatures change in a way the JS adapter cannot safely infer.
-const D3D9_ARENA_ABI_VERSION: u32 = 2;
+const D3D9_ARENA_ABI_VERSION: u32 = 4;
 
 const OFF_RENDER_STATES: usize = 0;
 const OFF_SAMPLER_STAGE0: usize = OFF_RENDER_STATES + RENDER_STATE_COUNT * 4;
@@ -177,6 +180,14 @@ const CMD_BIND_PROGRAMMABLE: u32 = 6;
 const CMD_DRAW_UP: u32 = 7;
 const CMD_DRAW_INDEXED_UP: u32 = 8;
 
+/// Shadow/authoritative Compact MegaRun descriptor stored in the frame bump arena.
+/// The RenderFrame owns the generation-safe material template while this payload owns
+/// every per-instance VS delta and the common indexed geometry.
+const COMPACT_RUN_MAGIC_SPARSE: u32 = 0x434d_5201; // "CMR" + sparse version 1
+const COMPACT_RUN_MAGIC_STORAGE: u32 = 0x434d_5202; // storage-ready version 2
+const COMPACT_RUN_HEADER_WORDS: usize = 10;
+static mut LAST_WBUF_COMPACT_OFFSET: i32 = -1;
+
 // ---------------------------------------------------------------------------
 // Layout table — the ONE place a byte offset is allowed to be duplicated on the JS
 // side. JS reads this table once at boot (get_d3d9_arena_layout_ptr) instead of
@@ -272,6 +283,10 @@ static mut LAST_DRAW_STATE_PS_VERSION: u32 = 0;
 static mut LAST_DRAW_STATE_BIND_GROUP_KEY: u32 = 0;
 static mut LAST_DRAW_STATE_OFFSET: u32 = 0;
 static mut LAST_DRAW_STATE_IDENTITY: [u32; PIPELINE_IDENTITY_WORDS] = [0; PIPELINE_IDENTITY_WORDS];
+static mut WBUF_RUN_SCRATCH: [u32; WBUF_RUN_CAP / 4] = [0; WBUF_RUN_CAP / 4];
+static mut WBUF_CONST_ROLLBACK: [u32; VS_CONST_FLOATS] = [0; VS_CONST_FLOATS];
+static mut COMPACT_RUN_TEMPLATE: [u32; VS_CONST_FLOATS] = [0; VS_CONST_FLOATS];
+static mut COMPACT_RUN_TEMPLATE_WORDS: usize = 0;
 
 #[inline(always)]
 unsafe fn arena_ptr() -> *mut u8 {
@@ -323,6 +338,32 @@ pub unsafe fn d3d9_reset_frame() {
     LAST_DRAW_STATE_VALID = false;
     LAST_DRAW_STATE_BIND_GROUP_KEY = 0;
     LAST_DRAW_STATE_IDENTITY = [0; PIPELINE_IDENTITY_WORDS];
+    LAST_WBUF_COMPACT_OFFSET = -1;
+    COMPACT_RUN_TEMPLATE_WORDS = 0;
+}
+
+/// Offset of the descriptor emitted by the most recent successful WBUF run, or -1 when
+/// compact shadowing was disabled/declined. Relative to OFF_BUMP_ARENA.
+#[no_mangle]
+pub unsafe fn d3d9_get_last_wbuf_compact_offset() -> i32 {
+    LAST_WBUF_COMPACT_OFFSET
+}
+
+#[no_mangle]
+pub fn get_d3d9_compact_template_ptr() -> u32 {
+    addr_of!(COMPACT_RUN_TEMPLATE) as u32
+}
+
+/// Publish the valid prefix previously copied through the zero-copy pointer above.
+#[no_mangle]
+pub unsafe fn d3d9_set_compact_template_words(words: u32) -> u32 {
+    let words = words as usize;
+    if words == 0 || words > VS_CONST_FLOATS {
+        COMPACT_RUN_TEMPLATE_WORDS = 0;
+        return 0;
+    }
+    COMPACT_RUN_TEMPLATE_WORDS = words;
+    words as u32
 }
 
 /// Roll back a speculative draw recording transaction.  JS records the compact arena row
@@ -775,6 +816,244 @@ pub unsafe fn d3d9_record_draw_indexed(
     }
 }
 
+/// Record an exact alternating WBUF run:
+///   SetVertexShaderConstantF(this,start,count,inlineBits) ->
+///   DrawIndexedPrimitive(this,TRIANGLELIST,base,min,numVertices,startIndex,primitiveCount)
+///
+/// The complete source range is copied through the paging-aware guest accessor once, then
+/// fully validated before the arena mirror or command cursors are touched. Any unexpected
+/// recorder decline restores every mutable field involved in the transaction. Returns the
+/// number of recorded pairs, or -1 so JS can replay the ordinary handlers exactly once.
+#[no_mangle]
+pub unsafe fn d3d9_record_wbuf_indexed_run(
+    guest_start: i32,
+    byte_len: u32,
+    vs_func_id: u32,
+    draw_func_id: u32,
+    expected_device: u32,
+    stride: u32,
+    force_cull_none: u32,
+    compact_mode: u32,
+    index_capacity: u32,
+) -> i32 {
+    LAST_WBUF_COMPACT_OFFSET = -1;
+    let len = byte_len as usize;
+    if compact_mode > 3 || guest_start == 0 || len == 0 || len > WBUF_RUN_CAP || (len & 3) != 0
+        || expected_device == 0 || stride == 0
+    {
+        return -1;
+    }
+    let gm = match guest_mem() { Some(gm) => gm, None => return -1 };
+    let scratch_ptr = addr_of_mut!(WBUF_RUN_SCRATCH).cast::<u8>();
+    if !(gm.read_block)(guest_start, scratch_ptr, byte_len) { return -1; }
+    let words = std::slice::from_raw_parts(scratch_ptr.cast::<u32>(), len / 4);
+
+    // Pass one: exact shape + bounds + a stable constant range. A state setter between the
+    // two calls cannot be hidden because the dispatcher only hands us a contiguous run.
+    let mut at = 0usize;
+    let mut pairs = 0usize;
+    let mut run_start_reg = 0usize;
+    let mut run_float_count = 0usize;
+    let mut run_index_count = 0u32;
+    let mut run_start_index = 0u32;
+    let mut run_base_vertex = 0u32;
+    while at < words.len() {
+        if words.len() - at < 4 || words[at] != vs_func_id || words[at + 1] != expected_device {
+            return -1;
+        }
+        let start_reg = words[at + 2] as usize;
+        let vec_count = words[at + 3] as usize;
+        let float_count = match vec_count.checked_mul(4) { Some(v) if v > 0 => v, _ => return -1 };
+        let float_start = match start_reg.checked_mul(4) { Some(v) => v, None => return -1 };
+        if float_start >= VS_CONST_FLOATS || float_count > VS_CONST_FLOATS - float_start {
+            return -1;
+        }
+        if pairs == 0 { run_start_reg = start_reg; run_float_count = float_count; }
+        else if start_reg != run_start_reg || float_count != run_float_count { return -1; }
+        let constant_words = match 4usize.checked_add(float_count) {
+            Some(v) if v <= words.len() - at => v,
+            _ => return -1,
+        };
+        at += constant_words;
+        if words.len() - at < 8 || words[at] != draw_func_id || words[at + 1] != expected_device {
+            return -1;
+        }
+        // The specialized host command is deliberately list-only and non-instanced.
+        if words[at + 2] != 4 || (words[at + 3] as i32) < 0 { return -1; }
+        let primitive_count = words[at + 7];
+        if primitive_count == 0 || primitive_count > u32::MAX / 3 { return -1; }
+        let index_count = primitive_count * 3;
+        let start_index = words[at + 6];
+        let base_vertex = words[at + 3];
+        if compact_mode != 0 {
+            if index_capacity == 0 || index_count > index_capacity
+                || start_index > index_capacity - index_count
+            {
+                return -1;
+            }
+            if pairs == 0 {
+                run_index_count = index_count;
+                run_start_index = start_index;
+                run_base_vertex = base_vertex;
+            } else if index_count != run_index_count || start_index != run_start_index
+                || base_vertex != run_base_vertex
+            {
+                return -1;
+            }
+        }
+        at += 8;
+        pairs += 1;
+    }
+    if at != words.len() || pairs < 2 { return -1; }
+
+    let vs_handle = rd_u32(OFF_VS_HANDLE) as usize;
+    let ps_handle = rd_u32(OFF_PS_HANDLE) as usize;
+    if vs_handle == 0 || ps_handle == 0 { return -1; }
+    let vs_bytes = (rd_u16(OFF_SHADER_CONST_LEN_VS + (vs_handle % SHADER_HANDLE_SLOTS) * 2) as usize)
+        .min(VS_CONST_FLOATS) * 4;
+    let ps_bytes = (rd_u16(OFF_SHADER_CONST_LEN_PS + (ps_handle % SHADER_HANDLE_SLOTS) * 2) as usize)
+        .min(PS_CONST_FLOATS) * 4;
+    let slot_bytes = (DRAW_STATE_HEADER_LEN + vs_bytes + ps_bytes + 3) & !3;
+    let command_count = rd_u32(OFF_COMMAND_COUNT) as usize;
+    let bump_cursor = rd_u32(OFF_BUMP_CURSOR) as usize;
+    let compact_stride_words = if compact_mode == 3 {
+        let words = COMPACT_RUN_TEMPLATE_WORDS;
+        let float_start = run_start_reg * 4;
+        if words == 0 || float_start > words || run_float_count > words - float_start {
+            return -1;
+        }
+        words
+    } else {
+        run_float_count
+    };
+    let compact_bytes = if compact_mode != 0 {
+        match pairs.checked_mul(compact_stride_words)
+            .and_then(|words| words.checked_add(COMPACT_RUN_HEADER_WORDS))
+            .and_then(|words| words.checked_mul(4))
+        {
+            Some(bytes) => bytes,
+            None => return -1,
+        }
+    } else { 0 };
+    // Legacy/shadow mode still materializes three rows + one state slot per pair.
+    // Authoritative compact mode needs only its sparse descriptor/payload.
+    if compact_bytes > BUMP_CAP.saturating_sub(bump_cursor)
+        || (compact_mode < 2 && (
+            pairs > (CMD_CAP.saturating_sub(command_count + 2)) / 3
+            || pairs > BUMP_CAP.saturating_sub(bump_cursor + compact_bytes) / slot_bytes.max(1)
+        ))
+    {
+        return -1;
+    }
+
+    // Transaction checkpoint. High-water marks intentionally remain monotonic telemetry;
+    // visible cursors, counters, mirrors and reuse/binding memos are restored on decline.
+    let old_command_count = rd_u32(OFF_COMMAND_COUNT);
+    let old_bump_cursor = rd_u32(OFF_BUMP_CURSOR);
+    let old_emitted = rd_u32(OFF_COMMANDS_EMITTED);
+    let old_vs_version = rd_u32(OFF_VS_CONST_VERSION);
+    let old_bound_stream = LAST_BOUND_STREAM;
+    let old_bound_index = LAST_BOUND_INDEX;
+    let old_state_valid = LAST_DRAW_STATE_VALID;
+    let old_state_pipeline = LAST_DRAW_STATE_PIPELINE_KEY;
+    let old_state_vs_version = LAST_DRAW_STATE_VS_VERSION;
+    let old_state_ps_version = LAST_DRAW_STATE_PS_VERSION;
+    let old_state_bind = LAST_DRAW_STATE_BIND_GROUP_KEY;
+    let old_state_offset = LAST_DRAW_STATE_OFFSET;
+    let old_state_identity = LAST_DRAW_STATE_IDENTITY;
+    let float_start = run_start_reg * 4;
+    std::ptr::copy_nonoverlapping(
+        arena_ptr().add(OFF_VS_CONSTANTS + float_start * 4).cast::<u32>(),
+        addr_of_mut!(WBUF_CONST_ROLLBACK).cast::<u32>(),
+        run_float_count,
+    );
+
+    let compact_offset = if compact_mode != 0 {
+        let offset = bump_alloc(compact_bytes);
+        if offset == u32::MAX { return -1; }
+        let header = arena_ptr().add(OFF_BUMP_ARENA + offset as usize).cast::<u32>();
+        *header.add(0) = if compact_mode == 3 {
+            COMPACT_RUN_MAGIC_STORAGE
+        } else {
+            COMPACT_RUN_MAGIC_SPARSE
+        };
+        *header.add(1) = pairs as u32;
+        *header.add(2) = run_start_reg as u32;
+        *header.add(3) = run_float_count as u32;
+        *header.add(4) = offset + (COMPACT_RUN_HEADER_WORDS * 4) as u32;
+        *header.add(5) = (pairs * compact_stride_words) as u32;
+        *header.add(6) = run_index_count;
+        *header.add(7) = run_start_index;
+        *header.add(8) = run_base_vertex;
+        *header.add(9) = compact_stride_words as u32;
+        offset as i32
+    } else { -1 };
+
+    at = 0;
+    let mut recorded = 0usize;
+    while at < words.len() {
+        let float_count = (words[at + 3] as usize) * 4;
+        if compact_offset >= 0 {
+            let payload = arena_ptr().add(
+                OFF_BUMP_ARENA + compact_offset as usize + COMPACT_RUN_HEADER_WORDS * 4,
+            ).cast::<u32>();
+            let instance = payload.add(recorded * compact_stride_words);
+            if compact_mode == 3 {
+                std::ptr::copy_nonoverlapping(
+                    addr_of!(COMPACT_RUN_TEMPLATE).cast::<u32>(),
+                    instance,
+                    compact_stride_words,
+                );
+            }
+            std::ptr::copy_nonoverlapping(
+                words.as_ptr().add(at + 4),
+                instance.add(if compact_mode == 3 { float_start } else { 0 }),
+                float_count,
+            );
+        }
+        std::ptr::copy_nonoverlapping(
+            words.as_ptr().add(at + 4),
+            arena_ptr().add(OFF_VS_CONSTANTS + float_start * 4).cast::<u32>(),
+            float_count,
+        );
+        wr_u32(OFF_VS_CONST_VERSION, rd_u32(OFF_VS_CONST_VERSION).wrapping_add(1));
+        at += 4 + float_count;
+        let base_vertex = words[at + 3];
+        let start_index = words[at + 6];
+        let index_count = words[at + 7] * 3;
+        if compact_mode < 2
+            && d3d9_record_draw_indexed(
+                0, index_count, start_index, base_vertex, stride, force_cull_none,
+            ) < 0
+        {
+            std::ptr::copy_nonoverlapping(
+                addr_of!(WBUF_CONST_ROLLBACK).cast::<u32>(),
+                arena_ptr().add(OFF_VS_CONSTANTS + float_start * 4).cast::<u32>(),
+                run_float_count,
+            );
+            wr_u32(OFF_COMMAND_COUNT, old_command_count);
+            wr_u32(OFF_BUMP_CURSOR, old_bump_cursor);
+            wr_u32(OFF_COMMANDS_EMITTED, old_emitted);
+            wr_u32(OFF_VS_CONST_VERSION, old_vs_version);
+            LAST_BOUND_STREAM = old_bound_stream;
+            LAST_BOUND_INDEX = old_bound_index;
+            LAST_DRAW_STATE_VALID = old_state_valid;
+            LAST_DRAW_STATE_PIPELINE_KEY = old_state_pipeline;
+            LAST_DRAW_STATE_VS_VERSION = old_state_vs_version;
+            LAST_DRAW_STATE_PS_VERSION = old_state_ps_version;
+            LAST_DRAW_STATE_BIND_GROUP_KEY = old_state_bind;
+            LAST_DRAW_STATE_OFFSET = old_state_offset;
+            LAST_DRAW_STATE_IDENTITY = old_state_identity;
+            LAST_WBUF_COMPACT_OFFSET = -1;
+            return -1;
+        }
+        at += 8;
+        recorded += 1;
+    }
+    LAST_WBUF_COMPACT_OFFSET = compact_offset;
+    recorded as i32
+}
+
 /// IDirect3DDevice9_DrawPrimitiveUP — capture-at-call: copies `byte_len` bytes from the
 /// GUEST vertex pointer into the frame bump arena immediately (before returning), same
 /// timing guarantee as the legacy synchronous JS path. The executor reads the recorded
@@ -1000,5 +1279,179 @@ unsafe fn copy_guest_bytes(guest_src: i32, dst_off: usize, len: u32) -> Result<(
         Ok(())
     } else {
         Err(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::guest_mem::{set_guest_mem, GuestMem};
+    use std::sync::Mutex;
+
+    const GUEST_BASE: i32 = 0x1000;
+    static mut GUEST: [u32; 4096 / 4] = [0; 4096 / 4];
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn read_guest(addr: i32, dst: *mut u8, len: u32) -> bool {
+        let off = addr.wrapping_sub(GUEST_BASE);
+        if off < 0 || off as usize > 4096usize.saturating_sub(len as usize) { return false; }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                addr_of!(GUEST).cast::<u8>().add(off as usize), dst, len as usize,
+            );
+        }
+        true
+    }
+
+    unsafe fn install_run(second_device: u32) -> u32 {
+        let words = std::slice::from_raw_parts_mut(addr_of_mut!(GUEST).cast::<u32>(), 4096 / 4);
+        let packet: [u32; 32] = [
+            11, 99, 4, 1, 1, 2, 3, 4,
+            22, 99, 4, 0, 0, 3, 7, 2,
+            11, 99, 4, 1, 5, 6, 7, 8,
+            22, second_device, 4, 0, 0, 3, 11, 3,
+        ];
+        words[..packet.len()].copy_from_slice(&packet);
+        (packet.len() * 4) as u32
+    }
+
+    unsafe fn prepare_arena() {
+        set_guest_mem(GuestMem { read_block: read_guest });
+        d3d9_reset_frame();
+        wr_u32(OFF_VS_HANDLE, 1);
+        wr_u32(OFF_PS_HANDLE, 1);
+        *(arena_ptr().add(OFF_SHADER_CONST_LEN_VS + 2).cast::<u16>()) = 32;
+        *(arena_ptr().add(OFF_SHADER_CONST_LEN_PS + 2).cast::<u16>()) = 4;
+        wr_u32(OFF_STREAM_SOURCE, 10);
+        wr_u32(OFF_STREAM_SOURCE + 4, 0);
+        wr_u32(OFF_STREAM_SOURCE + 8, 32);
+        wr_u32(OFF_INDEX_BUFFER, 20);
+        wr_u32(OFF_INDEX_BUFFER + 4, 16);
+    }
+
+    #[test]
+    fn wbuf_indexed_run_is_atomic_and_captures_each_constant_value() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            prepare_arena();
+            let len = install_run(99);
+            assert_eq!(d3d9_record_wbuf_indexed_run(GUEST_BASE, len, 11, 22, 99, 32, 0, 0, 0), 2);
+            assert_eq!(rd_u32(OFF_COMMAND_COUNT), 8);
+            assert_eq!(rd_u32(OFF_CMD_TYPES + 4 * 4), CMD_DRAW_INDEXED);
+            assert_eq!(rd_u32(OFF_CMD_A + 4 * 4), 6);
+            assert_eq!(rd_u32(OFF_CMD_B + 4 * 4), 7);
+            assert_eq!(rd_u32(OFF_CMD_TYPES + 7 * 4), CMD_DRAW_INDEXED);
+            assert_eq!(rd_u32(OFF_CMD_A + 7 * 4), 9);
+            assert_eq!(rd_u32(OFF_CMD_B + 7 * 4), 11);
+            assert_eq!(rd_u32(OFF_VS_CONSTANTS + 16 * 4), 5);
+            let first_state = rd_u32(OFF_CMD_B + 2 * 4) as usize;
+            assert_eq!(rd_u32(OFF_BUMP_ARENA + first_state + DRAW_STATE_HEADER_LEN + 16 * 4), 1);
+        }
+    }
+
+    #[test]
+    fn malformed_wbuf_run_declines_without_mutation() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            prepare_arena();
+            wr_u32(OFF_VS_CONSTANTS + 16 * 4, 0xdead_beef);
+            let len = install_run(100);
+            let command_before = rd_u32(OFF_COMMAND_COUNT);
+            let bump_before = rd_u32(OFF_BUMP_CURSOR);
+            assert_eq!(d3d9_record_wbuf_indexed_run(GUEST_BASE, len, 11, 22, 99, 32, 0, 0, 0), -1);
+            assert_eq!(rd_u32(OFF_COMMAND_COUNT), command_before);
+            assert_eq!(rd_u32(OFF_BUMP_CURSOR), bump_before);
+            assert_eq!(rd_u32(OFF_VS_CONSTANTS + 16 * 4), 0xdead_beef);
+        }
+    }
+
+    #[test]
+    fn truncated_wbuf_constant_payload_declines_without_panicking_or_mutation() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            prepare_arena();
+            let words = std::slice::from_raw_parts_mut(
+                addr_of_mut!(GUEST).cast::<u32>(), 4096 / 4,
+            );
+            // vec_count=256 is valid against the 1024-float VS bank, but the packet ends
+            // immediately after its header. Validation must reject before advancing `at`.
+            words[..4].copy_from_slice(&[11, 99, 0, 256]);
+            wr_u32(OFF_VS_CONSTANTS, 0xdead_beef);
+            let command_before = rd_u32(OFF_COMMAND_COUNT);
+            let bump_before = rd_u32(OFF_BUMP_CURSOR);
+            assert_eq!(
+                d3d9_record_wbuf_indexed_run(GUEST_BASE, 16, 11, 22, 99, 32, 0, 0, 0),
+                -1,
+            );
+            assert_eq!(rd_u32(OFF_COMMAND_COUNT), command_before);
+            assert_eq!(rd_u32(OFF_BUMP_CURSOR), bump_before);
+            assert_eq!(rd_u32(OFF_VS_CONSTANTS), 0xdead_beef);
+        }
+    }
+
+    #[test]
+    fn compact_wbuf_run_emits_sparse_payload_without_draw_rows() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            prepare_arena();
+            let len = install_run(99);
+            let words = std::slice::from_raw_parts_mut(
+                addr_of_mut!(GUEST).cast::<u32>(), 4096 / 4,
+            );
+            // Compact physical instancing requires the geometry tuple to be identical.
+            words[30] = 7;
+            words[31] = 2;
+            assert_eq!(
+                d3d9_record_wbuf_indexed_run(
+                    GUEST_BASE, len, 11, 22, 99, 32, 0, 2, 64,
+                ),
+                2,
+            );
+            assert_eq!(rd_u32(OFF_COMMAND_COUNT), 0);
+            let offset = d3d9_get_last_wbuf_compact_offset();
+            assert!(offset >= 0);
+            let header = OFF_BUMP_ARENA + offset as usize;
+            assert_eq!(rd_u32(header), COMPACT_RUN_MAGIC_SPARSE);
+            assert_eq!(rd_u32(header + 4), 2);
+            assert_eq!(rd_u32(header + 8), 4);
+            assert_eq!(rd_u32(header + 12), 4);
+            assert_eq!(rd_u32(header + 20), 8);
+            assert_eq!(rd_u32(header + 24), 6);
+            let payload = rd_u32(header + 16) as usize;
+            assert_eq!(rd_u32(OFF_BUMP_ARENA + payload), 1);
+            assert_eq!(rd_u32(OFF_BUMP_ARENA + payload + 4 * 4), 5);
+            assert_eq!(rd_u32(OFF_VS_CONSTANTS + 16 * 4), 5);
+        }
+    }
+
+    #[test]
+    fn storage_ready_compact_run_expands_template_in_rust() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            prepare_arena();
+            let len = install_run(99);
+            let words = std::slice::from_raw_parts_mut(
+                addr_of_mut!(GUEST).cast::<u32>(), 4096 / 4,
+            );
+            words[30] = 7;
+            words[31] = 2;
+            for word in 0..24 {
+                COMPACT_RUN_TEMPLATE[word] = 100 + word as u32;
+            }
+            assert_eq!(d3d9_set_compact_template_words(24), 24);
+            assert_eq!(
+                d3d9_record_wbuf_indexed_run(
+                    GUEST_BASE, len, 11, 22, 99, 32, 0, 3, 64,
+                ),
+                2,
+            );
+            let header = OFF_BUMP_ARENA + d3d9_get_last_wbuf_compact_offset() as usize;
+            assert_eq!(rd_u32(header), COMPACT_RUN_MAGIC_STORAGE);
+            assert_eq!(rd_u32(header + 9 * 4), 24);
+            let payload = rd_u32(header + 16) as usize;
+            assert_eq!(rd_u32(OFF_BUMP_ARENA + payload), 100);
+            assert_eq!(rd_u32(OFF_BUMP_ARENA + payload + 16 * 4), 1);
+            assert_eq!(rd_u32(OFF_BUMP_ARENA + payload + (24 + 16) * 4), 5);
+        }
     }
 }
