@@ -8,7 +8,7 @@ use crate::cpu::cpu::{
 };
 use crate::cpu::global_pointers;
 use crate::gen;
-use crate::jit::{Instruction, InstructionOperand, InstructionOperandDest, JitContext};
+use crate::jit::{gen_tier2_note_retired, Instruction, InstructionOperand, InstructionOperandDest, JitContext};
 use crate::modrm::{jit_add_seg_offset, jit_add_seg_offset_no_override, ModrmByte};
 use crate::prefix::{PREFIX_66, PREFIX_67, PREFIX_F2, PREFIX_F3};
 use crate::prefix::{PREFIX_MASK_SEGMENT, SEG_PREFIX_ZERO};
@@ -4594,33 +4594,98 @@ pub fn instr16_FF_2_reg_jit(ctx: &mut JitContext, r: u32) {
     ctx.builder
         .store_aligned_i32(global_pointers::instruction_pointer as u32);
 }
+
+fn gen_indirect_call32(ctx: &mut JitContext, new_eip: WasmLocal) {
+    crate::jit::wbuf_intrinsic_note_call32(ctx.cpu.ssize_32());
+    // Win32 WBUF intrinsic: only 32-bit stacks are eligible. The normal path below
+    // remains exact for misses, overflow, unregistered targets, and 16-bit stacks.
+    if ctx.cpu.ssize_32() {
+        ctx.builder.const_i32(-1);
+        let cleanup = ctx.builder.set_new_local();
+
+        // A helper call, not inline codegen: the hash probe and copy loops repeated at every
+        // indirect CALL site bloat modules enough to cost more than the call saves.
+        ctx.builder
+            .load_fixed_i32(crate::jit::wbuf_intrinsic_enabled_ptr());
+        ctx.builder.if_void();
+        ctx.builder.get_local(&new_eip);
+        ctx.builder
+            .load_fixed_i32(crate::jit::wbuf_intrinsic_hot_min_target_ptr());
+        ctx.builder.geu_i32();
+        ctx.builder
+            .load_fixed_i32(crate::jit::wbuf_intrinsic_hot_max_target_ptr());
+        ctx.builder.get_local(&new_eip);
+        ctx.builder.geu_i32();
+        ctx.builder.and_i32();
+        ctx.builder.if_void();
+        ctx.builder.get_local(&new_eip);
+        codegen::gen_get_reg32(ctx, regs::ESP);
+        ctx.builder
+            .load_fixed_i32(global_pointers::get_seg_offset(regs::SS));
+        ctx.builder.add_i32();
+        ctx.builder.call_fn2_ret("jit_wbuf_intrinsic_execute");
+        ctx.builder.set_local(&cleanup);
+        ctx.builder.block_end();
+        ctx.builder.block_end();
+
+        ctx.builder.get_local(&cleanup);
+        ctx.builder.const_i32(0);
+        ctx.builder.ge_i32();
+        ctx.builder.if_void();
+
+        codegen::gen_get_reg32(ctx, regs::ESP);
+        ctx.builder.get_local(&cleanup);
+        ctx.builder.add_i32();
+        codegen::gen_set_reg32(ctx, regs::ESP);
+
+        // Match the canonical trampoline's caller-visible ABI. Its XOR EAX,EAX executes
+        // under PUSHFD/POPFD, so EAX becomes zero while the incoming EFLAGS are preserved.
+        // ECX is caller-saved but deliberately left untouched.
+        ctx.builder.const_i32(0);
+        codegen::gen_set_reg32(ctx, regs::EAX);
+        ctx.builder.const_i32(0xB077);
+        codegen::gen_set_reg32(ctx, regs::EDX);
+
+        codegen::gen_set_eip_to_after_current_instruction(ctx);
+
+        ctx.builder.else_();
+        codegen::gen_get_real_eip(ctx);
+        let return_eip = ctx.builder.set_new_local();
+        codegen::gen_push32(ctx, &return_eip);
+        ctx.builder.free_local(return_eip);
+
+        ctx.builder.const_i32(0);
+        ctx.builder.get_local(&new_eip);
+        ctx.builder
+            .store_aligned_i32(global_pointers::instruction_pointer as u32);
+        ctx.builder.block_end();
+        ctx.builder.free_local(cleanup);
+    }
+    else {
+        codegen::gen_get_real_eip(ctx);
+        let return_eip = ctx.builder.set_new_local();
+        codegen::gen_push32(ctx, &return_eip);
+        ctx.builder.free_local(return_eip);
+
+        ctx.builder.const_i32(0);
+        ctx.builder.get_local(&new_eip);
+        ctx.builder
+            .store_aligned_i32(global_pointers::instruction_pointer as u32);
+    }
+    ctx.builder.free_local(new_eip);
+}
+
 pub fn instr32_FF_2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
     codegen::gen_add_cs_offset(ctx);
     let new_eip = ctx.builder.set_new_local();
-
-    codegen::gen_get_real_eip(ctx);
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_push32(ctx, &value_local);
-    ctx.builder.free_local(value_local);
-
-    ctx.builder.const_i32(0);
-    ctx.builder.get_local(&new_eip);
-    ctx.builder
-        .store_aligned_i32(global_pointers::instruction_pointer as u32);
-    ctx.builder.free_local(new_eip);
+    gen_indirect_call32(ctx, new_eip);
 }
 pub fn instr32_FF_2_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_get_real_eip(ctx);
-    let value_local = ctx.builder.set_new_local();
-    codegen::gen_push32(ctx, &value_local);
-    ctx.builder.free_local(value_local);
-
-    ctx.builder.const_i32(0);
     codegen::gen_get_reg32(ctx, r);
     codegen::gen_add_cs_offset(ctx);
-    ctx.builder
-        .store_aligned_i32(global_pointers::instruction_pointer as u32);
+    let new_eip = ctx.builder.set_new_local();
+    gen_indirect_call32(ctx, new_eip);
 }
 
 pub fn instr16_FF_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -4841,6 +4906,7 @@ fn gen_popf(ctx: &mut JitContext, is_32: bool) {
         codegen::gen_move_registers_from_locals_to_memory(ctx);
         codegen::gen_fn0_const(ctx.builder, "handle_irqs");
 
+        gen_tier2_note_retired(ctx);
         codegen::gen_update_instruction_counter(ctx);
         ctx.builder.return_();
     }

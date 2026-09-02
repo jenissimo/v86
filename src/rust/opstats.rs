@@ -1,6 +1,41 @@
 use crate::wasmgen::wasm_builder::WasmBuilder;
 
-const SIZE: usize = if cfg!(feature = "profiler") { 8192 } else { 0 };
+// The census used to exist only in a `profiler` build, whose shipping counterpart
+// exported a stub returning zeros — a readout indistinguishable from "this game runs no
+// x87". It is now a RUNTIME switch instead: production emits nothing (the flag is off, so
+// no increment is generated), and a census run flips the flag and clears the JIT cache so
+// hot code recompiles with the counters in it. Cost when off is the static buffers below.
+const SIZE: usize = 8192;
+
+#[allow(non_upper_case_globals)]
+pub static mut OPSTATS_ENABLED: bool = false;
+
+pub fn opstats_enabled() -> bool { unsafe { OPSTATS_ENABLED } }
+
+/// Turn census emission on/off. Only blocks compiled while this is on carry the
+/// increments, so the caller must clear the JIT cache and let the workload warm up.
+#[no_mangle]
+pub fn set_opstats(enabled: u32) { unsafe { OPSTATS_ENABLED = enabled != 0 } }
+
+#[no_mangle]
+pub fn get_opstats() -> u32 { unsafe { OPSTATS_ENABLED as u32 } }
+
+#[no_mangle]
+pub fn opstats_reset() {
+    unsafe {
+        #[allow(static_mut_refs)]
+        for b in [
+            &mut opstats_buffer, &mut opstats_compiled_buffer, &mut opstats_jit_exit_buffer,
+            &mut opstats_unguarded_register_buffer, &mut opstats_wasm_size,
+        ] {
+            for x in b.iter_mut() { *x = 0 }
+        }
+        #[allow(static_mut_refs)]
+        for x in opstats_addr_buffer.iter_mut() { *x = 0 }
+        #[allow(static_mut_refs)]
+        for x in opstats_simd_buffer.iter_mut() { *x = 0 }
+    }
+}
 
 #[allow(non_upper_case_globals)]
 pub static mut opstats_buffer: [u64; SIZE] = [0; SIZE];
@@ -19,14 +54,29 @@ pub struct Instruction {
     pub fixed_g: u8,
     pub is_mem: bool,
     pub is_0f: bool,
+    /// The ModRM byte, when the opcode has one, and the SIB byte when ModRM asks for one.
+    /// `is_mem` alone cannot tell `[esp+8]` from `[eax+ebx*4]`, and that difference is the
+    /// whole question behind stack fastmem (roadmap 02) and the permission bitmap (03).
+    pub modrm: u8,
+    pub has_modrm: bool,
+    pub sib: u8,
+    pub has_sib: bool,
+    /// A 0x67 prefix was present, so the ModRM encoding is the 16-bit one. Classified as
+    /// its own bucket rather than mis-modelled as a 32-bit form.
+    pub addr16: bool,
 }
 
-pub fn decode(mut instruction: u32) -> Instruction {
+pub fn decode(instruction: u32) -> Instruction { decode64(instruction as u64) }
+
+/// The same prefix walk over up to eight bytes. A prefixed 0F opcode pushes its SIB byte
+/// past the fourth byte (`66 0F 6F 44 24 10`), so a u32 cannot see the operand form.
+pub fn decode64(bytes: u64) -> Instruction {
+    let mut instruction = bytes;
     let mut is_0f = false;
     let mut prefixes = vec![];
     let mut final_opcode = 0;
 
-    for _ in 0..4 {
+    for _ in 0..7 {
         let opcode = (instruction & 0xFF) as u8;
         instruction >>= 8;
 
@@ -116,16 +166,20 @@ pub fn decode(mut instruction: u32) -> Instruction {
     let mut is_mem = false;
     let mut fixed_g = 0;
 
+    let modrm = (instruction & 0xFF) as u8;
     if has_fixed_g {
         dbg_assert!(has_modrm_byte);
-        let modrm_byte = (instruction & 0xFF) as u8;
-        fixed_g = modrm_byte >> 3 & 7;
-        is_mem = modrm_byte < 0xC0
+        fixed_g = modrm >> 3 & 7;
+        is_mem = modrm < 0xC0
     }
     if has_modrm_byte {
-        let modrm_byte = (instruction & 0xFF) as u8;
-        is_mem = modrm_byte < 0xC0
+        is_mem = modrm < 0xC0
     }
+    let addr16 = prefixes.contains(&0x67);
+    // A SIB byte follows ModRM only in 32-bit addressing, for a memory operand whose
+    // rm field is 4. In 16-bit addressing that encoding means [si], not "see SIB".
+    let has_sib = has_modrm_byte && !addr16 && modrm < 0xC0 && (modrm & 7) == 4;
+    let sib = if has_sib { ((instruction >> 8) & 0xFF) as u8 } else { 0 };
 
     Instruction {
         prefixes,
@@ -133,15 +187,111 @@ pub fn decode(mut instruction: u32) -> Instruction {
         is_mem,
         fixed_g,
         is_0f,
+        modrm,
+        has_modrm: has_modrm_byte,
+        sib,
+        has_sib,
+        addr16,
     }
 }
 
-pub fn gen_opstats(builder: &mut WasmBuilder, opcode: u32) {
-    if !cfg!(feature = "profiler") {
+
+// ---------------------------------------------------------------------------
+// Addressing-form census (roadmap 02/03)
+// ---------------------------------------------------------------------------
+//
+// `is_mem` says an instruction touches memory; it cannot say through WHAT. The share of
+// accesses that are ESP/EBP-based with a constant displacement is the ceiling on stack
+// fastmem, and the remainder is what a permission bitmap would have to serve. Guessing
+// that split from a proxy demo is what the last campaign did.
+//
+// This side does bit extraction ONLY. What counts as "the stack class", "absolute" or
+// "base+index" is a question about x86 semantics, and it is answered once — in
+// TypeScript, where it has a unit test over a table of encodings
+// (tools/tests/guest-opcode-census.test.ts). Two implementations of a judgement drift;
+// one implementation plus a mechanical feed does not.
+//
+// Only instructions with an explicit ModRM memory operand are counted here, so the sum of
+// this buffer must equal the `is_mem` half of the opcode census — an independent
+// cross-check between two separately produced numbers, not an identity.
+
+pub const ADDRKEY_COUNT: usize = 256;
+
+#[allow(non_upper_case_globals)]
+pub static mut opstats_addr_buffer: [u64; ADDRKEY_COUNT] = [0; ADDRKEY_COUNT];
+
+#[no_mangle]
+pub fn get_opstats_addr(index: u32) -> f64 {
+    if (index as usize) < ADDRKEY_COUNT { unsafe { opstats_addr_buffer[index as usize] as f64 } } else { 0.0 }
+}
+
+/// bit 7 addr16 | bit 6 has_sib | bits 5-4 mod | bits 3-1 base (SIB base, else rm) |
+/// bit 0 index present (SIB index != 4).
+pub fn addr_key(i: &Instruction) -> u32 {
+    let md = (i.modrm >> 6 & 3) as u32;
+    let base = if i.has_sib { (i.sib & 7) as u32 } else { (i.modrm & 7) as u32 };
+    let index_present = if i.has_sib && (i.sib >> 3 & 7) != 4 { 1 } else { 0 };
+    (i.addr16 as u32) << 7 | (i.has_sib as u32) << 6 | md << 4 | base << 1 | index_present
+}
+
+pub fn gen_addr_stat(builder: &mut WasmBuilder, i: &Instruction) {
+    // is_mem is only ever set from a ModRM byte, so the second test is an invariant, not
+    // a case: without a ModRM the key below would be extracted from whatever byte follows.
+    if !i.is_mem || !i.has_modrm { return; }
+    builder.increment_fixed_i64(
+        unsafe { &mut opstats_addr_buffer[addr_key(i) as usize] as *mut _ } as u32,
+        1,
+    );
+}
+
+// The 0F census key drops prefixes, and for SIMD the prefix IS the family: 0F 58 is
+// ADDPS, 66 0F 58 ADDPD, F3 0F 58 ADDSS, F2 0F 58 ADDSD, and the unprefixed integer forms
+// are MMX rather than SSE. Reporting all of those as one row would answer "how much SSE2"
+// with a number that also contains MMX. One extra buffer, keyed by the mandatory prefix,
+// keeps the families apart; the naming of the families stays in TypeScript.
+
+pub const SIMDKEY_COUNT: usize = 1024;
+
+#[allow(non_upper_case_globals)]
+pub static mut opstats_simd_buffer: [u64; SIMDKEY_COUNT] = [0; SIMDKEY_COUNT];
+
+#[no_mangle]
+pub fn get_opstats_simd(index: u32) -> f64 {
+    if (index as usize) < SIMDKEY_COUNT { unsafe { opstats_simd_buffer[index as usize] as f64 } } else { 0.0 }
+}
+
+/// 0 = none (MMX / packed-single), 1 = 0x66, 2 = 0xF3, 3 = 0xF2. The LAST such prefix
+/// wins, which is what the hardware does.
+fn mandatory_prefix(i: &Instruction) -> u32 {
+    let mut p = 0;
+    for &b in i.prefixes.iter() {
+        match b {
+            0x66 => p = 1,
+            0xF3 => p = 2,
+            0xF2 => p = 3,
+            _ => {},
+        }
+    }
+    p
+}
+
+pub fn gen_simd_stat(builder: &mut WasmBuilder, i: &Instruction) {
+    if !i.is_0f { return; }
+    let key = mandatory_prefix(i) << 8 | i.opcode as u32;
+    builder.increment_fixed_i64(
+        unsafe { &mut opstats_simd_buffer[key as usize] as *mut _ } as u32,
+        1,
+    );
+}
+
+pub fn gen_opstats(builder: &mut WasmBuilder, opcode: u64) {
+    if !opstats_enabled() {
         return;
     }
 
-    let instruction = decode(opcode);
+    let instruction = decode64(opcode);
+    gen_addr_stat(builder, &instruction);
+    gen_simd_stat(builder, &instruction);
 
     for prefix in instruction.prefixes {
         let index = (prefix as u32) << 4;
@@ -162,12 +312,12 @@ pub fn gen_opstats(builder: &mut WasmBuilder, opcode: u32) {
     );
 }
 
-pub fn record_opstat_compiled(opcode: u32) {
-    if !cfg!(feature = "profiler") {
+pub fn record_opstat_compiled(opcode: u64) {
+    if !opstats_enabled() {
         return;
     }
 
-    let instruction = decode(opcode);
+    let instruction = decode64(opcode);
 
     for prefix in instruction.prefixes {
         let index = (prefix as u32) << 4;
@@ -183,7 +333,7 @@ pub fn record_opstat_compiled(opcode: u32) {
 }
 
 pub fn record_opstat_jit_exit(opcode: u32) {
-    if !cfg!(feature = "profiler") {
+    if !opstats_enabled() {
         return;
     }
 
@@ -203,7 +353,7 @@ pub fn record_opstat_jit_exit(opcode: u32) {
 }
 
 pub fn gen_opstat_unguarded_register(builder: &mut WasmBuilder, opcode: u32) {
-    if !cfg!(feature = "profiler") {
+    if !opstats_enabled() {
         return;
     }
 
@@ -228,12 +378,12 @@ pub fn gen_opstat_unguarded_register(builder: &mut WasmBuilder, opcode: u32) {
     );
 }
 
-pub fn record_opstat_size_wasm(opcode: u32, size: u64) {
-    if !cfg!(feature = "profiler") {
+pub fn record_opstat_size_wasm(opcode: u64, size: u64) {
+    if !opstats_enabled() {
         return;
     }
 
-    let instruction = decode(opcode);
+    let instruction = decode64(opcode);
 
     for prefix in instruction.prefixes {
         let index = (prefix as u32) << 4;

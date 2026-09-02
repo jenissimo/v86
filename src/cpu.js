@@ -396,9 +396,9 @@ CPU.prototype.wasm_patch = function()
     }
 
     const jit_config_abi = this.jit_config_abi_version() >>> 0;
-    if(jit_config_abi !== 1)
+    if(jit_config_abi !== 4)
     {
-        throw new Error("Unsupported JIT config ABI: expected 1, got " + jit_config_abi);
+        throw new Error("Unsupported JIT config ABI: expected 4, got " + jit_config_abi);
     }
     this.jit_config_supported_mask_value = this.jit_config_supported_mask() >>> 0;
     this.set_jit_config_raw = this.set_jit_config;
@@ -1819,8 +1819,13 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         compileStats["bytes"] = (compileStats["bytes"] | 0) + len;
     }
 
+    // `pages` absent = capture EVERY module. A page set can only name what is already hot,
+    // and over a play session the pages that matter become hot progressively — arming on the
+    // current tier-2 set records the warm-up and misses the game. `maxPages` bounds the
+    // wildcard: past it, records are DROPPED and counted, so a truncated capture is visible
+    // as a number rather than as a quietly short unit list.
     const wasmDump = globalThis["__wasmDump"];
-    if(wasmDump && wasmDump["pages"] && wasmDump["pages"].has(start >>> 12))
+    if(wasmDump && (!wasmDump["pages"] || wasmDump["pages"].has(start >>> 12)))
     {
         const rec = {
             "start": start >>> 0,
@@ -1838,7 +1843,12 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         {
             const page = start >>> 12;
             const i = out.findIndex(r => (r["start"] >>> 12) === page);
-            if(i >= 0) { out[i] = rec; } else { out.push(rec); }
+            if(i >= 0) { out[i] = rec; }
+            else if(wasmDump["maxPages"] && out.length >= wasmDump["maxPages"])
+            {
+                wasmDump["dropped"] = (wasmDump["dropped"] | 0) + 1;
+            }
+            else { out.push(rec); }
         }
         else
         {

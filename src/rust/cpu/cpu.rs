@@ -329,6 +329,18 @@ pub static mut tsc_offset: u64 = 0;
 
 pub static mut tlb_data: [i32; 0x100000] = [0; 0x100000];
 
+/// THE ONLY writer of `tlb_data`.
+///
+/// The permission bitmap (cpu/perm_map.rs) is a mirror of this table, and the one thing
+/// that keeps a mirror honest is having a single place where the two are written together.
+/// A desynced byte is a missing page fault or a read of the wrong page, with nothing to
+/// notice it — `tools/validate-tlb-mirror.mjs` fails the build if a second writer appears.
+#[inline]
+pub unsafe fn set_tlb_entry(page: i32, entry: i32) {
+    tlb_data[page as usize] = entry;
+    crate::cpu::perm_map::perm_map[page as usize] = crate::cpu::perm_map::perm_byte_of(page, entry);
+}
+
 pub static mut valid_tlb_entries: [i32; 10000] = [0; 10000];
 pub static mut valid_tlb_entries_count: i32 = 0;
 
@@ -2099,6 +2111,26 @@ pub unsafe fn writable_or_pagefault_cpl(other_cpl: u8, addr: i32, size: i32) -> 
 pub fn translate_address_read_no_side_effects(address: i32) -> OrPageFault<u32> {
     unsafe { translate_address(address, false, *cpl == 3, false, false) }
 }
+
+/// Speculative translation for a caller that must be able to DECLINE: no #PF, no
+/// accessed/dirty update, no TLB fill. `None` also for a device-mapped page, since the
+/// callers of this reach guest bytes through `mem8` and would bypass the device.
+pub unsafe fn translate_address_no_fault(address: i32, for_writing: bool) -> Option<u32> {
+    let user = *cpl == 3;
+    let mut entry = tlb_data[(address as u32 >> 12) as usize];
+    if entry
+        & (TLB_VALID
+            | if user { TLB_NO_USER } else { 0 }
+            | if for_writing { TLB_READONLY } else { 0 })
+        != TLB_VALID
+    {
+        entry = do_page_walk(address, for_writing, user, false, false).ok()?.get();
+    }
+    if entry & TLB_IN_MAPPED_RANGE != 0 {
+        return None;
+    }
+    Some((entry & !0xFFF ^ address) as u32 - memory::mem8 as u32)
+}
 pub fn translate_address_read(address: i32) -> OrPageFault<u32> {
     unsafe { translate_address(address, false, *cpl == 3, false, true) }
 }
@@ -2373,7 +2405,7 @@ pub unsafe fn do_page_walk(
     if side_effects {
         // bake in the addition with memory::mem8 to save an instruction from the fast path
         // of memory accesses
-        tlb_data[page as usize] = tlb_entry;
+        set_tlb_entry(page, tlb_entry);
 
         jit::update_tlb_code(Page::page_of(addr as u32), Page::page_of(high));
     }
@@ -2397,7 +2429,7 @@ pub unsafe fn full_clear_tlb() {
     for i in 0..valid_tlb_entries_count {
         let page = valid_tlb_entries[i as usize];
         clear_tlb_code(page);
-        tlb_data[page as usize] = 0;
+        set_tlb_entry(page, 0);
     }
     valid_tlb_entries_count = 0;
 
@@ -2428,7 +2460,7 @@ pub unsafe fn clear_tlb() {
         }
         else {
             clear_tlb_code(page);
-            tlb_data[page as usize] = 0;
+            set_tlb_entry(page, 0);
         }
     }
     valid_tlb_entries_count = global_page_offset;
@@ -2516,7 +2548,7 @@ pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: boo
     let page = ((addr as u32) >> 12) as i32;
     crate::cpu::hypercall_eagl::eagl_read_cursor_invalidate();
     clear_tlb_code(page);
-    tlb_data[page as usize] = 0;
+    set_tlb_entry(page, 0);
     let error_code = (user as i32) << 2 | (write as i32) << 1 | present as i32;
     if jit {
         jit_fault = Some((CPU_EXCEPTION_PF, Some(error_code)));
@@ -2546,8 +2578,7 @@ pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
             );
             if physical_page == tlb_physical_page {
                 unsafe {
-                    tlb_data[page as usize] =
-                        if has_code { entry | TLB_HAS_CODE } else { entry & !TLB_HAS_CODE }
+                    set_tlb_entry(page, if has_code { entry | TLB_HAS_CODE } else { entry & !TLB_HAS_CODE });
                 }
                 if !has_code {
                     clear_tlb_code(page);
@@ -2580,8 +2611,7 @@ pub fn tlb_set_has_code_multiple(physical_pages: &HashSet<Page>, has_code: bool)
             );
             if physical_pages.contains(&tlb_physical_page) {
                 unsafe {
-                    tlb_data[page as usize] =
-                        if has_code { entry | TLB_HAS_CODE } else { entry & !TLB_HAS_CODE }
+                    set_tlb_entry(page, if has_code { entry | TLB_HAS_CODE } else { entry & !TLB_HAS_CODE });
                 }
             }
         }
@@ -3180,6 +3210,8 @@ pub unsafe fn cycle_internal() {
     profiler::stat_increment(stat::CYCLE_INTERNAL);
     let mut jit_entry = None;
     let initial_eip = *instruction_pointer;
+    // Which ADDRESS the dispatcher re-entered at (roadmap 07). No-op unless DISPATCH_STATS.
+    jit::note_entry_eip(initial_eip as u32);
     // dbg_on_instruction stays: it's gated by DBG_ENABLED (off by default), the guest debugger's
     // interpreter hook.
     // BottleShip: when ONLY breakpoints are active (no step-trace), restrict the per-block hook to
@@ -3193,9 +3225,8 @@ pub unsafe fn cycle_internal() {
     }
     let initial_state_flags = *state_flags;
 
-    // Tier-2 promotions owed to CHAINED module entries. They are counted inside a live
-    // generated frame (jit::chain_note_execution) but can only be APPLIED here, between
-    // module entries — the same safe point jit_tier2_note_execution promotes at below.
+    // Tier-2 promotions owed to retired instructions. Generated modules queue them while
+    // live; they can only be APPLIED here, between module entries.
     // Draining before the dispatch lookup means a module freed by the drain is already
     // gone from dispatch meta when we look, so this slice runs interpreted with no extra
     // check. No-op cost is one static load and a branch.
@@ -3219,10 +3250,8 @@ pub unsafe fn cycle_internal() {
 
             if initial_state_flags == unit_state_flags {
                 if unit_state != u16::MAX {
-                    // B3 hotness tiering: returns true when this module just crossed the
-                    // tier-2 threshold and was freed — don't dispatch into it; run
-                    // interpreted this slice and let hotness recompile it with the
-                    // tier-2 budget.
+                    // Entry census for V8 tier diagnostics. Retired-instruction promotion
+                    // was drained above and can no longer free this target here.
                     if jit::jit_tier2_note_execution(unit_index) {
                         profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_CODE);
                     }
@@ -4737,8 +4766,10 @@ pub unsafe fn vm86_mode() -> bool { return *flags & FLAG_VM == FLAG_VM; }
 #[no_mangle]
 pub unsafe fn getiopl() -> i32 { return *flags >> 12 & 3; }
 
+// The census is a runtime switch, not a build (opstats.rs). The reader is therefore
+// always present with its real signature; `get_opstats()` is the provenance bit that says
+// whether anything was counting, and arity no longer means anything.
 #[no_mangle]
-#[cfg(feature = "profiler")]
 pub unsafe fn get_opstats_buffer(
     compiled: bool,
     jit_exit: bool,
@@ -4772,10 +4803,6 @@ pub unsafe fn get_opstats_buffer(
     }
 }
 
-#[no_mangle]
-#[cfg(not(feature = "profiler"))]
-pub unsafe fn get_opstats_buffer() -> f64 { 0.0 }
-
 pub fn clear_tlb_code(page: i32) {
     // A code-TLB eviction invalidates dispatch targets the stock resolvers would
     // re-derive from the dispatch SoA on the next probe; the B1b ret-target memo
@@ -4797,7 +4824,7 @@ pub unsafe fn invlpg(addr: i32) {
     // empties by calling clear_tlb, which removes this entry as it isn't global.
     // This however means that valid_tlb_entries can contain some invalid entries
     clear_tlb_code(page);
-    tlb_data[page as usize] = 0;
+    set_tlb_entry(page, 0);
     *last_virt_eip = -1;
 }
 

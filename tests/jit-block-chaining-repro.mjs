@@ -17,6 +17,97 @@ const ITER = 800000;
 const MEM_SIZE = 16 * 1024 * 1024;
 const TIMEOUT_MS = 12000;
 
+// Exercise the exported resolver directly after the guest has populated both pages.
+// This makes the guards deterministic instead of hoping that a scheduler tick happens
+// at a particular edge. Every probe passes a distinct retired count, so their sum also
+// detects either lost or double accounting on hit and fallback paths.
+function probeDirectChainInvariants(cpu)
+{
+    const w = cpu.wm.exports;
+    const page = (BASE + PAGE1_OFF) >>> 12;
+    const target = BASE + PAGE1_OFF;
+    const metaLo = w.jit_debug_meta_lo(page) >>> 0;
+    const stateFlags = w.jit_debug_meta_hi(page) >>> 0;
+    const tableIndex = metaLo >>> 16;
+    const slab = metaLo & 0xFFFF;
+    if(!metaLo || !slab) throw new Error("direct-chain target page was not published");
+
+    const hp = w.get_hypercall_page_ptr() >>> 0;
+    const data = new DataView(cpu.wasm_memory.buffer);
+    const cell = new Uint16Array(
+        cpu.wasm_memory.buffer,
+        (w.jit_get_dispatch_slabs_ptr() >>> 0) + (slab * 0x1000) * 2,
+        1,
+    );
+    const saved = {
+        eip: cpu.instruction_pointer[0],
+        inHlt: cpu.in_hlt[0],
+        enabled: data.getUint32(hp + 0x008, true),
+        limit: data.getUint32(hp + 0x000, true),
+        cell: cell[0],
+        wrongMode: cpu.get_jit_config(24) >>> 0,
+    };
+    const stat = i => w.profiler_dispatch_stat_get(i) >>> 0;
+    const retiredBefore = w.jit_get_tier2_retired_total();
+    const budgetBefore = stat(6);
+    const missBefore = stat(7);
+    const wrongBefore = w.jit_get_wrong_entry_chain() >>> 0;
+    const retiredInputs = [7, 11, 13, 17, 19, 23, 29];
+
+    try {
+        data.setUint32(hp + 0x008, 1, true);
+        cpu.instruction_pointer[0] = target;
+        cpu.in_hlt[0] = 0;
+
+        data.setUint32(hp + 0x000, 0, true);
+        const urgentExit = w.jit_find_cache_entry_for_chaining(stateFlags, tableIndex, retiredInputs[0]);
+
+        data.setUint32(hp + 0x000, 0xFFFF_FFFF, true);
+        cpu.in_hlt[0] = 1;
+        const hltExit = w.jit_find_cache_entry_for_chaining(stateFlags, tableIndex, retiredInputs[1]);
+
+        cpu.in_hlt[0] = 0;
+        const hit = w.jit_find_cache_entry_for_chaining(stateFlags, tableIndex, retiredInputs[2]);
+
+        cpu.instruction_pointer[0] = target + 1;
+        const noEntryMiss = w.jit_find_cache_entry_for_chaining(stateFlags, tableIndex, retiredInputs[3]);
+
+        cpu.instruction_pointer[0] = target;
+        cpu.set_jit_config(24, 2);
+        const verifiedHit = w.jit_find_cache_entry_for_chaining(
+            stateFlags, tableIndex, retiredInputs[4]);
+        cell[0] = saved.cell === 0xFFFE ? 1 : 0xFFFE;
+        const wrongEntryRefused = w.jit_find_cache_entry_for_chaining(
+            stateFlags, tableIndex, retiredInputs[5]);
+        cell[0] = saved.cell;
+        const restoredHit = w.jit_find_cache_entry_for_chaining(
+            stateFlags, tableIndex, retiredInputs[6]);
+
+        return {
+            urgentExit,
+            hltExit,
+            hit,
+            noEntryMiss,
+            verifiedHit,
+            wrongEntryRefused,
+            restoredHit,
+            budgetExitDelta: (stat(6) - budgetBefore) >>> 0,
+            missDelta: (stat(7) - missBefore) >>> 0,
+            wrongEntryDelta: (w.jit_get_wrong_entry_chain() - wrongBefore) >>> 0,
+            retiredDelta: w.jit_get_tier2_retired_total() - retiredBefore,
+            retiredExpected: retiredInputs.reduce((a, b) => a + b, 0),
+        };
+    }
+    finally {
+        cell[0] = saved.cell;
+        cpu.instruction_pointer[0] = saved.eip;
+        cpu.in_hlt[0] = saved.inHlt;
+        data.setUint32(hp + 0x008, saved.enabled, true);
+        data.setUint32(hp + 0x000, saved.limit, true);
+        cpu.set_jit_config(24, saved.wrongMode);
+    }
+}
+
 function build_image()
 {
     const buf = new Uint8Array(PAGE1_OFF + 16);
@@ -60,7 +151,7 @@ function build_image()
     return buf;
 }
 
-function run()
+function run(chaining)
 {
     return new Promise(resolve => {
         const emulator = new V86({
@@ -69,23 +160,31 @@ function run()
             disable_jit: 0,
             log_level: 0,
         });
-        let halted = false, timer;
+        let halted = false, timer, defaultChaining = 0xFFFF_FFFF;
         const finish = status => {
             clearTimeout(timer);
             try { emulator.stop(); } catch(e) {}
             const cpu = emulator.v86.cpu;
             const dget = cpu.wm.exports["profiler_dispatch_stat_get"];
+            const naturalWrongEntryChain = cpu.wm.exports["jit_get_wrong_entry_chain"]?.() >>> 0;
+            const naturalRetired = cpu.wm.exports["jit_get_tier2_retired_total"]?.() ?? 0;
+            const instructionCounter = cpu.instruction_counter[0] >>> 0;
+            const probe = chaining ? probeDirectChainInvariants(cpu) : null;
             resolve({
                 status,
                 ecx: cpu.reg32[1] >>> 0,
-                // idx 12 = RET dynamic chaining. get_jit_config returns 0 for unknown indices,
-                // so reading a retired index silently disables the assertion below.
-                chaining: cpu.get_jit_config ? cpu.get_jit_config(12) >>> 0 : 0,
+                chaining: cpu.get_jit_config ? cpu.get_jit_config(4) >>> 0 : 0,
                 reentry: dget ? dget(1) : 0,
                 chainableFallback: dget ? dget(2) : 0,
                 chainedEdge: dget ? dget(5) : 0,
                 budgetExit: dget ? dget(6) : 0,
                 miss: dget ? dget(7) : 0,
+                instructionCounter,
+                naturalRetired,
+                naturalWrongEntryChain,
+                chainEntries: cpu.wm.exports["jit_get_tier2_chain_entries"]?.() ?? 0,
+                defaultChaining,
+                probe,
             });
         };
 
@@ -97,7 +196,11 @@ function run()
             const cpu = emulator.v86.cpu;
             cpu.reboot_internal();
             cpu.reset_memory();
+            defaultChaining = cpu.get_jit_config(4) >>> 0;
             cpu.set_jit_config(1, 1); // MAX_PAGES=1, force cross-page module exits
+            cpu.set_jit_config(4, chaining ? 1 : 0);
+            cpu.set_jit_config(15, 0xFFFF_FFFF); // emit accounting, never promote this fixture
+            cpu.set_jit_config(24, 0); // production inline path; probe covers verifier/refusal
             cpu.wm.exports["set_dispatch_stats"]?.(1);
             cpu.wm.exports["profiler_init"]?.();
             cpu.jit_clear_cache?.();
@@ -108,27 +211,62 @@ function run()
     });
 }
 
-const result = await run();
-console.log("jit-block-chaining " + JSON.stringify(result));
+const off = await run(false);
+const on = await run(true);
+console.log("jit-block-chaining " + JSON.stringify({ off, on }));
 
-if(result.status !== "halt" || result.ecx !== 0)
+if(off.status !== "halt" || off.ecx !== 0 || on.status !== "halt" || on.ecx !== 0)
 {
-    console.error("FAIL: loop did not halt cleanly with ecx=0");
+    console.error("FAIL: OFF/ON loop did not halt cleanly with ecx=0");
     process.exit(1);
 }
 
-if(result.chaining)
+if(off.defaultChaining !== 0 || on.defaultChaining !== 0 ||
+   off.chaining !== 0 || on.chaining !== 1)
 {
-    if(result.chainedEdge <= 0)
-    {
-        console.error("FAIL: JIT_BLOCK_CHAINING enabled but CHAINED_EDGE stayed zero");
-        process.exit(1);
-    }
+    console.error("FAIL: idx 4 did not report the requested OFF/ON state");
+    process.exit(1);
 }
-else {
-    // Dormant by construction: this test never enables idx 12. The RET dynamic-chaining path
-    // is covered by jit-alive-repro.mjs, which enables it and asserts RET_CHAIN_HIT > 0.
-    console.log("SKIP effectiveness: RET chaining (idx 12) not enabled in this run");
+
+if(off.chainEntries !== 0 || on.chainEntries <= 0)
+{
+    console.error("FAIL: direct chained-entry accounting is inconsistent");
+    process.exit(1);
+}
+
+if(off.chainedEdge !== 0 || on.chainedEdge <= 0)
+{
+    console.error("FAIL: idx 4 kill switch/effectiveness counters are inconsistent");
+    process.exit(1);
+}
+
+if(on.reentry >= off.reentry)
+{
+    console.error("FAIL: chaining did not reduce module re-entry");
+    process.exit(1);
+}
+
+if(off.naturalRetired <= 0 || on.naturalRetired <= 0 ||
+   off.naturalRetired > off.instructionCounter || on.naturalRetired > on.instructionCounter)
+{
+    console.error("FAIL: retired accounting is empty or exceeds architectural instructions");
+    process.exit(1);
+}
+
+if(off.naturalWrongEntryChain !== 0 || on.naturalWrongEntryChain !== 0)
+{
+    console.error("FAIL: normal OFF/ON execution triggered the wrong-entry detector");
+    process.exit(1);
+}
+
+const p = on.probe;
+if(!p || p.urgentExit !== -1 || p.hltExit !== -1 || p.hit < 0 || p.verifiedHit < 0 ||
+   p.noEntryMiss !== -1 || p.wrongEntryRefused !== -1 || p.restoredHit < 0 ||
+   p.budgetExitDelta !== 2 || p.missDelta !== 2 || p.wrongEntryDelta !== 1 ||
+   p.retiredDelta !== p.retiredExpected)
+{
+    console.error("FAIL: direct-chain guard/fallback/accounting invariant failed: " + JSON.stringify(p));
+    process.exit(1);
 }
 
 process.exit(0);

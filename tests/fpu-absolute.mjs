@@ -386,12 +386,13 @@ for(const jit of [false, true]) {
                 `fistp=${r.ebx} ${okFist?"OK":"<<< BAD (want 2)"}`);
 }
 
-// PC=00 (24-bit single) arrives the same way. Strict mode must round 1/3 to f32;
-// relaxed mode ignores PC by contract (see softfloat apply_precision) and keeps f64.
+// PC=00 (24-bit single) arrives the same way. Both strict and relaxed modes must round
+// arithmetic results to f32; relaxed mode removes F80 representation overhead, not the
+// architectural precision-control contract (see softfloat apply_precision).
 for(const relaxed of [false, true])
 for(const jit of [false, true]) {
     const r = await run_cw("pc", 0x007F, { jit, relaxed });
-    const want = relaxed ? 1/3 : Math.fround(1/3);
+    const want = Math.fround(1/3);
     const okCw = r.ecx === 0x007F;
     const okDiv = r.eax === f64hi(want) && r.ebx === f64lo(want);
     if(!(okCw && okDiv)) fail = true;

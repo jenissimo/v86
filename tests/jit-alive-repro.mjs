@@ -94,6 +94,8 @@ function run()
             const dget = cpu.wm.exports["profiler_dispatch_stat_get"];
             let published = 0;
             for(let i = 1; i < 900; i++) if(cpu.wm.wasm_table.get(i + 1024)) published++;
+            let retired = 0;
+            for(let i = 1; i < 900; i++) retired += cpu.wm.exports["jit_get_module_retired_total"]?.(i) ?? 0;
             resolve({
                 status,
                 ecx: cpu.reg32[1] >>> 0,
@@ -102,6 +104,8 @@ function run()
                 retChainHit: dget ? dget(11) : 0,
                 chainEntries: cpu.wm.exports["jit_get_tier2_chain_entries"]?.() ?? 0,
                 directEntries: cpu.wm.exports["jit_get_tier2_direct_entries"]?.() ?? 0,
+                retired,
+                tier2Promotions: cpu.wm.exports["jit_get_tier2_promotions"]?.() ?? 0,
             });
         };
 
@@ -112,6 +116,10 @@ function run()
             cpu.reset_memory();
             cpu.set_jit_config(1, 1);   // MAX_PAGES=1 — callee gets its own module
             cpu.set_jit_config(12, 1);  // RET dynamic chaining ON (the path under test)
+            // Shipping OFF omits retired-accounting calls. This fixture validates the
+            // accounting shape, so opt in before its code is compiled without allowing
+            // the tiny image to reach promotion.
+            cpu.set_jit_config(15, 1_000_000_000);
             cpu.wm.exports["set_dispatch_stats"]?.(1);
             cpu.wm.exports["profiler_init"]?.();
             cpu.jit_clear_cache?.();
@@ -141,7 +149,9 @@ if(r.finalized === 0)
 if(r.published === 0) fail("nothing was installed in the wasm table despite finalized=" + r.finalized);
 if(r.retChaining && r.retChainHit <= 0) fail("RET chaining enabled but RET_CHAIN_HIT stayed zero — the chaining path never ran");
 if(r.retChaining && r.chainEntries <= 0) fail("RET chaining ran but chained entries were not accounted (jit_get_tier2_chain_entries == 0)");
+if(r.retired <= 0) fail("generated modules retired instructions but the per-module retired census stayed zero");
 
 console.log(`  ok — generated=${r.generated} finalized=${r.finalized} published=${r.published} ` +
-            `retChainHit=${r.retChainHit} chainEntries=${r.chainEntries} directEntries=${r.directEntries}`);
+            `retChainHit=${r.retChainHit} chainEntries=${r.chainEntries} directEntries=${r.directEntries} ` +
+            `retired=${r.retired} promotions=${r.tier2Promotions}`);
 process.exit(0);

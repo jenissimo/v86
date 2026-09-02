@@ -556,6 +556,55 @@ pub fn gen_set_reg32_r(ctx: &mut JitContext, dest: u32, src: u32) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stack fastmem CEILING EXPERIMENT (docs/performance/sota-roadmap/02)
+// ---------------------------------------------------------------------------
+//
+// Item 02 proposes replacing the TLB lookup on ESP/EBP-relative accesses with ONE guard per
+// compiled unit. Before writing that guard it prescribes measuring the ceiling: what the
+// same accesses cost with NO check at all. The difference between this and the guarded
+// version is the budget the guard has to fit inside; if the ceiling is small, the item
+// closes without the guard ever being written.
+//
+// This is that measurement and NOTHING else. It is UNSOUND by construction: it drops the
+// present/writable/has-code checks, so a decommitted stack page is read as garbage instead
+// of faulting, and a store into a guarded page corrupts memory silently. It exists to be
+// switched on for a synthetic fixture (tools/guestbench) and switched off again.
+//
+// Two conditions make the raw form equivalent to the guarded one on the paths it takes:
+// BottleShip identity-maps guest linear to physical, and the operand must carry no segment
+// base (checked per operand). The wasm memory offset of guest RAM is baked in at compile
+// time, which a shipping version would have to invalidate on memory growth — one more
+// reason this is a measurement rather than a feature.
+// Modes: 0 = off, 1 = the roadmap-02 class only (ESP/EBP base, constant displacement),
+// 2 = EVERY flat 32-bit read, which is roadmap 03's ceiling — what a permission check
+// costs on the accesses stack fastmem would NOT cover. Two modes rather than two flags so
+// the arms are mutually exclusive by construction.
+#[allow(non_upper_case_globals)]
+pub static mut STACK_RAW_UNSAFE: u32 = 0;
+
+pub fn stack_raw_unsafe_mode() -> u32 { unsafe { STACK_RAW_UNSAFE } }
+
+#[no_mangle]
+pub fn set_stack_raw_unsafe(mode: u32) { unsafe { STACK_RAW_UNSAFE = mode } }
+
+#[no_mangle]
+pub fn get_stack_raw_unsafe() -> u32 { unsafe { STACK_RAW_UNSAFE } }
+
+/// The guest-RAM base inside the wasm linear memory, or None before memory is allocated.
+fn raw_guest_base() -> Option<u32> {
+    let base = unsafe { crate::cpu::memory::mem8 } as u32;
+    if base == 0 { None } else { Some(base) }
+}
+
+fn stack_raw_applies(ctx: &mut JitContext, modrm_byte: &ModrmByte) -> Option<u32> {
+    let mode = stack_raw_unsafe_mode();
+    if mode == 0 { return None; }
+    if mode == 1 && !modrm_byte.is_stack_const() { return None; }
+    if !modrm::stack_const_is_flat(ctx, modrm_byte) { return None; }
+    raw_guest_base()
+}
+
 pub fn gen_modrm_resolve_safe_read8(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     gen_modrm_resolve_with_local(ctx, modrm_byte, &|ctx, addr| gen_safe_read8(ctx, addr));
 }
@@ -563,6 +612,11 @@ pub fn gen_modrm_resolve_safe_read16(ctx: &mut JitContext, modrm_byte: ModrmByte
     gen_modrm_resolve_with_local(ctx, modrm_byte, &|ctx, addr| gen_safe_read16(ctx, addr));
 }
 pub fn gen_modrm_resolve_safe_read32(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    if let Some(base) = stack_raw_applies(ctx, &modrm_byte) {
+        gen_modrm_resolve(ctx, modrm_byte);
+        ctx.builder.load_unaligned_i32(base);
+        return;
+    }
     gen_modrm_resolve_with_local(ctx, modrm_byte, &|ctx, addr| gen_safe_read32(ctx, addr));
 }
 pub fn gen_modrm_resolve_safe_read64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
@@ -677,6 +731,128 @@ pub fn gen_safe_write128(
     )
 }
 
+/// Release the unit-scoped permission-bitmap scratch, alongside the other per-unit locals.
+pub fn gen_perm_map_off_free(ctx: &mut JitContext) {
+    if let Some(off) = ctx.perm_map_off.take() {
+        ctx.builder.free_local(off);
+    }
+}
+
+pub fn gen_read_tlb_cache_free(ctx: &mut JitContext) {
+    if let Some(cache) = ctx.read_tlb_cache.take() {
+        ctx.builder.free_local(cache.page);
+        ctx.builder.free_local(cache.entry);
+        ctx.builder.free_local(cache.valid);
+    }
+}
+
+fn gen_read_tlb_cache_slot(ctx: &mut JitContext) -> Option<(WasmLocal, WasmLocal, WasmLocal)> {
+    if !crate::jit::read_tlb_cache_enabled_for(ctx.start_of_current_instruction) {
+        return None;
+    }
+    if ctx.read_tlb_cache.is_none() {
+        ctx.builder.const_i32(0);
+        let page = ctx.builder.set_new_local();
+        ctx.builder.const_i32(0);
+        let entry = ctx.builder.set_new_local();
+        ctx.builder.const_i32(0);
+        let valid = ctx.builder.set_new_local();
+        ctx.read_tlb_cache = Some(crate::jit::ReadTlbCache { page, entry, valid });
+    }
+    let cache = ctx.read_tlb_cache.as_ref().unwrap();
+    Some((
+        cache.page.unsafe_clone(),
+        cache.entry.unsafe_clone(),
+        cache.valid.unsafe_clone(),
+    ))
+}
+
+/** A generated guest write may enter a slow translation helper, which is allowed to
+ * clear/refill the architectural TLB. Drop the read-local before every write. */
+fn gen_read_tlb_cache_invalidate(ctx: &mut JitContext) {
+    if let Some(cache) = ctx.read_tlb_cache.as_ref() {
+        ctx.builder.const_i32(0);
+        ctx.builder.set_local(&cache.valid);
+    }
+}
+
+fn gen_read_tlb_cache_stat(ctx: &mut JitContext, stat: profiler::stat) {
+    if !crate::jit::read_tlb_cache_census_enabled() {
+        return;
+    }
+    let addr = unsafe { &raw mut profiler::stat_array[stat as usize] } as u32;
+    ctx.builder.increment_fixed_i64(addr, 1);
+}
+
+/// Permission-bitmap read probe (docs/performance/sota-roadmap/03).
+///
+/// Opens a block and, when the page's byte says "readable, real memory, identity-mapped,
+/// reachable at this CPL", writes `mem8 + addr` into `off` and branches out — skipping the
+/// TLB entry load, the scale-by-4, and the XOR remap. Returns the label to close and the
+/// local the ordinary path must also write, or None when the probe is not emitted.
+///
+/// Everything the TLB check enforces is enforced here: the byte carries VALID, not-MMIO,
+/// read-only and CPL3 reachability, and the page-crossing test is the same one. What the
+/// byte adds is IDENTITY — without it there is no remap to skip, so such a page simply
+/// falls through to the ordinary path.
+fn gen_perm_map_read_probe(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+) -> Option<(crate::wasmgen::wasm_builder::Label, WasmLocal)> {
+    use crate::cpu::perm_map;
+    if !perm_map::perm_map_reads_enabled() {
+        return None;
+    }
+    let mem8 = unsafe { crate::cpu::memory::mem8 } as u32;
+    if mem8 == 0 {
+        return None; // guest memory not allocated yet; nothing to bake
+    }
+    let mask = if ctx.cpu.cpl3() { perm_map::PERM_READ_MASK_CPL3 } else { perm_map::PERM_READ_MASK_CPL0 };
+
+    // One local per compiled unit, not one per access: a loop body with ten memory operands
+    // otherwise pays ten locals and ten initialisers, and that cost is what turned an
+    // eight-percent win on a scattered walk into a four-percent LOSS on a dense one.
+    if ctx.perm_map_off.is_none() {
+        ctx.builder.const_i32(0);
+        ctx.perm_map_off = Some(ctx.builder.set_new_local());
+    }
+    let off = ctx.perm_map_off.as_ref().unwrap().unsafe_clone();
+    let done = ctx.builder.block_void();
+
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder.load_u8(perm_map::perm_map_base());
+    ctx.builder.const_i32(mask as i32);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(mask as i32);
+    ctx.builder.eq_i32();
+
+    if bits != BitSize::BYTE {
+        // The same page-crossing test the TLB path makes: a multi-byte read straddling two
+        // pages is two permission questions, and the byte only answers one of them.
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
+        ctx.builder.le_i32();
+        ctx.builder.and_i32();
+    }
+
+    ctx.builder.if_void();
+    gen_dispatch_stat_increment(ctx.builder, profiler::stat::PERM_MAP_READ_HIT);
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(mem8 as i32);
+    ctx.builder.add_i32();
+    ctx.builder.set_local(&off);
+    ctx.builder.br(done);
+    ctx.builder.block_end();
+
+    gen_dispatch_stat_increment(ctx.builder, profiler::stat::PERM_MAP_READ_MISS);
+    Some((done, off))
+}
+
 fn gen_safe_read(
     ctx: &mut JitContext,
     bits: BitSize,
@@ -685,12 +861,52 @@ fn gen_safe_read(
 ) {
     // Execute a virtual memory read. All slow paths (memory-mapped IO, tlb miss, page fault and
     // read across page boundary are handled in safe_read_jit_slow
-
     //   entry <- tlb_data[addr >> 12 << 2]
     //   if entry & MASK == TLB_VALID && (addr & 0xFFF) <= 0x1000 - bytes: goto fast
     //   entry <- safe_read_jit_slow(addr, instruction_pointer)
     //   if page_fault: goto exit-with-pagefault
     //   fast: mem[(entry & ~0xFFF) ^ addr]
+
+    // The read-cache locals are created, and zero-initialised, ONCE per unit; that initialiser
+    // must be emitted BEFORE the perm-map probe's block. On a probe hit control branches past
+    // everything below, so a recycled local left non-zero would make the NEXT read in this unit
+    // take the cache path with a stale page — a wrong read no counter can see.
+    let read_cache = gen_read_tlb_cache_slot(ctx);
+    let perm_probe = gen_perm_map_read_probe(ctx, bits, address_local);
+    ctx.builder.const_i32(0);
+    let entry_local = ctx.builder.set_new_local();
+    let mut cache_page_now: Option<WasmLocal> = None;
+    let entry_ready = if let Some((cache_page, cache_entry, cache_valid)) = read_cache.as_ref() {
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(12);
+        ctx.builder.shr_u_i32();
+        let page = ctx.builder.set_new_local();
+        let ready = ctx.builder.block_void();
+        ctx.builder.get_local(cache_valid);
+        ctx.builder.get_local(cache_page);
+        ctx.builder.get_local(&page);
+        ctx.builder.eq_i32();
+        ctx.builder.and_i32();
+        if bits != BitSize::BYTE {
+            ctx.builder.get_local(address_local);
+            ctx.builder.const_i32(0xFFF);
+            ctx.builder.and_i32();
+            ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
+            ctx.builder.le_i32();
+            ctx.builder.and_i32();
+        }
+        ctx.builder.if_void();
+        gen_read_tlb_cache_stat(ctx, profiler::stat::READ_TLB_CACHE_HIT);
+        ctx.builder.get_local(cache_entry);
+        ctx.builder.set_local(&entry_local);
+        ctx.builder.br(ready);
+        ctx.builder.block_end();
+        cache_page_now = Some(page);
+        Some(ready)
+    }
+    else {
+        None
+    };
 
     let cont = ctx.builder.block_void();
     ctx.builder.get_local(&address_local);
@@ -702,7 +918,7 @@ fn gen_safe_read(
 
     ctx.builder
         .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
-    let entry_local = ctx.builder.tee_new_local();
+    ctx.builder.tee_local(&entry_local);
 
     ctx.builder.const_i32(
         (0xFFF
@@ -727,7 +943,26 @@ fn gen_safe_read(
     }
 
     // TLB hit is the fast path; falling through means calling safe_read*_slow_jit.
-    ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
+    if let (Some((cache_page, cache_entry, cache_valid)), Some(page)) =
+        (read_cache.as_ref(), cache_page_now.as_ref())
+    {
+        // Fill ONLY here. safe_read*_slow_jit can answer with a one-shot alias into
+        // jit_paging_scratch_buffer (page-crossing or MMIO); caching that would serve a later
+        // same-page read stale scratch bytes and skip the device access entirely.
+        ctx.builder.if_void_hinted(HINT_GROUP_MEM, HINT_LIKELY);
+        gen_read_tlb_cache_stat(ctx, profiler::stat::READ_TLB_CACHE_FILL);
+        ctx.builder.get_local(page);
+        ctx.builder.set_local(cache_page);
+        ctx.builder.get_local(&entry_local);
+        ctx.builder.set_local(cache_entry);
+        ctx.builder.const_i32(1);
+        ctx.builder.set_local(cache_valid);
+        ctx.builder.br(cont);
+        ctx.builder.block_end();
+    }
+    else {
+        ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
+    }
 
     if cfg!(feature = "profiler") {
         ctx.builder.get_local(&address_local);
@@ -775,6 +1010,11 @@ fn gen_safe_read(
 
     ctx.builder.block_end();
 
+    if entry_ready.is_some() {
+        ctx.builder.block_end();
+        ctx.builder.free_local(cache_page_now.take().unwrap());
+    }
+
     gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST); // XXX: Both fast and slow
 
     ctx.builder.get_local(&entry_local);
@@ -782,6 +1022,15 @@ fn gen_safe_read(
     ctx.builder.and_i32();
     ctx.builder.get_local(&address_local);
     ctx.builder.xor_i32();
+
+    // Both paths converge on ONE wasm offset, so the load below is emitted once and the
+    // arms cannot drift into loading different widths or from different bases.
+    if let Some((done, off)) = perm_probe.as_ref() {
+        ctx.builder.set_local(off);
+        ctx.builder.block_end();
+        let _ = done;
+        ctx.builder.get_local(off);
+    }
 
     // where_to_write is only used by dqword
     dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
@@ -817,6 +1066,8 @@ fn gen_safe_read(
     }
 
     ctx.builder.free_local(entry_local);
+    // `off` belongs to the unit (ctx.perm_map_off) and is released with it, not here.
+    drop(perm_probe);
 }
 
 // Split-range shape of the fastmem read fast path. DEAD: reads go through the inlined TLB
@@ -1199,6 +1450,10 @@ fn gen_safe_write(
     // When enabled for this unit, route through the per-page write
     // map instead of the inline TLB fast path. Flag off = byte-identical to below.
     if ctx.fastmem_writes {
+        // The experimental write-map helper owns a different slow-path shape. Keep the
+        // conservative invalidation there; the ordinary TLB path below narrows it to the
+        // actual slow edge.
+        gen_read_tlb_cache_invalidate(ctx);
         gen_fastmem_write_map(ctx, bits, address_local, value_local);
         return;
     }
@@ -1250,6 +1505,9 @@ fn gen_safe_write(
         ctx.builder.call_fn2("report_safe_write_jit_slow");
     }
 
+    // A TLB-hit store cannot refill or clear the architectural translation cache. Only the
+    // helper edge can, so preserve the block-local read entry across ordinary guest writes.
+    gen_read_tlb_cache_invalidate(ctx);
     ctx.builder.get_local(&address_local);
     match value_local {
         GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
@@ -1454,6 +1712,7 @@ fn gen_push32_coalesced_write(
         ctx.builder.call_fn2("report_safe_write_jit_slow");
     }
 
+    gen_read_tlb_cache_invalidate(ctx);
     ctx.builder.get_local(address_local);
     ctx.builder.get_local(value_local);
     ctx.builder
@@ -1556,6 +1815,9 @@ pub fn gen_safe_read_write(
         ctx.builder.call_fn2("report_safe_read_write_jit_slow");
     }
 
+    // The fast read-modify-write path uses the already validated entry and cannot mutate the
+    // architectural TLB. Invalidate only when the translation helper is actually entered.
+    gen_read_tlb_cache_invalidate(ctx);
     ctx.builder.get_local(&address_local);
     ctx.builder
         .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
@@ -3676,15 +3938,33 @@ fn gen_fpu_clamp_i32_to_i16(ctx: &mut JitContext, value: &WasmLocal) {
 
 /// x87 PC=00 rounds every arithmetic result to a 24-bit significand. PC is a RUNTIME
 /// value — the CRT saves and restores the control word around every transcendental —
-/// so it can be neither baked into the block (the invalidation that correctness would
-/// then demand empties the JIT cache continuously) nor ignored (a title that compares a
+/// so it cannot be baked into the compiled block or ignored (a title that compares a
 /// computed value against one it stored as f32 then never sees them equal; GTA III's
 /// CPathFind de-duplicates car path links exactly that way, and overruns the array into
 /// its own map-object table).
 ///
-/// Read it here and pick branchlessly instead. The old PC gate did not cost what the
+/// The optional local is populated at runtime on every block activation and survives
+/// only across consecutive relaxed arithmetic instructions. Any other instruction is
+/// a fence, including every control-word writer/restorer. The old PC gate did not cost what the
 /// ROUNDING costs — two conversions — it cost the F80 HELPER CALL it fell back to,
 /// which is the whole expense the relaxed path exists to avoid.
+fn gen_fpu_pc_cache_prepare(ctx: &mut JitContext) {
+    if !crate::jit::x87_pc_local_enabled() || ctx.fpu_pc_cache.is_some() {
+        return;
+    }
+
+    // This initialization must dominate the relaxed tag fast/slow branch. A run may
+    // execute the helper branch for its first instruction (for example an F80 ST(i))
+    // and the inline branch for the next one. Initializing inside the first inline
+    // branch leaves the reused Wasm local stale on that runtime path.
+    ctx.builder
+        .load_fixed_u16(global_pointers::fpu_control_word as u32);
+    ctx.builder.const_i32(0x300);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.fpu_pc_cache = Some(ctx.builder.set_new_local());
+}
+
 fn gen_fpu_round_f64_by_precision_control(ctx: &mut JitContext) {
     ctx.builder.reinterpret_f64_as_i64();
     let raw = ctx.builder.tee_new_local_i64();
@@ -3694,13 +3974,27 @@ fn gen_fpu_round_f64_by_precision_control(ctx: &mut JitContext) {
     ctx.builder.get_local_i64(&raw);
     ctx.builder.reinterpret_i64_as_f64();
     // select() keeps the FIRST value when the condition is non-zero: PC field == 00.
-    ctx.builder
-        .load_fixed_u16(global_pointers::fpu_control_word as u32);
-    ctx.builder.const_i32(0x300);
-    ctx.builder.and_i32();
-    ctx.builder.eqz_i32();
+    if crate::jit::x87_pc_local_enabled() {
+        ctx.fpu_pc_cache_kept = true;
+        // Every relaxed binop prepares this before emitting its tag branch, so all
+        // runtime paths reaching a lexical run observe an initialized predicate.
+        ctx.builder.get_local(ctx.fpu_pc_cache.as_ref().unwrap());
+    }
+    else {
+        ctx.builder
+            .load_fixed_u16(global_pointers::fpu_control_word as u32);
+        ctx.builder.const_i32(0x300);
+        ctx.builder.and_i32();
+        ctx.builder.eqz_i32();
+    }
     ctx.builder.select();
     ctx.builder.free_local_i64(raw);
+}
+
+pub fn gen_fpu_pc_cache_free(ctx: &mut JitContext) {
+    if let Some(pc) = ctx.fpu_pc_cache.take() {
+        ctx.builder.free_local(pc);
+    }
 }
 
 fn gen_fpu_apply_f64_binop(ctx: &mut JitContext, op: FpuFastBinOp) {
@@ -3831,9 +4125,18 @@ fn gen_fpu_relaxed_binop_mem(
         ctx.builder.call_fn3_i32_i64_i32(slow_helper);
         return;
     }
+    gen_fpu_pc_cache_prepare(ctx);
     let modrm_slow = modrm_byte.clone();
     let target_addr = gen_fpu_st_addr(ctx, target_sti);
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    // D8/DA/DE memory arithmetic overwhelmingly writes ST0. Target and source are
+    // then the same physical stack slot; compute TOP->address once.
+    let st0_aliases_target = target_sti == 0;
+    let st0_addr = if st0_aliases_target {
+        target_addr.unsafe_clone()
+    }
+    else {
+        gen_fpu_st_addr(ctx, 0)
+    };
     gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
     ctx.builder.eqz_i32();
     ctx.builder.if_void();
@@ -3848,7 +4151,9 @@ fn gen_fpu_relaxed_binop_mem(
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_relaxed_f64_st(ctx, target_sti, &target_addr);
     ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
+    if !st0_aliases_target {
+        ctx.builder.free_local(st0_addr);
+    }
     ctx.builder.free_local(target_addr);
 }
 
@@ -3878,9 +4183,26 @@ pub fn gen_fpu_relaxed_binop_sti(
         ctx.builder.call_fn3_i32_i64_i32(slow_helper);
         return;
     }
+    gen_fpu_pc_cache_prepare(ctx);
     let target_addr = gen_fpu_st_addr(ctx, target_sti);
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    let op_addr = gen_fpu_st_addr(ctx, sti);
+    let st0_aliases_target = target_sti == 0;
+    let st0_addr = if st0_aliases_target {
+        target_addr.unsafe_clone()
+    }
+    else {
+        gen_fpu_st_addr(ctx, 0)
+    };
+    let op_aliases_target = sti == target_sti;
+    let op_aliases_st0 = !op_aliases_target && sti == 0;
+    let op_addr = if op_aliases_target {
+        target_addr.unsafe_clone()
+    }
+    else if op_aliases_st0 {
+        st0_addr.unsafe_clone()
+    }
+    else {
+        gen_fpu_st_addr(ctx, sti)
+    };
     gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
     gen_fpu_relaxed_st_ok(ctx, sti, &op_addr);
     ctx.builder.and_i32();
@@ -3897,8 +4219,12 @@ pub fn gen_fpu_relaxed_binop_sti(
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_relaxed_f64_st(ctx, target_sti, &target_addr);
     ctx.builder.block_end();
-    ctx.builder.free_local(op_addr);
-    ctx.builder.free_local(st0_addr);
+    if !op_aliases_target && !op_aliases_st0 {
+        ctx.builder.free_local(op_addr);
+    }
+    if !st0_aliases_target {
+        ctx.builder.free_local(st0_addr);
+    }
     ctx.builder.free_local(target_addr);
 }
 
@@ -4657,7 +4983,7 @@ pub fn gen_condition_fn(ctx: &mut JitContext, condition: u8) {
 }
 
 pub fn gen_move_registers_from_locals_to_memory(ctx: &mut JitContext) {
-    if cfg!(feature = "profiler") {
+    if opstats::opstats_enabled() {
         let instruction = memory::read32s(ctx.start_of_current_instruction) as u32;
         opstats::gen_opstat_unguarded_register(ctx.builder, instruction);
     }
@@ -4674,7 +5000,7 @@ pub fn gen_move_registers_from_locals_to_memory(ctx: &mut JitContext) {
     ctx.builder.emit_flag_spill();
 }
 pub fn gen_move_registers_from_memory_to_locals(ctx: &mut JitContext) {
-    if cfg!(feature = "profiler") {
+    if opstats::opstats_enabled() {
         let instruction = memory::read32s(ctx.start_of_current_instruction) as u32;
         opstats::gen_opstat_unguarded_register(ctx.builder, instruction);
     }

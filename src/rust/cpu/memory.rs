@@ -43,6 +43,17 @@ pub fn allocate_memory(size: u32) -> u32 {
     ptr
 }
 
+/// Where guest RAM lives inside the wasm linear memory.
+///
+/// The JIT bakes this as an `i32.const` into every module it emits (codegen.rs: the TLB
+/// entry carries `high + mem8`, and the raw shapes add it directly). A module persisted
+/// across sessions is therefore only replayable if the allocator hands back the SAME base —
+/// and `mem8` is an `alloc::alloc` result, not part of any version tuple. Exported so the
+/// AOT cache can put it in its key: a different base must invalidate the cache, because the
+/// failure mode is not a refusal but a module reading the wrong memory.
+#[no_mangle]
+pub fn get_mem8_base() -> u32 { unsafe { mem8 as u32 } }
+
 #[no_mangle]
 pub unsafe fn zero_memory(addr: u32, size: u32) {
     if !check_in_guest(addr, size, 0) {

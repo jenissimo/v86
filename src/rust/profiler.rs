@@ -183,6 +183,18 @@ pub enum stat {
     PUSH_RUN_HIT,
     PUSH_RUN_FILL,
 
+    // Targeted block-local read micro-TLB (readout 23-24). Emitted only in census
+    // mode, so production mode pays no counter traffic.
+    READ_TLB_CACHE_HIT,
+    READ_TLB_CACHE_FILL,
+
+    // Permission-bitmap read path (roadmap 03), readout 25-26. A HIT skipped the TLB entry
+    // load and the remap; a MISS means the byte refused and the ordinary path ran, so the
+    // access paid the probe on top. A miss rate that is not small is the feature costing
+    // more than it saves, and it is the first number to read after switching it on.
+    PERM_MAP_READ_HIT,
+    PERM_MAP_READ_MISS,
+
     // Dynamic-chaining path split (read via profiler_dispatch_stat_get 18-22, gated by
     // jit::DISPATCH_STATS). RET_CHAIN_HIT alone cannot say WHICH tier served the dispatch,
     // and "the memo is too small" and "the memo is fine, the helper call is the cost" are
@@ -276,6 +288,10 @@ pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
         20 => stat::RET_MEMO_COLD,
         21 => stat::RET_META_HIT,
         22 => stat::RET_CHAIN_BUDGET,
+        23 => stat::READ_TLB_CACHE_HIT,
+        24 => stat::READ_TLB_CACHE_FILL,
+        25 => stat::PERM_MAP_READ_HIT,
+        26 => stat::PERM_MAP_READ_MISS,
         _ => return 0.0,
     };
     unsafe { stat_array[stat as usize] as f64 }

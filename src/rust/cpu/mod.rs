@@ -12,6 +12,7 @@ pub mod instructions_0f;
 pub mod ioapic;
 pub mod memory;
 pub mod misc_instr;
+pub mod perm_map;
 pub mod modrm;
 pub mod pic;
 pub mod sse_instr;

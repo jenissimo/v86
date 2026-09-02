@@ -398,7 +398,10 @@ function run(image, cfg) {
                 }
             }
             const paged = ((cpu.cr?.[0] ?? 0) & 0x80000000) !== 0;
-            resolve({ status, regs, chk, generated: globalThis.__jitCompileStats.count | 0, maxSpan, paged });
+            resolve({
+                status, regs, chk, generated: globalThis.__jitCompileStats.count | 0, maxSpan, paged,
+                tier2Promotions: cpu.wm.exports["jit_get_tier2_promotions"]?.() ?? 0,
+            });
         };
         emulator.bus.register("cpu-event-halt", () => { halted = true; finish("halt"); });
         emulator.add_listener("emulator-loaded", () => {
@@ -436,14 +439,19 @@ for (let seed = seedStart; seed < seedStart + seedCount; seed++) {
     const interp = await run(image, { jit: false });
     const jit3 = await run(image, { jit: true, maxPages: 3 });
     const jit8 = await run(image, { jit: true, maxPages: 8 });
-    // mirrors the production default arm: MAX_PAGES=3 but tier-2 promotion ON with the
-    // default TIER2_MAX_PAGES=8 budget; low threshold so promotions actually happen here
+    // Explicit experimental Tier-2 arm: shipping defaults OFF. Keep MAX_PAGES=3 and
+    // TIER2_MAX_PAGES=8, with a low threshold so promotions actually happen here.
     const jitT2 = await run(image, { jit: true, maxPages: 3, tier2: 20000 });
 
     const sig = r => `${r.status} chk=${(r.chk >>> 0).toString(16)} regs=${r.regs.map(x => x.toString(16)).join(",")}`;
     const ok3 = sig(interp) === sig(jit3);
     const ok8 = sig(interp) === sig(jit8);
     const okT2 = sig(interp) === sig(jitT2);
+    if (jitT2.tier2Promotions <= 0) {
+        failures++;
+        console.error(`seed ${seed}: Tier-2 arm retired enough instructions but promotions stayed zero`);
+        continue;
+    }
     const note = ` (gen3=${jit3.generated} gen8=${jit8.generated} genT2=${jitT2.generated}` +
                  ` span3=${jit3.maxSpan} span8=${jit8.maxSpan} spanT2=${jitT2.maxSpan}` +
                  ` paged=${jit8.paged ? 1 : 0})`;

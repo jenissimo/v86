@@ -18,6 +18,13 @@ pub struct ModrmByte {
     is_16: bool,
 }
 impl ModrmByte {
+    /// The roadmap-02 class: base is ESP or EBP, no index register, 32-bit addressing.
+    /// Segment flatness is checked separately (`stack_const_is_flat`), because it depends
+    /// on CPU state rather than on the encoding.
+    pub fn is_stack_const(&self) -> bool {
+        !self.is_16 && self.second_reg.is_none() && matches!(self.first_reg, Some(ESP) | Some(EBP))
+    }
+
     pub fn is_nop(&self, reg: u32) -> bool {
         self.first_reg == Some(reg)
             && self.second_reg.is_none()
@@ -267,6 +274,19 @@ pub fn get_as_reg_index_if_possible(ctx: &mut JitContext, modrm_byte: &ModrmByte
 }
 
 pub fn skip(ctx: &mut CpuContext, modrm_byte: u8) { let _ = decode(ctx, modrm_byte); }
+
+/// True when this operand's effective address IS the linear address, i.e. no segment base
+/// has to be added. Only then is a raw access equivalent to the guarded one. (16-bit
+/// addressing is excluded too: its wrap is part of the address computation.)
+pub fn stack_const_is_flat(ctx: &mut JitContext, modrm_byte: &ModrmByte) -> bool {
+    if modrm_byte.is_16 { return false; }
+    let prefix = ctx.cpu.prefixes & PREFIX_MASK_SEGMENT;
+    if prefix == SEG_PREFIX_ZERO {
+        return true;
+    }
+    let seg = if prefix != 0 { (prefix - 1) as u32 } else { modrm_byte.segment };
+    can_optimize_get_seg(ctx, seg)
+}
 
 #[derive(PartialEq)]
 enum Imm32 {

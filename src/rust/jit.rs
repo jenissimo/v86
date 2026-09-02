@@ -62,6 +62,372 @@ pub fn jit_clear_func(wasm_table_index: WasmTableIndex) {
 
 static mut JIT_DISABLED: bool = false;
 
+// BottleShip write-buffer CALL intrinsic. The JS thunk dispatcher registers the exact
+// guest stub addresses after it patches them to WBUF trampolines. JITed `CALL r/m32`
+// sites use the cheap enabled/min/max words below as a miss guard, then call the helper
+// only for targets inside the registered stub span. A hit appends the exact trampoline
+// payload and returns the stdcall cleanup byte count; the emitter then resumes at the
+// instruction after CALL without entering either the stub or trampoline Wasm module.
+//
+// This is deliberately runtime-registered rather than baked into the codegen fingerprint:
+// thunk addresses and ids belong to each guest process, while generated modules all import
+// the same linear memory and therefore see registration updates immediately.
+pub(crate) const WBUF_INTRINSIC_CAPACITY: usize = 512;
+pub(crate) const WBUF_INTRINSIC_PROBES: usize = 8;
+const WBUF_KIND_SCALAR: u32 = 0;
+const WBUF_KIND_SHADER_CONSTANT: u32 = 1;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct WbufIntrinsicDesc {
+    target: u32,
+    func_id: u32,
+    meta: u32, // kind:8 | arg_count:8 | stdcall:1
+    ctrl_addr: u32,
+    data_base: u32,
+    capacity: u32,
+}
+
+const WBUF_INTRINSIC_EMPTY: WbufIntrinsicDesc = WbufIntrinsicDesc {
+    target: 0,
+    func_id: 0,
+    meta: 0,
+    ctrl_addr: 0,
+    data_base: 0,
+    capacity: 0,
+};
+
+static mut WBUF_INTRINSIC_ENABLED: u32 = 0;
+static mut WBUF_INTRINSIC_MIN_TARGET: u32 = u32::MAX;
+static mut WBUF_INTRINSIC_MAX_TARGET: u32 = 0;
+static mut WBUF_INTRINSIC_TABLE: [WbufIntrinsicDesc; WBUF_INTRINSIC_CAPACITY] =
+    [WBUF_INTRINSIC_EMPTY; WBUF_INTRINSIC_CAPACITY];
+// Direct slots are intentionally distinct: VS constants, PS constants, and the draw
+// barrier are independently hot and registering one must not evict another.
+const WBUF_INTRINSIC_HOT_CAPACITY: usize = 3;
+static mut WBUF_INTRINSIC_HOT: [WbufIntrinsicDesc; WBUF_INTRINSIC_HOT_CAPACITY] =
+    [WBUF_INTRINSIC_EMPTY; WBUF_INTRINSIC_HOT_CAPACITY];
+static mut WBUF_INTRINSIC_HOT_MIN_TARGET: u32 = u32::MAX;
+static mut WBUF_INTRINSIC_HOT_MAX_TARGET: u32 = 0;
+static mut WBUF_INTRINSIC_REGISTERED: u32 = 0;
+static mut WBUF_INTRINSIC_HITS: u32 = 0;
+static mut WBUF_INTRINSIC_FALLBACKS: u32 = 0;
+static mut WBUF_INTRINSIC_CODEGEN_CALL32: u32 = 0;
+static mut WBUF_INTRINSIC_CODEGEN_SS32: u32 = 0;
+
+pub(crate) fn wbuf_intrinsic_note_call32(ssize_32: bool) {
+    unsafe {
+        WBUF_INTRINSIC_CODEGEN_CALL32 = WBUF_INTRINSIC_CODEGEN_CALL32.wrapping_add(1);
+        if ssize_32 {
+            WBUF_INTRINSIC_CODEGEN_SS32 = WBUF_INTRINSIC_CODEGEN_SS32.wrapping_add(1);
+        }
+    }
+}
+
+#[inline]
+fn wbuf_intrinsic_hash(target: u32) -> usize {
+    // Stubs are 16-byte aligned/sequential, so discarding the low nibble avoids the
+    // pathological all-zero low bits while retaining locality in the direct probe.
+    ((target >> 4) as usize) & (WBUF_INTRINSIC_CAPACITY - 1)
+}
+
+pub(crate) fn wbuf_intrinsic_enabled_ptr() -> u32 {
+    std::ptr::addr_of!(WBUF_INTRINSIC_ENABLED) as u32
+}
+pub(crate) fn wbuf_intrinsic_hot_min_target_ptr() -> u32 {
+    std::ptr::addr_of!(WBUF_INTRINSIC_HOT_MIN_TARGET) as u32
+}
+pub(crate) fn wbuf_intrinsic_hot_max_target_ptr() -> u32 {
+    std::ptr::addr_of!(WBUF_INTRINSIC_HOT_MAX_TARGET) as u32
+}
+
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_set_enabled(enabled: u32) {
+    WBUF_INTRINSIC_ENABLED = (enabled != 0) as u32;
+}
+
+/// kind: 0 = scalar WBUF, 1 = D3D shader-constant capture.
+/// Returns 1 on insert/update, 0 for invalid metadata or a saturated probe window.
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_register(
+    target: u32,
+    func_id: u32,
+    kind: u32,
+    arg_count: u32,
+    is_stdcall: u32,
+    ctrl_addr: u32,
+    data_base: u32,
+    capacity: u32,
+) -> u32 {
+    if target == 0
+        || ctrl_addr == 0
+        || data_base == 0
+        || capacity < 32
+        || kind > WBUF_KIND_SHADER_CONSTANT
+        || kind == WBUF_KIND_SCALAR && !(1..=8).contains(&arg_count)
+        || kind == WBUF_KIND_SHADER_CONSTANT && arg_count != 4
+    {
+        return 0;
+    }
+
+    let start = wbuf_intrinsic_hash(target);
+    for probe in 0..WBUF_INTRINSIC_PROBES {
+        let idx = (start + probe) & (WBUF_INTRINSIC_CAPACITY - 1);
+        let slot = &mut WBUF_INTRINSIC_TABLE[idx];
+        if slot.target == 0 || slot.target == target {
+            let was_empty = slot.target == 0;
+            *slot = WbufIntrinsicDesc {
+                target,
+                func_id,
+                meta: kind | arg_count << 8 | ((is_stdcall != 0) as u32) << 16,
+                ctrl_addr,
+                data_base,
+                capacity,
+            };
+            WBUF_INTRINSIC_MIN_TARGET = WBUF_INTRINSIC_MIN_TARGET.min(target);
+            WBUF_INTRINSIC_MAX_TARGET = WBUF_INTRINSIC_MAX_TARGET.max(target);
+            if was_empty {
+                WBUF_INTRINSIC_REGISTERED = WBUF_INTRINSIC_REGISTERED.wrapping_add(1);
+            }
+            return 1;
+        }
+    }
+    0
+}
+
+/// Promote an already-registered descriptor into a direct hot slot.
+/// BottleShip assigns slot 0 to VS constants, 1 to PS constants, and 2 to the draw barrier.
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_mark_hot(slot: u32, target: u32) -> u32 {
+    if slot as usize >= WBUF_INTRINSIC_HOT_CAPACITY || target == 0 {
+        return 0;
+    }
+    let start = wbuf_intrinsic_hash(target);
+    for probe in 0..WBUF_INTRINSIC_PROBES {
+        let desc = WBUF_INTRINSIC_TABLE[(start + probe) & (WBUF_INTRINSIC_CAPACITY - 1)];
+        if desc.target == target {
+            WBUF_INTRINSIC_HOT[slot as usize] = desc;
+            WBUF_INTRINSIC_HOT_MIN_TARGET = WBUF_INTRINSIC_HOT_MIN_TARGET.min(target);
+            WBUF_INTRINSIC_HOT_MAX_TARGET = WBUF_INTRINSIC_HOT_MAX_TARGET.max(target);
+            return 1;
+        }
+        if desc.target == 0 {
+            break;
+        }
+    }
+    0
+}
+
+#[inline]
+unsafe fn wbuf_guest_range_ok(addr: u32, size: u32) -> bool {
+    addr.checked_add(size).map_or(false, |end| end <= *global_pointers::memory_size)
+}
+
+/// Every 4 KiB page of `[addr, addr + size)` must be present, permitted at the current CPL
+/// (writable too when `for_writing`) and identity-mapped — the helper reaches guest bytes by
+/// LINEAR address through `mem8`, so a non-identity mapping would touch the wrong page. The
+/// walk is non-faulting and sets no accessed/dirty bits, so declining leaves the guest's own
+/// CALL to raise the exact #PF at the exact place.
+#[inline]
+unsafe fn wbuf_range_accessible(addr: u32, size: u32, for_writing: bool) -> bool {
+    if !wbuf_guest_range_ok(addr, size) {
+        return false;
+    }
+    if size == 0 || *global_pointers::cr & cpu::CR0_PG == 0 {
+        return true;
+    }
+    let last = (addr + size - 1) & !0xFFF;
+    let mut page = addr & !0xFFF;
+    loop {
+        match cpu::translate_address_no_fault(page as i32, for_writing) {
+            Some(phys) if phys == page => {},
+            _ => return false,
+        }
+        if page == last {
+            return true;
+        }
+        page += 0x1000;
+    }
+}
+
+#[inline]
+fn wbuf_ranges_overlap(a: u32, a_len: u32, b: u32, b_len: u32) -> bool {
+    a_len != 0
+        && b_len != 0
+        && (a as u64) < b as u64 + b_len as u64
+        && (b as u64) < a as u64 + a_len as u64
+}
+
+#[inline]
+unsafe fn wbuf_read_u32(addr: u32) -> u32 {
+    std::ptr::read_unaligned(memory::mem8.add(addr as usize) as *const u32)
+}
+
+#[inline]
+unsafe fn wbuf_write_u32(addr: u32, value: u32) {
+    std::ptr::write_unaligned(memory::mem8.add(addr as usize) as *mut u32, value);
+}
+
+/// Executes one registered WBUF call from its pre-CALL guest stack.
+/// Returns the caller-visible stack cleanup in bytes, or -1 to take the exact old
+/// stub/trampoline/OUT path. No ring bytes are changed on a fallback.
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_execute(target: u32, esp: u32) -> i32 {
+    if WBUF_INTRINSIC_ENABLED == 0 {
+        return -1;
+    }
+    let cleanup = wbuf_intrinsic_execute_inner(target, esp);
+    if cleanup < 0 {
+        WBUF_INTRINSIC_FALLBACKS = WBUF_INTRINSIC_FALLBACKS.wrapping_add(1);
+    }
+    else {
+        WBUF_INTRINSIC_HITS = WBUF_INTRINSIC_HITS.wrapping_add(1);
+    }
+    cleanup
+}
+
+/// Every guest range this may touch is validated — bounds AND paging — before the first byte
+/// moves, so a decline is indistinguishable from the CALL never having been intercepted.
+unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
+    let mut desc = WBUF_INTRINSIC_EMPTY;
+    for hot in WBUF_INTRINSIC_HOT {
+        if hot.target == target {
+            desc = hot;
+            break;
+        }
+    }
+    // The direct slots cover the common shader/draw targets. Keep the exact table as a
+    // correctness-preserving secondary path: duplicate exports can legitimately make a
+    // different same-name stub hot, and the outer min/max guard has already rejected the
+    // overwhelming majority of ordinary indirect CALL targets.
+    if desc.target == 0 {
+        let start = wbuf_intrinsic_hash(target);
+        for probe in 0..WBUF_INTRINSIC_PROBES {
+            let candidate = WBUF_INTRINSIC_TABLE[(start + probe) & (WBUF_INTRINSIC_CAPACITY - 1)];
+            if candidate.target == target {
+                desc = candidate;
+                break;
+            }
+            if candidate.target == 0 {
+                break;
+            }
+        }
+    }
+    // The control word is read AND written back, so it must be writable, not merely present.
+    if desc.target == 0 || !wbuf_range_accessible(desc.ctrl_addr, 4, true) {
+        return -1;
+    }
+
+    let kind = desc.meta & 0xFF;
+    let arg_count = desc.meta >> 8 & 0xFF;
+    let is_stdcall = desc.meta >> 16 & 1 != 0;
+    let stack_bytes = arg_count * 4;
+    if !wbuf_range_accessible(esp, stack_bytes, false) {
+        return -1;
+    }
+
+    let head = wbuf_read_u32(desc.ctrl_addr);
+    if head > desc.capacity {
+        return -1;
+    }
+
+    let mut payload = (0u32, 0u32); // (data_ptr, byte length) — empty for the scalar kind
+    let stride = if kind == WBUF_KIND_SCALAR {
+        (arg_count + 1) * 4
+    }
+    else {
+        let data_ptr = wbuf_read_u32(esp + 8);
+        let vec4_count = wbuf_read_u32(esp + 12);
+        if vec4_count == 0 || vec4_count > 256 {
+            return -1;
+        }
+        let payload_bytes = vec4_count * 16;
+        if !wbuf_range_accessible(data_ptr, payload_bytes, false) {
+            return -1;
+        }
+        payload = (data_ptr, payload_bytes);
+        (4 + vec4_count * 4) * 4
+    };
+    let dst = match desc.data_base.checked_add(head) {
+        Some(dst) => dst,
+        None => return -1,
+    };
+    if stride > desc.capacity - head || !wbuf_range_accessible(dst, stride, true) {
+        return -1;
+    }
+    // The ring is guest-addressable and both source ranges are guest-controlled, so an
+    // aliasing caller could otherwise make the copy read bytes this call is still writing.
+    if wbuf_ranges_overlap(payload.0, payload.1, dst, stride)
+        || wbuf_ranges_overlap(esp, stack_bytes, dst, stride)
+    {
+        return -1;
+    }
+
+    wbuf_write_u32(dst, desc.func_id);
+    if kind == WBUF_KIND_SCALAR {
+        for i in 0..arg_count {
+            wbuf_write_u32(dst + 4 + i * 4, wbuf_read_u32(esp + i * 4));
+        }
+    }
+    else {
+        let this_ptr = wbuf_read_u32(esp);
+        let start_reg = wbuf_read_u32(esp + 4);
+        let data_ptr = wbuf_read_u32(esp + 8);
+        let vec4_count = wbuf_read_u32(esp + 12);
+        wbuf_write_u32(dst + 4, this_ptr);
+        wbuf_write_u32(dst + 8, start_reg);
+        wbuf_write_u32(dst + 12, vec4_count);
+        std::ptr::copy_nonoverlapping(
+            memory::mem8.add(data_ptr as usize),
+            memory::mem8.add((dst + 16) as usize),
+            (vec4_count * 16) as usize,
+        );
+    }
+    wbuf_write_u32(desc.ctrl_addr, head + stride);
+    if is_stdcall { stack_bytes as i32 } else { 0 }
+}
+
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_get_hits() -> u32 { WBUF_INTRINSIC_HITS }
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_get_fallbacks() -> u32 { WBUF_INTRINSIC_FALLBACKS }
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_get_enabled() -> u32 { WBUF_INTRINSIC_ENABLED }
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_get_registered() -> u32 { WBUF_INTRINSIC_REGISTERED }
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_get_min_target() -> u32 { WBUF_INTRINSIC_MIN_TARGET }
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_get_max_target() -> u32 { WBUF_INTRINSIC_MAX_TARGET }
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_get_codegen_call32() -> u32 { WBUF_INTRINSIC_CODEGEN_CALL32 }
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_get_codegen_ss32() -> u32 { WBUF_INTRINSIC_CODEGEN_SS32 }
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_reset_stats() {
+    WBUF_INTRINSIC_HITS = 0;
+    WBUF_INTRINSIC_FALLBACKS = 0;
+}
+
+/// Drop all process-owned WBUF intrinsic state. Generated modules only retain pointers to
+/// these runtime words, so clearing the registry is sufficient to make every old CALL site
+/// decline safely until the next process publishes fresh descriptors.
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_clear_registry() {
+    WBUF_INTRINSIC_ENABLED = 0;
+    WBUF_INTRINSIC_MIN_TARGET = u32::MAX;
+    WBUF_INTRINSIC_MAX_TARGET = 0;
+    WBUF_INTRINSIC_TABLE = [WBUF_INTRINSIC_EMPTY; WBUF_INTRINSIC_CAPACITY];
+    WBUF_INTRINSIC_HOT = [WBUF_INTRINSIC_EMPTY; WBUF_INTRINSIC_HOT_CAPACITY];
+    WBUF_INTRINSIC_HOT_MIN_TARGET = u32::MAX;
+    WBUF_INTRINSIC_HOT_MAX_TARGET = 0;
+    WBUF_INTRINSIC_REGISTERED = 0;
+    WBUF_INTRINSIC_HITS = 0;
+    WBUF_INTRINSIC_FALLBACKS = 0;
+    WBUF_INTRINSIC_CODEGEN_CALL32 = 0;
+    WBUF_INTRINSIC_CODEGEN_SS32 = 0;
+}
+
 // Maximum number of pages per wasm module. Necessary for the following reasons:
 // - There is an upper limit on the size of a single function in wasm (currently ~7MB in all browsers)
 //   See https://github.com/WebAssembly/design/issues/1138
@@ -71,14 +437,19 @@ static mut JIT_DISABLED: bool = false;
 static mut MAX_PAGES: u32 = 3;
 
 static mut JIT_USE_LOOP_SAFETY: bool = true;
+// Direct known-successor cross-module chaining: after a direct jump leaves the
+// current module, resolve the already-written runtime EIP through DISPATCH_META
+// and tail-call the destination module instead of returning to cycle_internal.
+// Gated at COMPILE time — toggle via set_jit_config(4) and clear the JIT cache.
+static mut JIT_BLOCK_CHAINING: bool = false;
 // RET/AbsoluteEip dynamic chaining: when the in-module AbsoluteEip
 // re-dispatch misses, attempt a cross-module tail-call at the runtime eip instead of
 // exiting to main_loop. Gated at COMPILE time — toggle via
 // set_jit_config(12) and clear the JIT cache.
 static mut JIT_RET_CHAINING: bool = false;
-// Count CHAINED module entries toward tier-2 hotness (idx 20, default ON). Pure accounting:
-// it changes no emitted code, so both arms run identical modules and switching needs no
-// cache clear — which is what separates idx 12's CODE effect from its COUNTER effect.
+// Count CHAINED module entries in the V8-tier census (idx 20, default ON). Tier-2
+// promotion itself is retired-instruction weighted; this switch is now diagnostics-only.
+// It changes no emitted code, so switching needs no cache clear.
 static mut JIT_CHAIN_TIER2_ACCOUNTING: bool = true;
 // RET-target speculation (superblock lite): annotate the RET of a
 // small module-local leaf with its call sites' return addresses and emit inline
@@ -396,14 +767,17 @@ pub fn jit_verify_dispatch_entry(
     false
 }
 
-// B3 hotness tiering: a module whose RE-ENTRY count (bumped per cycle_internal entry —
-// the cheapest per-module execution proxy that needs no codegen) crosses the threshold
-// gets its pages marked tier-2 and is freed; the ordinary hotness path recompiles it,
-// and jit_find_basic_blocks sees the tier-2 marking and compiles with expanded budgets
-// (more pages per module + a deeper RET-speculation window). Cold code never pays for
-// the expensive compilation. Threshold 0 disables (set_jit_config idx 15); the page-set
-// cap bounds runaway promotion (compile-storm guard — once full, no new promotions).
-static mut JIT_TIER2_THRESHOLD: u32 = 300_000;
+// B3 hotness tiering: generated modules credit their RETIRED guest instructions at
+// module exits and before cross-module tail calls. This fixes the structural bias of
+// entry-count tiering: a long, tight physics loop is hot even if it enters its module
+// once, while fragmented/vtable-heavy code no longer wins merely by dispatching often.
+// Crossing the threshold queues a promotion for the next cycle_internal safe point.
+// Threshold 0 disables (set_jit_config idx 15).
+// Experimental and opt-in.  The retired-instruction policy and bounded replacement
+// set are safe to exercise, but the expanded modules regressed the representative
+// mixed RE workload in a fresh-load host-timed A/B.  Shipping therefore keeps the
+// threshold at zero until a policy/budget wins on representative games.
+static mut JIT_TIER2_THRESHOLD: u32 = 0;
 static mut JIT_TIER2_RET_SPEC_MAX_INSTR: u32 = 96;
 // Runtime-tunable (set_jit_config idx 17) so the tier-2 module-size budget can be
 // A/B'd in-race without a rebuild; 8 was never tuned. Raising it grows only PROMOTED
@@ -411,18 +785,41 @@ static mut JIT_TIER2_RET_SPEC_MAX_INSTR: u32 = 96;
 // that forbids raising the global cap doesn't apply at moderate values.
 static mut TIER2_MAX_PAGES: u32 = 8;
 const TIER2_PAGE_SET_CAP: usize = 256;
-static mut MODULE_EXEC_COUNTS: [u32; 0x10000] = [0; 0x10000];
+const TIER2_CANDIDATE_SET_CAP: usize = 1024;
+const TIER2_REPLACE_HITS: u8 = 8;
+static mut MODULE_RETIRED_COUNTS: [u64; 0x10000] = [0; 0x10000];
+static mut MODULE_RETIRED_TOTALS: [u64; 0x10000] = [0; 0x10000];
+// Monotonic instance-lifetime denominator for the V8 tier census. Per-slot totals must
+// reset on recycling, but this one deliberately does not: work retired by a module that
+// is promoted, invalidated, or evicted is reported as unobserved rather than disappearing.
+static mut TIER2_RETIRED_TOTAL: u64 = 0;
+// Number of threshold quanta represented by a queued promotion. A single long-running
+// activation can retire many quanta before it exits, and deserves equivalent admission
+// weight without enqueueing the same table slot repeatedly.
+static mut MODULE_PROMOTION_CREDITS: [u8; 0x10000] = [0; 0x10000];
 
-// Per-module entry count for the SLOT'S CURRENT LIFE (reset when the index is freed),
-// unlike MODULE_EXEC_COUNTS which tier-2 zeroes on promotion. It weights a per-slot V8
-// tier sample (dbg.jitTierStats) by execution, turning "how many modules are in baseline"
-// into "what share of EXECUTION never reaches the optimizing tier". Reset-on-free is what
-// lets the sampler detect slot recycling: a negative delta means a different module.
+// Per-module entry count for the SLOT'S CURRENT LIFE (reset when the index is freed).
+// It weights a per-slot V8 tier sample (dbg.jitTierStats) by execution, turning "how many
+// modules are in baseline" into "what share of EXECUTION never reaches the optimizing
+// tier". Reset-on-free lets the sampler detect slot recycling: a negative delta means a
+// different module.
 static mut MODULE_ENTRY_TOTALS: [u32; 0x10000] = [0; 0x10000];
 
 #[no_mangle]
 pub fn jit_get_module_entry_total(wasm_table_index: u32) -> u32 {
     unsafe { MODULE_ENTRY_TOTALS[(wasm_table_index & 0xFFFF) as usize] }
+}
+
+/// Retired guest instructions for the slot's current life. f64 is exact for every
+/// realistic session total and crosses the wasm boundary without BigInt plumbing.
+#[no_mangle]
+pub fn jit_get_module_retired_total(wasm_table_index: u32) -> f64 {
+    unsafe { MODULE_RETIRED_TOTALS[(wasm_table_index & 0xFFFF) as usize] as f64 }
+}
+
+#[no_mangle]
+pub fn jit_get_tier2_retired_total() -> f64 {
+    unsafe { TIER2_RETIRED_TOTAL as f64 }
 }
 
 // Tier-2 observability (read via dbg.tier2Stats()): without these there is no way to
@@ -431,6 +828,7 @@ pub fn jit_get_module_entry_total(wasm_table_index: u32) -> u32 {
 // zero FPS delta because the cap, not the threshold, was the limiter candidate).
 static mut TIER2_PROMOTIONS: u32 = 0;
 static mut TIER2_BLOCKED_BY_CAP: u32 = 0;
+static mut TIER2_EVICTIONS: u32 = 0;
 
 #[no_mangle]
 pub fn jit_get_tier2_page_count() -> u32 {
@@ -444,60 +842,189 @@ pub fn jit_get_tier2_promotions() -> u32 {
 pub fn jit_get_tier2_blocked_by_cap() -> u32 {
     unsafe { TIER2_BLOCKED_BY_CAP }
 }
-/// Distinct pages the cap refused (see `tier2_blocked_pages`). Read against the refusal
-/// count: distinct << count means a few hot modules retry, distinct ~ count means the
-/// hot set genuinely outgrew TIER2_PAGE_SET_CAP.
+#[no_mangle]
+pub fn jit_get_tier2_evictions() -> u32 {
+    unsafe { TIER2_EVICTIONS }
+}
+/// Distinct probationary pages deferred by the active-set admission policy (see
+/// `tier2_blocked_pages`). Read against the deferral count: distinct << count means a few
+/// candidates are accumulating replacement evidence, while distinct ~ count means the
+/// hot set is broadly wider than TIER2_PAGE_SET_CAP.
 #[no_mangle]
 pub fn jit_get_tier2_blocked_distinct() -> u32 {
     get_jit_state().tier2_blocked_pages.len() as u32
 }
-/// i-th tier-2 page address (page<<12), 0 when i >= count. Iteration order is the
-/// HashSet's (arbitrary but stable between mutations) — callers use this to feed
-/// trace2_watch_page with known-hot pages (tier-2 membership == crossed the re-entry
-/// threshold), closing the "which pages should Tier-2R watch" loop without an EIP
-/// sampler (which only sees idle/yield EIPs — JS timers can't fire mid-cycle-slice).
+/// i-th tier-2 page address (page<<12), 0 when i >= count. Sorted by address so a
+/// capped trace watcher sees a reproducible subset rather than HashSet iteration order.
 #[no_mangle]
 pub fn jit_get_tier2_page_at(i: u32) -> u32 {
     let ctx = get_jit_state();
-    match ctx.tier2_pages.iter().nth(i as usize) {
-        Some(p) => p.to_address(),
-        None => 0,
-    }
+    let mut pages: Vec<Page> = ctx.tier2_pages.iter().copied().collect();
+    pages.sort_by_key(|p| p.to_address());
+    pages.get(i as usize).map_or(0, |p| p.to_address())
 }
 
-/// Bump the entry counters for one module entry. Returns true when THIS entry crossed the
-/// tier-2 threshold (and consumes the crossing by resetting the promotion counter).
-///
-/// Split out of `jit_tier2_note_execution` so a caller that cannot safely promote — a
-/// chained edge, which runs inside a live generated frame — can still do the ACCOUNTING,
-/// which is all a chained edge owes. Touches nothing but two plain static arrays: no
-/// JitState lock, no allocation, no map walk. That matters because the chain path is the
-/// hottest dispatch path in the JIT.
+/// Bump the entry census for one module entry. Promotion uses retired instructions;
+/// entries remain useful for measuring V8 Liftoff/TurboFan exposure.
 #[inline]
-fn tier2_count_entry(wasm_table_index: u16) -> bool { tier2_count_entry_by(wasm_table_index, 1) }
+fn tier2_count_entry(wasm_table_index: u16) { tier2_count_entry_by(wasm_table_index, 1) }
 
-/// As `tier2_count_entry`, but crediting `by` entries at once — what a sampled caller owes
-/// (see `chain_note_execution`). `>=` rather than `==` on the threshold, because a credited
-/// stride can step over it.
+/// As `tier2_count_entry`, but crediting a sampled chained-dispatch stride at once.
 #[inline]
-fn tier2_count_entry_by(wasm_table_index: u16, by: u32) -> bool {
+fn tier2_count_entry_by(wasm_table_index: u16, by: u32) {
     unsafe {
         let t = &mut (*std::ptr::addr_of_mut!(MODULE_ENTRY_TOTALS))[wasm_table_index as usize];
         *t = t.wrapping_add(by);
     }
-    let threshold = unsafe { JIT_TIER2_THRESHOLD };
+}
+
+fn tier2_pending_enqueue(idx: u16) {
+    unsafe {
+        let len = TIER2_PENDING_LEN as usize;
+        if TIER2_PENDING[..len].contains(&idx) {
+            return;
+        }
+        if len >= TIER2_PENDING_CAP {
+            TIER2_PENDING_DROPPED += 1;
+            return;
+        }
+        TIER2_PENDING[len] = idx;
+        TIER2_PENDING_LEN += 1;
+    }
+}
+
+/// Credit actual guest instructions retired by one generated module activation.
+/// Called from generated code while its frame is live, so it only queues promotion.
+#[no_mangle]
+pub fn jit_tier2_note_retired(wasm_table_index: u32, retired: u32) {
+    if retired == 0 || wasm_table_index > u16::MAX as u32 {
+        return;
+    }
+    let idx = wasm_table_index as u16;
+    let threshold = unsafe { JIT_TIER2_THRESHOLD } as u64;
+    // Shipping OFF is also an accounting-overhead kill switch. Live modules compiled
+    // while OFF omit this call entirely; this guard covers an in-flight/old module and
+    // the accounting folded into the always-present dynamic-chain resolver.
     if threshold == 0 {
+        return;
+    }
+    unsafe {
+        TIER2_RETIRED_TOTAL = TIER2_RETIRED_TOTAL.wrapping_add(retired as u64);
+        let total = &mut (*std::ptr::addr_of_mut!(MODULE_RETIRED_TOTALS))[idx as usize];
+        *total = total.wrapping_add(retired as u64);
+        let count = &mut (*std::ptr::addr_of_mut!(MODULE_RETIRED_COUNTS))[idx as usize];
+        *count += retired as u64;
+        let crossings = *count / threshold;
+        if crossings == 0 {
+            return;
+        }
+        *count %= threshold;
+        let credit = &mut (*std::ptr::addr_of_mut!(MODULE_PROMOTION_CREDITS))[idx as usize];
+        *credit = credit.saturating_add(crossings.min(u8::MAX as u64) as u8);
+    }
+    tier2_pending_enqueue(idx);
+}
+
+/// AOT units are relocatable and intentionally contain no wasm-table slot constant. They
+/// therefore contribute to the lifetime retired denominator without participating in
+/// per-slot promotion; the JS census reports this work as `unknown` instead of losing it.
+#[no_mangle]
+pub fn jit_tier2_note_aot_retired(retired: u32) {
+    if unsafe { JIT_TIER2_THRESHOLD } == 0 { return; }
+    unsafe { TIER2_RETIRED_TOTAL = TIER2_RETIRED_TOTAL.wrapping_add(retired as u64) };
+}
+
+/// Record evidence for pages asking to displace the active set. The candidate set is
+/// independently bounded; on overflow Misra-Gries decay preserves recurring candidates
+/// while cancelling one-shot breadth. This prevents both unbounded metadata and a full
+/// table permanently freezing out a later hot phase.
+fn tier2_note_candidates(ctx: &mut JitState, pages: &[Page], credit: u8, touch: u64) {
+    for &page in pages.iter().filter(|p| !ctx.tier2_pages.contains(p)) {
+        if let Some((hits, last)) = ctx.tier2_candidates.get_mut(&page) {
+            *hits = hits.saturating_add(credit);
+            *last = touch;
+            continue;
+        }
+        if ctx.tier2_candidates.len() >= TIER2_CANDIDATE_SET_CAP {
+            // Bounded Misra-Gries decay: a full table must not permanently freeze when every
+            // old candidate has more hits than a recurring new phase's single credit. Decay
+            // all evidence and reclaim zeros; frequent pages survive and repeated newcomers
+            // eventually obtain a tracked slot, while one-shot broad scans cancel out.
+            let decay = credit.max(1);
+            let mut expired = Vec::new();
+            ctx.tier2_candidates.retain(|p, (hits, _)| {
+                *hits = hits.saturating_sub(decay);
+                if *hits == 0 { expired.push(*p); false } else { true }
+            });
+            for p in expired { ctx.tier2_blocked_pages.remove(&p); }
+            if ctx.tier2_candidates.len() >= TIER2_CANDIDATE_SET_CAP {
+                continue;
+            }
+        }
+        ctx.tier2_candidates.insert(page, (credit, touch));
+        ctx.tier2_blocked_pages.insert(page);
+    }
+}
+
+/// Admit a module's pages into the bounded active hot set. Coarse LRU touches happen
+/// only at retired-instruction threshold crossings. Once the set is full, a candidate
+/// must accumulate several crossings before it may replace the oldest active pages; the
+/// hysteresis preserves phase adaptation without the compile/evict storm caused by pure
+/// LRU on broad workloads.
+fn tier2_admit_pages(ctx: &mut JitState, pages: &[Page], credit: u8) -> bool {
+    if pages.len() > TIER2_PAGE_SET_CAP {
+        unsafe { TIER2_BLOCKED_BY_CAP += 1 };
+        for p in pages { ctx.tier2_blocked_pages.insert(*p); }
         return false;
     }
-    let count = unsafe {
-        let c = &mut (*std::ptr::addr_of_mut!(MODULE_EXEC_COUNTS))[wasm_table_index as usize];
-        *c = c.wrapping_add(by);
-        *c
-    };
-    if count < threshold {
-        return false;
+
+    ctx.tier2_touch_clock = ctx.tier2_touch_clock.wrapping_add(1);
+    let touch = ctx.tier2_touch_clock;
+    let new_count = pages.iter().filter(|p| !ctx.tier2_pages.contains(p)).count();
+    let evict_count = (ctx.tier2_pages.len() + new_count).saturating_sub(TIER2_PAGE_SET_CAP);
+    if evict_count > 0 {
+        tier2_note_candidates(ctx, pages, credit.max(1), touch);
+        let qualified = pages.iter()
+            .filter(|p| !ctx.tier2_pages.contains(p))
+            .all(|p| ctx.tier2_candidates.get(p).is_some_and(|(hits, _)| *hits >= TIER2_REPLACE_HITS));
+        if !qualified {
+            unsafe { TIER2_BLOCKED_BY_CAP += 1 };
+            return false;
+        }
+        let incoming: HashSet<Page> = pages.iter().copied().collect();
+        let mut victims: Vec<(u64, u32, Page)> = ctx.tier2_pages.iter()
+            .filter(|p| !incoming.contains(p))
+            .map(|p| (*ctx.tier2_page_touches.get(p).unwrap_or(&0), p.to_address(), *p))
+            .collect();
+        victims.sort_by_key(|v| (v.0, v.1));
+        if victims.len() < evict_count {
+            unsafe { TIER2_BLOCKED_BY_CAP += 1 };
+            for p in pages { ctx.tier2_blocked_pages.insert(*p); }
+            return false;
+        }
+        let mut victim_roots = Vec::new();
+        for &(_, _, victim) in victims.iter().take(evict_count) {
+            if let Some(info) = ctx.pages.get(&victim) {
+                victim_roots.push(info.wasm_table_index);
+            }
+            ctx.tier2_pages.remove(&victim);
+            ctx.tier2_page_touches.remove(&victim);
+            unsafe { TIER2_EVICTIONS += 1 };
+        }
+        // Removing the admission tag alone leaves the already-expanded wasm resident. At
+        // this safe point no generated frame is live, so invalidate each victim module once;
+        // a later cache miss recompiles it with baseline budgets unless another tagged page
+        // from that module remains active.
+        if !victim_roots.is_empty() {
+            free_wasm_module_forest(ctx, victim_roots);
+        }
     }
-    unsafe { MODULE_EXEC_COUNTS[wasm_table_index as usize] = 0 };
+    for p in pages {
+        ctx.tier2_pages.insert(*p);
+        ctx.tier2_page_touches.insert(*p, touch);
+        ctx.tier2_candidates.remove(p);
+        ctx.tier2_blocked_pages.remove(p);
+    }
     true
 }
 
@@ -506,9 +1033,14 @@ fn tier2_count_entry_by(wasm_table_index: u16, by: u32) -> bool {
 ///
 /// CONTRACT: no generated frame for `wasm_table_index` (or any module it shares pages with)
 /// may be live — this nulls table slots, clears dispatch meta and drops the TLB HAS_CODE
-/// bit. Only two call sites satisfy that: `jit_tier2_note_execution` (cycle_internal,
-/// BETWEEN module entries) and `jit_tier2_drain_pending` (same, before dispatch).
+/// bit. The sole call site is `jit_tier2_drain_pending`, run from cycle_internal between
+/// module entries before dispatch.
 fn tier2_promote(wasm_table_index: u16) -> bool {
+    let credit = unsafe {
+        let c = MODULE_PROMOTION_CREDITS[wasm_table_index as usize].max(1);
+        MODULE_PROMOTION_CREDITS[wasm_table_index as usize] = 0;
+        c
+    };
     let mut ctx = get_jit_state();
     let index = WasmTableIndex(wasm_table_index);
     let pages: Vec<Page> = ctx
@@ -520,37 +1052,26 @@ fn tier2_promote(wasm_table_index: u16) -> bool {
     if pages.is_empty() {
         return false;
     }
-    // Already fully tier-2? Nothing to gain from another free/recompile churn.
+    // Already fully tier-2? Refresh its coarse LRU position without recompiling.
     if pages.iter().all(|p| ctx.tier2_pages.contains(p)) {
+        tier2_admit_pages(&mut ctx, &pages, credit);
         return false;
     }
-    if ctx.tier2_pages.len() + pages.len() > TIER2_PAGE_SET_CAP {
-        unsafe { TIER2_BLOCKED_BY_CAP += 1 };
-        for p in &pages {
-            if !ctx.tier2_pages.contains(p) {
-                ctx.tier2_blocked_pages.insert(*p);
-            }
-        }
+    if !tier2_admit_pages(&mut ctx, &pages, credit) {
         return false;
-    }
-    for p in &pages {
-        ctx.tier2_pages.insert(*p);
-        // A page that got in is no longer starved — otherwise the set reports a lifetime
-        // tally instead of what is currently being refused, and only ever grows.
-        ctx.tier2_blocked_pages.remove(p);
     }
     unsafe { TIER2_PROMOTIONS += 1 };
     free_wasm_module_tree(&mut ctx, index);
     true
 }
 
-/// Called from cycle_internal on every compiled-module entry. Returns true when the
-/// module was just promoted to tier-2 AND freed — the caller must not dispatch into it
-/// (run interpreted this slice; hotness recompiles it with the tier-2 budget).
+/// Called from cycle_internal on every compiled-module entry. This is an entry-path census
+/// only; retired-instruction accounting queues tier-2 promotion from generated code.
 #[no_mangle]
 pub fn jit_tier2_note_execution(wasm_table_index: u16) -> bool {
     unsafe { TIER2_DIRECT_ENTRIES += 1 };
-    tier2_count_entry(wasm_table_index) && tier2_promote(wasm_table_index)
+    tier2_count_entry(wasm_table_index);
+    false
 }
 
 // Entry-event census, split by the path the entry arrived on. RET chaining (idx 12) changes
@@ -570,9 +1091,8 @@ pub fn jit_get_tier2_chain_entries() -> f64 { unsafe { TIER2_CHAIN_ENTRIES as f6
 #[no_mangle]
 pub fn jit_get_tier2_direct_entries() -> f64 { unsafe { TIER2_DIRECT_ENTRIES as f64 } }
 
-// Promotions owed to CHAINED entries. A chained edge is counted where it happens (see
-// chain_note_execution) but promoted here, because the counting site runs inside a live
-// generated frame and tier2_promote's contract forbids that.
+// Promotions owed to retired instructions. Generated modules credit their local counter
+// while a frame is live, then promotion is applied here at the next safe point.
 //
 // Bounded and lossy on purpose: overflow only delays a promotion to the module's next
 // threshold crossing, so the cap costs accuracy, never correctness — and a static array
@@ -605,11 +1125,15 @@ fn tier2_pending_drop(idx: u16) {
 
 /// Apply the promotions queued by chained entries.
 ///
-/// MUST be called only from cycle_internal, i.e. between module entries: it is the same
-/// safe point `jit_tier2_note_execution` already promotes at. Near-free when idle (one
-/// static load and a branch), which is why it can sit on the per-block path.
+/// MUST be called only from cycle_internal, i.e. between module entries, because promotion
+/// invalidates compiled table entries. Near-free when idle (one static load and a branch),
+/// which is why it can sit on the per-block path.
 #[no_mangle]
 pub fn jit_tier2_drain_pending() {
+    if unsafe { JIT_TIER2_THRESHOLD } == 0 {
+        unsafe { TIER2_PENDING_LEN = 0 };
+        return;
+    }
     let n = unsafe { TIER2_PENDING_LEN } as usize;
     if n == 0 {
         return;
@@ -620,8 +1144,34 @@ pub fn jit_tier2_drain_pending() {
     }
 }
 
+/// Runtime kill switch for Tier-2. This export is called from JS between main-loop slices,
+/// never from a live generated frame, so clearing compiled modules is safe. A full cache
+/// clear is intentional: an older admission policy may have left expanded modules whose
+/// page tags were already evicted, and retaining those would make an OFF arm dishonest.
+fn tier2_disable_and_clear() {
+    unsafe {
+        TIER2_PENDING_LEN = 0;
+        for i in 0..0x10000 {
+            MODULE_RETIRED_COUNTS[i] = 0;
+            MODULE_PROMOTION_CREDITS[i] = 0;
+        }
+    }
+    let mut ctx = get_jit_state();
+    jit_clear_cache(&mut ctx);
+    ctx.tier2_pages.clear();
+    ctx.tier2_page_touches.clear();
+    ctx.tier2_candidates.clear();
+    ctx.tier2_blocked_pages.clear();
+    ctx.tier2_touch_clock = 0;
+}
+
 static mut JIT_DEAD_FLAG_ELISION: bool = false;
 static mut JIT_X87_LOCALS: bool = false;
+// Cache the runtime x87 precision-control predicate across consecutive relaxed
+// arithmetic instructions in one basic block (idx 31). Any non-arithmetic
+// instruction ends the run, so control-word restoring instructions cannot leave
+// a stale value behind.
+static mut JIT_X87_PC_LOCAL: bool = true;
 static mut JIT_PUSH_RUN_COALESCING: bool = false;
 // Fastmem WRITES behind a per-page writability map (idx 19).
 // Off by default until the in-game gate passes.
@@ -659,6 +1209,23 @@ static mut JIT_BRANCH_HINT_OFFSET_FUZZ: u32 = 0;
 // future investigations if a trace captured without foreknowledge already has it.
 static mut JIT_FUNCTION_NAMES: bool = true;
 
+// Block-local read micro-TLB (idx 29) for one offline-profiled guest code page (idx 30).
+// 0=off, 1=on, 2=on+census. The cache never crosses a basic block and every generated
+// guest write invalidates it, so it cannot survive an operation that may refill/clear the
+// architectural TLB. Targeting keeps the extra locals/guards out of unrelated modules.
+static mut JIT_READ_TLB_CACHE_MODE: u32 = 0;
+static mut JIT_READ_TLB_CACHE_PAGE: u32 = u32::MAX;
+
+pub fn read_tlb_cache_enabled_for(code_addr: u32) -> bool {
+    unsafe { JIT_READ_TLB_CACHE_MODE != 0 && code_addr >> 12 == JIT_READ_TLB_CACHE_PAGE }
+}
+
+pub fn read_tlb_cache_census_enabled() -> bool {
+    unsafe { JIT_READ_TLB_CACHE_MODE >= 2 }
+}
+
+pub fn x87_pc_local_enabled() -> bool { unsafe { JIT_X87_PC_LOCAL } }
+
 // Tier-2R region recompiler: grow page groups across
 // indirect edges using trace_profiler target histograms, and make hot indirect
 // targets dispatcher entries so AbsoluteEip re-dispatches stay intra-module.
@@ -688,6 +1255,10 @@ fn region_target_excluded(target: u32) -> bool {
 }
 static mut JIT_INDIRECT_REGION_MIN_SHARE: u32 = 5; // percent of per-site hits
 const JIT_INDIRECT_REGION_MAX_TARGETS: usize = 16;
+// Keep the emitted per-site PIC deliberately small. Region formation may still absorb
+// more profiled targets below, but only the two hottest targets get an inline EIP compare;
+// everything else keeps the stock in-page resolver + dynamic-chain fallback.
+const JIT_INDIRECT_REGION_PIC_TARGETS: usize = 2;
 // Page budget for region growth ACROSS INDIRECT EDGES only — kept separate from
 // the global MAX_PAGES (which caps normal direct-jump BFS at 3). Raising the
 // global cap instead bloats EVERY module via long direct-call chains and OOMs
@@ -705,8 +1276,101 @@ pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 // its hot modules (set_dispatch_stats(1) at boot, then clear the JIT cache) and read the result
 // via profiler_dispatch_stat_get. OFF by default — zero cost on the production path.
 pub static mut DISPATCH_STATS: bool = false;
+
+// ---------------------------------------------------------------------------
+// Entry-EIP census (docs/performance/sota-roadmap/07)
+// ---------------------------------------------------------------------------
+//
+// The dispatch counters say WHICH CLASS of transition pays the tax; they cannot say which
+// call site or return site produces it, and "widen the memo" and "form a bigger region
+// here" are decisions about specific addresses. So this samples the EIP every dispatcher
+// entry takes, which is the address a `re resolve` can turn into a function name.
+//
+// A direct-mapped table rather than a hash map: this runs on the dispatch path, and a
+// table that allocates or rehashes there would change what it measures. A colliding entry
+// EVICTS and is counted, so the readout can say how much of the distribution it lost
+// instead of presenting a truncated top-N as if it were complete.
+//
+// Gated by DISPATCH_STATS, so production pays one predictable branch.
+const ENTRY_EIP_SLOTS: usize = 1024;
+
+#[allow(non_upper_case_globals)]
+static mut entry_eip_addr: [u32; ENTRY_EIP_SLOTS] = [0; ENTRY_EIP_SLOTS];
+#[allow(non_upper_case_globals)]
+static mut entry_eip_hits: [u64; ENTRY_EIP_SLOTS] = [0; ENTRY_EIP_SLOTS];
+#[allow(non_upper_case_globals)]
+static mut entry_eip_evictions: u64 = 0;
+#[allow(non_upper_case_globals)]
+static mut entry_eip_samples: u64 = 0;
+
+/// Fibonacci hashing of the address: the low bits of an EIP are far from uniform (aligned
+/// function entries, one hot loop per page), and indexing on them alone would pile the
+/// interesting addresses into a handful of slots.
+#[inline]
+fn entry_eip_slot(eip: u32) -> usize {
+    (eip.wrapping_mul(0x9E37_79B9) >> (32 - 10)) as usize & (ENTRY_EIP_SLOTS - 1)
+}
+
+pub fn note_entry_eip(eip: u32) {
+    if !dispatch_stats_enabled() {
+        return;
+    }
+    unsafe {
+        entry_eip_samples += 1;
+        let slot = entry_eip_slot(eip);
+        if entry_eip_addr[slot] == eip {
+            entry_eip_hits[slot] += 1;
+        }
+        else if entry_eip_hits[slot] == 0 {
+            entry_eip_addr[slot] = eip;
+            entry_eip_hits[slot] = 1;
+        }
+        else {
+            // Occupied by a different address. Decay rather than replace outright, so a
+            // genuinely hot address displaces a one-off but a stream of one-offs cannot
+            // displace a hot one.
+            entry_eip_hits[slot] -= 1;
+            entry_eip_evictions += 1;
+        }
+    }
+}
+
+#[no_mangle]
+pub fn entry_eip_census_reset() {
+    unsafe {
+        #[allow(static_mut_refs)]
+        for x in entry_eip_addr.iter_mut() { *x = 0 }
+        #[allow(static_mut_refs)]
+        for x in entry_eip_hits.iter_mut() { *x = 0 }
+        entry_eip_evictions = 0;
+        entry_eip_samples = 0;
+    }
+}
+
+#[no_mangle]
+pub fn entry_eip_census_slots() -> u32 { ENTRY_EIP_SLOTS as u32 }
+
+#[no_mangle]
+pub fn entry_eip_census_addr(i: u32) -> u32 {
+    if (i as usize) < ENTRY_EIP_SLOTS { unsafe { entry_eip_addr[i as usize] } } else { 0 }
+}
+
+#[no_mangle]
+pub fn entry_eip_census_hits(i: u32) -> f64 {
+    if (i as usize) < ENTRY_EIP_SLOTS { unsafe { entry_eip_hits[i as usize] as f64 } } else { 0.0 }
+}
+
+/// Samples the table could not attribute (collisions). A large share against
+/// `entry_eip_census_samples` means the top-N below is a sample of a wider distribution,
+/// not the distribution.
+#[no_mangle]
+pub fn entry_eip_census_evictions() -> f64 { unsafe { entry_eip_evictions as f64 } }
+
+#[no_mangle]
+pub fn entry_eip_census_samples() -> f64 { unsafe { entry_eip_samples as f64 } }
 pub fn dispatch_stats_enabled() -> bool { unsafe { DISPATCH_STATS } }
 fn ret_chaining_enabled() -> bool { unsafe { JIT_RET_CHAINING } }
+fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
 fn ret_speculation_enabled() -> bool { unsafe { JIT_RET_SPECULATION } }
 fn dead_flag_elision_enabled() -> bool { unsafe { JIT_DEAD_FLAG_ELISION } }
 
@@ -1275,14 +1939,21 @@ struct JitState {
     // Rust owns this reservation until commit or abort. JS must clear its corresponding
     // table entry before calling abort; Rust never infers ownership from that table.
     aot_staged: Option<AotTransaction>,
-    // B3 hotness tiering: pages promoted to tier-2 (jit_tier2_note_execution) — modules
-    // whose entries land on these pages compile with the expanded tier-2 budgets.
+    // B3 hotness tiering: pages promoted after retired-instruction threshold crossings —
+    // modules whose entries land on these pages compile with the expanded tier-2 budgets.
     // Survives jit_clear_cache (the pages are still the hot ones); dies with the wasm
     // instance (per game load).
     tier2_pages: HashSet<Page>,
-    // Pages a promotion wanted and the cap refused. The refusal COUNT cannot distinguish
-    // "one hot module retrying forever" from "hundreds of distinct pages starved", and those
-    // two want opposite fixes — a bigger cap versus a replacement policy.
+    // Coarse LRU stamp, updated only when a module crosses the retired-instruction
+    // threshold. Same cardinality as tier2_pages; no per-entry hot-path map access.
+    tier2_page_touches: HashMap<Page, u64>,
+    tier2_touch_clock: u64,
+    // Probationary pages that want to displace the active set: (threshold hits,
+    // last touch). Bounded separately so phase adaptation cannot grow metadata forever.
+    tier2_candidates: HashMap<Page, (u8, u64)>,
+    // Probationary pages whose admission is deferred. The deferral COUNT cannot distinguish
+    // "one candidate gathering evidence" from "hundreds of distinct pages competing", so
+    // keep this distinct-page view alongside it for diagnostics.
     tier2_blocked_pages: HashSet<Page>,
     #[cfg(debug_assertions)]
     wasm_table_index_to_page: HashMap<WasmTableIndex, HashSet<Page>>,
@@ -1381,6 +2052,9 @@ impl JitState {
             compiling: None,
             aot_staged: None,
             tier2_pages: HashSet::new(),
+            tier2_page_touches: HashMap::new(),
+            tier2_touch_clock: 0,
+            tier2_candidates: HashMap::new(),
             tier2_blocked_pages: HashSet::new(),
 
             #[cfg(debug_assertions)]
@@ -1427,6 +2101,12 @@ pub struct BasicBlock {
     /// otherwise. The compare guards correctness — a stale/wrong candidate simply
     /// falls through to the existing dispatch.
     pub ret_speculation: Vec<(i32, u32)>,
+    /// Profile-guided indirect targets that were successfully joined to this module.
+    /// Each pair is (runtime virtual EIP, physical dispatcher block). The emitter uses
+    /// exact EIP compares and only accepts current top-level dispatcher entries. A stale
+    /// profile therefore adds at worst a dead compare; an exact hit still dispatches the
+    /// current bytes' validated block, never code retained from the profile's lifetime.
+    pub indirect_local_dispatch: Vec<(i32, u32)>,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1516,10 +2196,23 @@ pub struct JitContext<'a> {
     pub fpu_simd_dirty_marked: bool,
     pub elide_current_flags: bool,
     pub instruction_counter: WasmLocal,
+    /// Table slot of the generated module that owns this activation. Kept in the
+    /// codegen context so instruction-specific early returns can attribute retired
+    /// guest instructions just like the shared module epilogue.
+    pub wasm_table_index: u16,
     /// Emit the per-page-map store fast path for this unit.
     pub fastmem_writes: bool,
     pub x87_local_cache: [Option<X87LocalCacheSlot>; 8],
     pub push32_write_cache: Option<Push32WriteCache>,
+    pub read_tlb_cache: Option<ReadTlbCache>,
+    /// Scratch for the permission-bitmap read path: the wasm offset both arms converge on.
+    /// One local for the whole unit rather than one per access — ten memory operands in a
+    /// loop body meant ten locals and ten initialisers, which cost more than the probe saved.
+    pub perm_map_off: Option<WasmLocal>,
+    /// Runtime `(fpu_control_word & 0x300) == 0`, reused only while every
+    /// consecutive guest instruction is relaxed x87 arithmetic.
+    pub fpu_pc_cache: Option<WasmLocal>,
+    pub fpu_pc_cache_kept: bool,
     /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
     /// cache coherent (it either updated the touched slot or invalidated all
     /// slots). Reset to false before each instruction; if an x87 opcode
@@ -1537,6 +2230,12 @@ pub struct X87LocalCacheSlot {
 }
 
 pub struct Push32WriteCache {
+    pub page: WasmLocal,
+    pub entry: WasmLocal,
+    pub valid: WasmLocal,
+}
+
+pub struct ReadTlbCache {
     pub page: WasmLocal,
     pub entry: WasmLocal,
     pub valid: WasmLocal,
@@ -1841,26 +2540,19 @@ pub fn jit_find_cache_entry_in_page(
 /// Account a CHAINED module entry.
 ///
 /// A chained edge jumps module→module without passing through `cycle_internal`, the only
-/// place `jit_tier2_note_execution` runs — so without this a large share of module entries is
-/// invisible to hotness accounting and to `MODULE_ENTRY_TOTALS`.
+/// place `jit_tier2_note_execution` runs, so without this a large share of module entries is
+/// invisible to the diagnostic `MODULE_ENTRY_TOTALS` census.
 ///
-/// Counted here, but only counted: promotion is QUEUED for `jit_tier2_drain_pending`, because
-/// this runs inside a live generated frame and promotion frees the module tree, which
-/// `tier2_promote`'s contract forbids. Deferring costs at most one cycle slice against a
-/// threshold of hundreds of thousands of entries and leaves the edge itself untouched — the
-/// target module is still valid and installed.
+/// Retired-instruction promotion is accounted separately by the generated activation exit
+/// (or folded into the cross-module chain lookup helpers) and queued for the next safe drain.
 #[inline]
 unsafe fn chain_note_execution(packed: i32) {
     // Stride sampling. The accounting itself is two scattered 64K-array read-modify-writes
     // plus a u64 add, and it runs on EVERY chained dispatch — ~20M/s in a vtable-dispatch
     // title, which measured as 1.5% of the whole worker thread purely to feed a counter.
-    // Against a promotion threshold of hundreds of thousands of entries, one sample in
-    // CHAIN_NOTE_STRIDE credited with the whole stride is the same decision: a module needs
-    // ~300k/stride samples, and at stride 32 that is still ~9400 independent observations,
-    // far past where sampling error could reorder the hot set. Cold modules (fewer entries
-    // than one stride) were never promotion candidates. What DOES become approximate is
-    // MODULE_ENTRY_TOTALS as a per-slot execution weight (dbg.jitTierStats) — quantized to
-    // the stride, still unbiased. Stride 1 is exact and is what the A/B compares against.
+    // The entry census is diagnostic rather than a promotion signal. Sampling makes
+    // MODULE_ENTRY_TOTALS approximate as a per-slot execution weight (dbg.jitTierStats),
+    // quantized to the stride but still unbiased. Stride 1 restores exact census data.
     let tick = CHAIN_NOTE_TICK.wrapping_add(1);
     CHAIN_NOTE_TICK = tick;
     if tick & CHAIN_NOTE_MASK != 0 {
@@ -1876,29 +2568,94 @@ unsafe fn chain_note_execution(packed: i32) {
     if !JIT_CHAIN_TIER2_ACCOUNTING {
         return;
     }
-    let idx = idx as u16;
-    if !tier2_count_entry_by(idx, credit) {
-        return;
+    tier2_count_entry_by(idx as u16, credit);
+}
+
+/// Direct known-successor chaining. The generated caller has already committed
+/// registers, EIP, and its local instruction count before entering this helper.
+/// A hit returns the packed (table_slot << 16 | unit_state) target convention;
+/// every miss preserves the stock module-exit path.
+#[no_mangle]
+pub unsafe fn jit_find_cache_entry_for_chaining(
+    state_flags: u32,
+    current_wasm_table_index: u32,
+    retired: u32,
+) -> i32 {
+    // Chained activations do not pass cycle_internal, so credit this activation
+    // before either the tail-call or fallback exit. The caller resets its local
+    // counter immediately after this call, preventing a miss from double-counting.
+    jit_tier2_note_retired(current_wasm_table_index, retired);
+
+    // Match do_many_cycles_native's full hypercall quantum. In particular,
+    // limit==0 is the urgent-exit signal and must never be chained past.
+    let limit = hypercall::read_cycle_limit();
+    let elapsed = (*global_pointers::instruction_counter)
+        .wrapping_sub(cpu::jit_cycle_start_instruction_counter);
+    if limit == 0 || elapsed >= limit || *global_pointers::in_hlt {
+        if dispatch_stats_enabled() {
+            profiler::stat_increment_always(stat::MODULE_EXIT_CHAINABLE);
+            profiler::stat_increment_always(stat::MODULE_CHAIN_BUDGET_EXIT);
+        }
+        return -1;
     }
-    let len = TIER2_PENDING_LEN as usize;
-    if len >= TIER2_PENDING_CAP {
-        TIER2_PENDING_DROPPED += 1;
-        return;
+
+    let virt_address = *global_pointers::instruction_pointer as u32;
+    let state_flags = CachedStateFlags::of_u32(state_flags);
+    let meta = dispatch_meta_get(virt_address >> 12);
+    if meta != 0 && dispatch_meta_state_flags(meta) == state_flags.to_u32() {
+        let unit_state = dispatch_state_lookup(meta, virt_address);
+        if unit_state != u16::MAX {
+            // Keep the optional wrong-entry detector effective on this new
+            // dispatch path. Production mode is a zero-lock straight DOD lookup.
+            let verified = if !wrong_entry_verify_enabled() {
+                true
+            }
+            else {
+                match cpu::translate_address_read_no_side_effects(virt_address as i32) {
+                    Ok(phys) => jit_verify_dispatch_entry(
+                        phys,
+                        state_flags,
+                        dispatch_meta_table_index(meta),
+                        unit_state,
+                        virt_address,
+                        true,
+                    ),
+                    Err(()) => false,
+                }
+            };
+            if verified || !wrong_entry_refuse() {
+                if dispatch_stats_enabled() {
+                    profiler::stat_increment_always(stat::MODULE_CHAINED_EDGE);
+                }
+                let table_slot =
+                    dispatch_meta_table_index(meta) as i32 + cpu::WASM_TABLE_OFFSET as i32;
+                let packed = table_slot << 16 | unit_state as i32;
+                chain_note_execution(packed);
+                return packed;
+            }
+        }
     }
-    // A module can cross the threshold twice before a drain; promoting it twice would walk
-    // (and free) an index that is no longer its own.
-    if TIER2_PENDING[..len].contains(&idx) {
-        return;
+
+    if dispatch_stats_enabled() {
+        profiler::stat_increment_always(stat::MODULE_EXIT_CHAINABLE);
+        profiler::stat_increment_always(stat::MODULE_CHAIN_MISS);
     }
-    TIER2_PENDING[len] = idx;
-    TIER2_PENDING_LEN += 1;
+    -1
 }
 
 /// RET/AbsoluteEip dynamic chaining: budget-guarded tlb_code lookup at the runtime eip,
 /// returning the packed (table_slot << 16 | unit_state) target convention, with its own
 /// RET_CHAIN_HIT/RET_CHAIN_MISS stats.
 #[no_mangle]
-pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(state_flags: u32) -> i32 {
+pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(
+    state_flags: u32,
+    current_wasm_table_index: u32,
+    retired: u32,
+) -> i32 {
+    // This helper already sits on every successful/failed dynamic chain attempt. Fold
+    // retired accounting into it instead of adding a second cross-module wasm call to
+    // the hottest edge. The generated caller resets its local counter after this call.
+    jit_tier2_note_retired(current_wasm_table_index, retired);
     // same quantum as do_many_cycles_native (limit==0 urgent exit and in_hlt still bail) —
     // this is what keeps the async-park/spin-loop invariant: an urgent
     // exit request zeroes the budget, so we never chain past it.
@@ -2244,6 +3001,7 @@ fn jit_find_basic_blocks(
             has_sti: false,
             number_of_instructions: 0,
             ret_speculation: Vec::new(),
+            indirect_local_dispatch: Vec::new(),
         };
         loop {
             let addr_before_instruction = current_address;
@@ -2450,7 +3208,7 @@ fn jit_find_basic_blocks(
                                 if !registered {
                                     continue;
                                 }
-                                if follow_jump(
+                                if let Some(phys_target) = follow_jump(
                                     target as i32,
                                     ctx,
                                     &mut pages,
@@ -2459,9 +3217,19 @@ fn jit_find_basic_blocks(
                                     &mut marked_as_entry,
                                     &mut to_visit_stack,
                                 )
-                                .is_some()
                                 {
                                     marked_as_entry.insert(target as i32);
+                                    // `targets` is hottest-first. Keep region growth broad,
+                                    // but cap the inline compare chain independently so a
+                                    // polymorphic site cannot bloat every generated module.
+                                    if current_block.indirect_local_dispatch.len()
+                                        < JIT_INDIRECT_REGION_PIC_TARGETS
+                                    {
+                                        let candidate = (target as i32, phys_target);
+                                        if !current_block.indirect_local_dispatch.contains(&candidate) {
+                                            current_block.indirect_local_dispatch.push(candidate);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3193,14 +3961,16 @@ pub fn jit_aot_tx_begin(wasm_table_index: u32, page_count: u32, fp_lo: u32, fp_h
         None => return AOT_TX_SLOT_UNAVAILABLE,
     };
     let count = page_count as usize;
+    // AOT code is already compiled and uses global-only retired accounting: it has no
+    // relocatable table-slot constant and therefore cannot request live-JIT promotion.
+    // Keep AOT ownership out of the replaceable live tier-2 set; otherwise OFF was not
+    // strict and an old AOT unit became an unintended LRU victim when the set filled.
     let mut pages = Vec::new();
     #[cfg(debug_assertions)]
     let mut debug_pages = HashSet::new();
     #[allow(unused_mut)]
     let mut reserve_failed = pages.try_reserve_exact(count).is_err()
-        || ctx.pages.try_reserve(count).is_err()
-        || ctx.tier2_pages.try_reserve(count).is_err()
-        || ctx.tier2_blocked_pages.try_reserve(count).is_err();
+        || ctx.pages.try_reserve(count).is_err();
     #[cfg(debug_assertions)]
     {
         reserve_failed = reserve_failed
@@ -3319,14 +4089,6 @@ pub fn jit_aot_tx_commit() -> u32 {
     for staged in tx.pages {
         let page = staged.page;
         ctx.pages.insert(page, staged.info);
-        if ctx.tier2_pages.len() < TIER2_PAGE_SET_CAP {
-            ctx.tier2_pages.insert(page);
-            ctx.tier2_blocked_pages.remove(&page);
-        }
-        else {
-            unsafe { AOT_TIER2_BLOCKED_BY_CAP += 1 };
-            ctx.tier2_blocked_pages.insert(page);
-        }
     }
     #[cfg(debug_assertions)]
     { ctx.wasm_table_index_to_page.insert(index, debug_pages); }
@@ -3365,13 +4127,6 @@ pub fn jit_register_aot_module(wasm_table_index: u32, phys_addr: u32, state_flag
     // Retired: per-page publication would violate unit atomicity.
     AOT_TX_BAD_STATE
 }
-
-static mut AOT_TIER2_BLOCKED_BY_CAP: u32 = 0;
-
-/// Registrations that could not mark their page tier-2 because the page-set cap was full.
-/// Nonzero means some units will still be evicted at their first promotion.
-#[no_mangle]
-pub fn jit_aot_tier2_blocked_count() -> u32 { unsafe { AOT_TIER2_BLOCKED_BY_CAP } }
 
 /// Drop every TLB entry so the next access to a registered page rebuilds it — and
 /// `update_tlb_code` then stamps dispatch meta FROM `ctx.pages`, i.e. correct by
@@ -3487,16 +4242,240 @@ pub fn set_tlb_code(
     dispatch_meta_set(virt_page, wasm_table_index, entries, state_flags);
 }
 
-// Statically-chainable direct-jump exit: record the exit as chainable and branch to the
-// module exit label (main_loop re-dispatch). (Static block-chaining was removed; the live
-// cross-module chaining mechanism is the dynamic RET path, set_jit_config idx 12.)
+// Inline the sampled entry census on direct chains. Keeping the sampling branch inside the
+// generated module is important: calling `chain_note_execution` at every direct edge erased
+// the whole dispatch saving on real workloads. The uncommon sampled edge still updates the
+// same counters, with the same runtime-tunable stride/accounting policy.
+fn gen_direct_chain_entry_accounting(ctx: &mut JitContext, table_index: &WasmLocal) {
+    let tick_addr = std::ptr::addr_of!(CHAIN_NOTE_TICK) as u32;
+    let mask_addr = std::ptr::addr_of!(CHAIN_NOTE_MASK) as u32;
+    let chain_entries_addr = std::ptr::addr_of!(TIER2_CHAIN_ENTRIES) as u32;
+    let accounting_addr = std::ptr::addr_of!(JIT_CHAIN_TIER2_ACCOUNTING) as u32;
+    let module_entries_addr = std::ptr::addr_of!(MODULE_ENTRY_TOTALS) as u32;
+
+    ctx.builder.const_i32(tick_addr as i32);
+    ctx.builder.load_fixed_i32(tick_addr);
+    ctx.builder.const_i32(1);
+    ctx.builder.add_i32();
+    let tick = ctx.builder.tee_new_local();
+    ctx.builder.store_aligned_i32(0);
+
+    ctx.builder.get_local(&tick);
+    ctx.builder.load_fixed_i32(mask_addr);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+
+    // TIER2_CHAIN_ENTRIES += mask + 1
+    ctx.builder.const_i32(chain_entries_addr as i32);
+    ctx.builder.load_fixed_i64(chain_entries_addr);
+    ctx.builder.load_fixed_i32(mask_addr);
+    ctx.builder.const_i32(1);
+    ctx.builder.add_i32();
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.add_i64();
+    ctx.builder.store_aligned_i64(0);
+
+    ctx.builder.load_fixed_u8(accounting_addr);
+    ctx.builder.if_void();
+    // MODULE_ENTRY_TOTALS[table_index] += mask + 1
+    ctx.builder.const_i32(module_entries_addr as i32);
+    ctx.builder.get_local(table_index);
+    ctx.builder.const_i32(4);
+    ctx.builder.mul_i32();
+    ctx.builder.add_i32();
+    let entry_addr = ctx.builder.set_new_local();
+    ctx.builder.get_local(&entry_addr);
+    ctx.builder.get_local(&entry_addr);
+    ctx.builder.load_aligned_i32(0);
+    ctx.builder.load_fixed_i32(mask_addr);
+    ctx.builder.const_i32(1);
+    ctx.builder.add_i32();
+    ctx.builder.add_i32();
+    ctx.builder.store_aligned_i32(0);
+    ctx.builder.free_local(entry_addr);
+    ctx.builder.block_end();
+
+    ctx.builder.block_end();
+    ctx.builder.free_local(tick);
+}
+
+// Statically-chainable direct-jump exit. With idx 4 disabled this is byte-for-byte the
+// stock module exit. With idx 4 enabled, commit architectural state and tail-call a live
+// compiled successor; any budget/lookup/validation miss falls through to the same exit.
+// The production hit path is entirely generated wasm: fixed-memory budget guards plus a
+// DOD meta/slab lookup. The meta word is the generation guard — freeing/recycling a module
+// clears or republishes it before its table slot can be reused.
 fn gen_chain_or_exit_to_known_successor(
     ctx: &mut JitContext,
-    _state_flags: CachedStateFlags,
-    _last_instruction_addr: u32,
+    state_flags: CachedStateFlags,
+    last_instruction_addr: u32,
 ) {
+    if !block_chaining_enabled() {
+        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+        ctx.builder.br(ctx.exit_label);
+        return;
+    }
+
+    codegen::gen_move_registers_from_locals_to_memory(ctx);
+    codegen::gen_update_instruction_counter(ctx);
+
+    // Diagnostic wrong-entry verification deliberately remains in Rust: it walks the
+    // authoritative page map and is never part of the production (mode 0) hot path.
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(WRONG_ENTRY_REFUSE) as u32);
+    ctx.builder.if_void();
+        ctx.builder.const_i32(state_flags.to_u32() as i32);
+        ctx.builder.const_i32(ctx.wasm_table_index as i32);
+        ctx.builder.get_local(&ctx.instruction_counter);
+        ctx.builder.call_fn3_ret("jit_find_cache_entry_for_chaining");
+        let packed_target = ctx.builder.tee_new_local();
+        ctx.builder.const_i32(0);
+        ctx.builder.set_local(&ctx.instruction_counter);
+        ctx.builder.get_local(&packed_target);
+        ctx.builder.const_i32(0);
+        ctx.builder.ge_i32();
+        ctx.builder.if_void();
+            ctx.builder.get_local(&packed_target);
+            ctx.builder.const_i32(0xFFFF);
+            ctx.builder.and_i32();
+            ctx.builder.get_local(&packed_target);
+            ctx.builder.const_i32(16);
+            ctx.builder.shr_u_i32();
+            ctx.builder.return_call_indirect_fn1();
+        ctx.builder.block_end();
+        ctx.builder.free_local(packed_target);
+        codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+        ctx.builder.br(ctx.exit_label);
+    ctx.builder.block_end();
+
+    // The helper-free path credits this activation once before either tail-call or exit.
+    gen_tier2_note_retired(ctx);
+    ctx.builder.const_i32(0);
+    ctx.builder.set_local(&ctx.instruction_counter);
+
+    let attempt = ctx.builder.block_void();
+
+    // cycle_limit == 0 means either the legacy uninitialised default (HC disabled) or an
+    // urgent scheduler exit (HC enabled). Preserve read_cycle_limit() exactly.
+    let hp = unsafe { hypercall::hp_ptr() as u32 };
+    ctx.builder.load_fixed_i32(hp);
+    let limit = ctx.builder.set_new_local();
+    ctx.builder.get_local(&limit);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+        ctx.builder.load_fixed_i32(hp + 0x008);
+        ctx.builder.if_void();
+            codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+            codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_CHAIN_BUDGET_EXIT);
+            ctx.builder.br(attempt);
+        ctx.builder.block_end();
+        ctx.builder.const_i32(100_003);
+        ctx.builder.set_local(&limit);
+    ctx.builder.block_end();
+
+    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32);
+    ctx.builder.sub_i32();
+    ctx.builder.get_local(&limit);
+    ctx.builder.geu_i32();
+    ctx.builder.if_void();
+        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_CHAIN_BUDGET_EXIT);
+        ctx.builder.br(attempt);
+    ctx.builder.block_end();
+    ctx.builder.load_fixed_u8(global_pointers::in_hlt as u32);
+    ctx.builder.if_void();
+        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_CHAIN_BUDGET_EXIT);
+        ctx.builder.br(attempt);
+    ctx.builder.block_end();
+    ctx.builder.free_local(limit);
+
+    let lookup = ctx.builder.block_void();
+    ctx.builder.load_fixed_i32(global_pointers::instruction_pointer as u32);
+    let eip = ctx.builder.set_new_local();
+    ctx.builder.const_i32(std::ptr::addr_of!(DISPATCH_META) as u32 as i32);
+    ctx.builder.get_local(&eip);
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(8);
+    ctx.builder.mul_i32();
+    ctx.builder.add_i32();
+    ctx.builder.load_aligned_i64(0);
+    let meta = ctx.builder.set_new_local_i64();
+
+    ctx.builder.get_local_i64(&meta);
+    ctx.builder.const_i64(0);
+    ctx.builder.eq_i64();
+    ctx.builder.br_if(lookup);
+    ctx.builder.get_local_i64(&meta);
+    ctx.builder.const_i64(32);
+    ctx.builder.shr_u_i64();
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32(state_flags.to_u32() as i32);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(lookup);
+
+    ctx.builder.get_local_i64(&meta);
+    ctx.builder.const_i64(16);
+    ctx.builder.shr_u_i64();
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.and_i32();
+    let table_index = ctx.builder.set_new_local();
+
+    ctx.builder.const_i32(std::ptr::addr_of!(DISPATCH_SLABS) as u32 as i32);
+    ctx.builder.get_local_i64(&meta);
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(0x2000);
+    ctx.builder.mul_i32();
+    ctx.builder.add_i32();
+    ctx.builder.get_local(&eip);
+    ctx.builder.const_i32(0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(2);
+    ctx.builder.mul_i32();
+    ctx.builder.add_i32();
+    ctx.builder.load_aligned_u16(0);
+    let state_cell = ctx.builder.tee_new_local();
+    ctx.builder.eqz_i32();
+    ctx.builder.br_if(lookup);
+
+    gen_direct_chain_entry_accounting(ctx, &table_index);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_CHAINED_EDGE);
+    ctx.builder.get_local(&state_cell);
+    ctx.builder.const_i32(1);
+    ctx.builder.sub_i32();
+    ctx.builder.get_local(&table_index);
+    ctx.builder.const_i32(cpu::WASM_TABLE_OFFSET as i32);
+    ctx.builder.add_i32();
+    ctx.builder.return_call_indirect_fn1();
+
+    ctx.builder.block_end();
     codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_CHAIN_MISS);
+    ctx.builder.block_end();
+
+    ctx.builder.free_local(state_cell);
+    ctx.builder.free_local(table_index);
+    ctx.builder.free_local_i64(meta);
+    ctx.builder.free_local(eip);
+    codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
     ctx.builder.br(ctx.exit_label);
+}
+
+/// Attribute this activation's local guest-instruction count to its module at a real
+/// module exit. Cross-module chain exits fold the same operation into their existing
+/// lookup helper to avoid a second wasm call on the hottest edge.
+pub fn gen_tier2_note_retired(ctx: &mut JitContext) {
+    if unsafe { JIT_TIER2_THRESHOLD } == 0 {
+        return;
+    }
+    ctx.builder.const_i32(ctx.wasm_table_index as i32);
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.call_fn2("jit_tier2_note_retired");
 }
 
 fn jit_generate_module(
@@ -3573,9 +4552,14 @@ fn jit_generate_module(
         fpu_simd_dirty_marked: false,
         elide_current_flags: false,
         instruction_counter,
+        wasm_table_index: wasm_table_index.to_u16(),
         fastmem_writes: fastmem_writes_compile_enabled(state_flags),
         x87_local_cache: std::array::from_fn(|_| None),
         push32_write_cache: None,
+        read_tlb_cache: None,
+        perm_map_off: None,
+        fpu_pc_cache: None,
+        fpu_pc_cache_kept: false,
         x87_cache_kept: false,
     };
 
@@ -3703,6 +4687,7 @@ fn jit_generate_module(
                     codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_DYNAMIC);
                     codegen::gen_move_registers_from_locals_to_memory(ctx);
                     codegen::gen_fn0_const(ctx.builder, "handle_irqs");
+                    gen_tier2_note_retired(ctx);
                     codegen::gen_update_instruction_counter(ctx);
                     ctx.builder.return_();
                     continue;
@@ -3726,14 +4711,21 @@ fn jit_generate_module(
                             codegen::gen_get_eip(ctx.builder);
                             ctx.builder.call_fn2("trace2_record_indirect");
                         }
-                        // RET-target speculation: a leaf's RET
-                        // whose module-local call sites are known compares the runtime
-                        // eip against each return address and re-enters the module
-                        // dispatcher directly, skipping the helper call below. Return
-                        // addresses were marked_as_entry at their CALLs, so they are
-                        // top-dispatcher entries (index < entry_blocks.len()); anything
-                        // else is skipped defensively.
-                        for &(cand_virt, cand_phys) in &block.ret_speculation {
+                        // Module-local PIC: both statically discovered RET candidates and
+                        // profiled indirect-region targets compare the exact runtime EIP and
+                        // re-enter this module's dispatcher directly. Candidates must be
+                        // top-dispatcher entries (index < entry_blocks.len()); anything else
+                        // is skipped defensively. A miss falls through byte-for-byte to the
+                        // stock in-page resolver and dynamic-chain path below.
+                        let mut emitted_local_targets = HashSet::new();
+                        for &(cand_virt, cand_phys) in block
+                            .ret_speculation
+                            .iter()
+                            .chain(block.indirect_local_dispatch.iter())
+                        {
+                            if !emitted_local_targets.insert((cand_virt, cand_phys)) {
+                                continue;
+                            }
                             if let Some(&idx) = index_for_addr.get(&cand_phys) {
                                 if (idx as usize) < entry_blocks.len() {
                                     codegen::gen_get_eip(ctx.builder);
@@ -3748,21 +4740,77 @@ fn jit_generate_module(
                             }
                         }
 
-                        // Check if we can stay in this module, if not exit
+                        // Helper-free in-module DOD lookup. AbsoluteEip is reached by every
+                        // guest RET and indirect call/jump; crossing the Wasm module boundary
+                        // merely to perform two linear-memory loads dominated polymorphic
+                        // workloads. This is the same generation-safe meta/slab lookup used by
+                        // gen_chain_or_exit_to_known_successor, specialized to this module.
+                        codegen::gen_profiler_stat_increment(ctx.builder, stat::INDIRECT_JUMP);
+                        codegen::gen_dispatch_stat_increment(ctx.builder, stat::ABSEIP_DISPATCH);
+                        let in_page_miss = ctx.builder.block_void();
                         codegen::gen_get_eip(ctx.builder);
-                        ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
+                        let indirect_eip = ctx.builder.set_new_local();
+                        ctx.builder.const_i32(std::ptr::addr_of!(DISPATCH_META) as u32 as i32);
+                        ctx.builder.get_local(&indirect_eip);
+                        ctx.builder.const_i32(12);
+                        ctx.builder.shr_u_i32();
+                        ctx.builder.const_i32(8);
+                        ctx.builder.mul_i32();
+                        ctx.builder.add_i32();
+                        ctx.builder.load_aligned_i64(0);
+                        let dispatch_meta = ctx.builder.set_new_local_i64();
+
+                        ctx.builder.get_local_i64(&dispatch_meta);
+                        ctx.builder.const_i64(0);
+                        ctx.builder.eq_i64();
+                        ctx.builder.br_if(in_page_miss);
+                        ctx.builder.get_local_i64(&dispatch_meta);
+                        ctx.builder.const_i64(32);
+                        ctx.builder.shr_u_i64();
+                        ctx.builder.wrap_i64_to_i32();
                         ctx.builder.const_i32(state_flags.to_u32() as i32);
-                        ctx.builder.call_fn3_ret("jit_find_cache_entry_in_page");
-                        ctx.builder.tee_local(target_block);
-                        ctx.builder.const_i32(0);
-                        ctx.builder.ge_i32();
-                        // The branch stays conditional by design: the miss path below is no
-                        // longer a plain exit — it attempts a cross-module tail-call (RET
-                        // dynamic chaining), which must run between the in-page miss and the
-                        // module exit. Folding the miss into the dispatcher br_table (the old
-                        // idea here) would lose that attempt for the price of one predictable
-                        // branch on the hit path.
-                        ctx.builder.br_if(main_loop_label);
+                        ctx.builder.ne_i32();
+                        ctx.builder.br_if(in_page_miss);
+                        ctx.builder.get_local_i64(&dispatch_meta);
+                        ctx.builder.const_i64(16);
+                        ctx.builder.shr_u_i64();
+                        ctx.builder.wrap_i64_to_i32();
+                        ctx.builder.const_i32(0xFFFF);
+                        ctx.builder.and_i32();
+                        ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
+                        ctx.builder.ne_i32();
+                        ctx.builder.br_if(in_page_miss);
+
+                        ctx.builder.const_i32(std::ptr::addr_of!(DISPATCH_SLABS) as u32 as i32);
+                        ctx.builder.get_local_i64(&dispatch_meta);
+                        ctx.builder.wrap_i64_to_i32();
+                        ctx.builder.const_i32(0xFFFF);
+                        ctx.builder.and_i32();
+                        ctx.builder.const_i32(0x2000);
+                        ctx.builder.mul_i32();
+                        ctx.builder.add_i32();
+                        ctx.builder.get_local(&indirect_eip);
+                        ctx.builder.const_i32(0xFFF);
+                        ctx.builder.and_i32();
+                        ctx.builder.const_i32(2);
+                        ctx.builder.mul_i32();
+                        ctx.builder.add_i32();
+                        ctx.builder.load_aligned_u16(0);
+                        let dispatch_cell = ctx.builder.tee_new_local();
+                        ctx.builder.eqz_i32();
+                        ctx.builder.br_if(in_page_miss);
+                        ctx.builder.get_local(&dispatch_cell);
+                        ctx.builder.const_i32(1);
+                        ctx.builder.sub_i32();
+                        ctx.builder.set_local(target_block);
+                        ctx.builder.br(main_loop_label);
+                        ctx.builder.block_end();
+                        ctx.builder.free_local(dispatch_cell);
+                        ctx.builder.free_local_i64(dispatch_meta);
+                        ctx.builder.free_local(indirect_eip);
+
+                        codegen::gen_profiler_stat_increment(ctx.builder, stat::INDIRECT_JUMP_NO_ENTRY);
+                        codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_INDIRECT);
 
                         // RET/indirect dynamic chaining: the in-module
                         // re-dispatch missed, but the runtime eip may hit ANOTHER compiled
@@ -3775,13 +4823,16 @@ fn jit_generate_module(
                         if ret_chaining_enabled() {
                             codegen::gen_move_registers_from_locals_to_memory(ctx);
                             codegen::gen_update_instruction_counter(ctx);
-                            ctx.builder.const_i32(0);
-                            ctx.builder.set_local(&ctx.instruction_counter);
 
                             ctx.builder.const_i32(state_flags.to_u32() as i32);
+                            ctx.builder.const_i32(ctx.wasm_table_index as i32);
+                            ctx.builder.get_local(&ctx.instruction_counter);
                             ctx.builder
-                                .call_fn1_ret("jit_find_cache_entry_for_dynamic_chaining");
+                                .call_fn3_ret("jit_find_cache_entry_for_dynamic_chaining");
                             let packed_target = ctx.builder.tee_new_local();
+
+                            ctx.builder.const_i32(0);
+                            ctx.builder.set_local(&ctx.instruction_counter);
 
                             ctx.builder.get_local(&packed_target);
                             ctx.builder.const_i32(0);
@@ -4428,6 +5479,7 @@ fn jit_generate_module(
         ctx.builder.block_end();
         codegen::gen_move_registers_from_locals_to_memory(ctx);
         codegen::gen_fn0_const(ctx.builder, "trigger_fault_end_jit");
+        gen_tier2_note_retired(ctx);
         codegen::gen_update_instruction_counter(ctx);
         ctx.builder.return_();
     }
@@ -4435,6 +5487,7 @@ fn jit_generate_module(
         // exit
         ctx.builder.block_end();
         codegen::gen_move_registers_from_locals_to_memory(ctx);
+        gen_tier2_note_retired(ctx);
         codegen::gen_update_instruction_counter(ctx);
     }
 
@@ -4613,9 +5666,13 @@ fn jit_generate_basic_block(
     ctx.elide_current_flags = false;
 
     loop {
-        let mut instruction = 0;
-        if cfg!(feature = "profiler") {
-            instruction = memory::read32s(ctx.cpu.eip) as u32;
+        // Eight bytes, not four: the operand-form census needs the SIB byte, and a
+        // prefixed 0F opcode pushes it past the fourth. Gated at RUNTIME (the census is a
+        // switch now, not a build), so production reads nothing and emits nothing.
+        let mut instruction: u64 = 0;
+        if opstats::opstats_enabled() {
+            instruction = (memory::read32s(ctx.cpu.eip) as u32 as u64)
+                | ((memory::read32s(ctx.cpu.eip + 4) as u32 as u64) << 32);
             opstats::gen_opstats(ctx.builder, instruction);
             opstats::record_opstat_compiled(instruction);
         }
@@ -4641,9 +5698,17 @@ fn jit_generate_basic_block(
             should_elide_current_flags(&*ctx.cpu, start_eip, block, basic_blocks);
         // Relaxed x87 wrappers set this when they keep the st cache coherent.
         ctx.x87_cache_kept = false;
+        ctx.fpu_pc_cache_kept = false;
         let mut instruction_flags = 0;
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;
+
+        // The PC predicate is deliberately narrower than the generic ST cache:
+        // it survives only through an uninterrupted run of relaxed arithmetic.
+        // Thus every possible control-word writer/restorer is an implicit fence.
+        if ctx.fpu_pc_cache.is_some() && !ctx.fpu_pc_cache_kept {
+            codegen::gen_fpu_pc_cache_free(ctx);
+        }
 
         // Raw x87 helpers mutate TOP/st memory behind the local cache; MMX ops
         // (incl. EMMS) alias the same fpu_st storage and must invalidate too.
@@ -4670,6 +5735,9 @@ fn jit_generate_basic_block(
             dbg_assert!(Page::page_of(end_addr) == Page::page_of(start_addr));
             codegen::gen_x87_local_cache_free_all(ctx);
             codegen::gen_push32_write_cache_free(ctx);
+            codegen::gen_read_tlb_cache_free(ctx);
+            codegen::gen_perm_map_off_free(ctx);
+            codegen::gen_fpu_pc_cache_free(ctx);
             break;
         }
 
@@ -4685,6 +5753,9 @@ fn jit_generate_basic_block(
             dbg_assert!(false);
             codegen::gen_x87_local_cache_free_all(ctx);
             codegen::gen_push32_write_cache_free(ctx);
+            codegen::gen_read_tlb_cache_free(ctx);
+            codegen::gen_perm_map_off_free(ctx);
+            codegen::gen_fpu_pc_cache_free(ctx);
             break;
         }
 
@@ -4824,7 +5895,9 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
     // the null-function crash of the first landing — see the RET_CACHE comment). Also
     // reset the tier-2 execution counter for the recycled index (B3).
     ret_cache_invalidate_all();
-    unsafe { MODULE_EXEC_COUNTS[wasm_table_index.to_u16() as usize] = 0 };
+    unsafe { MODULE_RETIRED_COUNTS[wasm_table_index.to_u16() as usize] = 0 };
+    unsafe { MODULE_RETIRED_TOTALS[wasm_table_index.to_u16() as usize] = 0 };
+    unsafe { MODULE_PROMOTION_CREDITS[wasm_table_index.to_u16() as usize] = 0 };
     unsafe { MODULE_ENTRY_TOTALS[wasm_table_index.to_u16() as usize] = 0 };
     // A queued promotion names a SLOT, and the slot is about to be recycled. Left in the
     // queue it would promote — and free — whichever freshly compiled module lands here next.
@@ -4850,8 +5923,11 @@ fn free_wasm_module(ctx: &mut JitState, wasm_table_index: WasmTableIndex) -> Vec
             if meta != 0 && dispatch_meta_table_index(meta) == wasm_table_index.to_u16() {
                 dispatch_meta_clear(page as u32);
                 if !ctx.entry_points.contains_key(&tlb_physical_page) {
-                    // XXX
-                    unsafe { cpu::tlb_data[page as usize] &= !cpu::TLB_HAS_CODE };
+                    // Through the single writer: the permission bitmap mirrors tlb_data, so a
+                    // direct clear here drifts its PERM_HAS_CODE bit on every module free.
+                    unsafe {
+                        cpu::set_tlb_entry(page, cpu::tlb_data[page as usize] & !cpu::TLB_HAS_CODE)
+                    };
                 }
             }
         }
@@ -5149,8 +6225,11 @@ pub fn enter_basic_block(phys_eip: u32) {
     }
 }
 
-pub const JIT_CONFIG_ABI_VERSION: u32 = 1;
-const JIT_CONFIG_SUPPORTED_MASK: u32 = 0x1FFB_FDEF;
+// Version 4 covers the complete 0..31 configuration envelope, including the read-TLB
+// experiments and x87 precision-control local. Older bytecode must not be replayed when
+// either the supported mask or a code-shaping value differs.
+pub const JIT_CONFIG_ABI_VERSION: u32 = 4;
+const JIT_CONFIG_SUPPORTED_MASK: u32 = 0xFFFB_FDFF;
 const JIT_CONFIG_UNSUPPORTED: u32 = u32::MAX;
 
 #[inline]
@@ -5165,7 +6244,7 @@ pub fn jit_config_abi_version() -> u32 { JIT_CONFIG_ABI_VERSION }
 pub fn jit_config_supported_mask() -> u32 { JIT_CONFIG_SUPPORTED_MASK }
 
 // FNV-1a over the exact inputs that affect emitted JIT wasm. Field order is ABI-stable:
-// configuration indices 1-3, 5-8, 10-14, 16-17, 19, 21-23, and 28; relaxed-FPU mode and its
+// configuration indices 1-8, 10-14, 16-17, 19, 21-23, and 28-31; relaxed-FPU mode and its
 // hit/fallback counters; DISPATCH_STATS; and the fixed fastmem layout constants.
 // Policy/accounting/diagnostic indices 0, 15, 20, and 24 deliberately do not participate.
 // Index 28 (function names) emits no code, but it DOES change module bytes, and the AOT
@@ -5177,10 +6256,14 @@ fn jit_codegen_fingerprint() -> u64 {
         hash ^= value as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
     };
+    // Generated-code ABI revision. Bump whenever an always-on emitter changes so an AOT
+    // module produced by an older runtime cannot silently bypass the new code shape.
+    add(11);
     unsafe {
         add(MAX_PAGES);
         add(JIT_USE_LOOP_SAFETY as u32);
         add(MAX_EXTRA_BASIC_BLOCKS);
+        add(JIT_BLOCK_CHAINING as u32);
         add(JIT_DEAD_FLAG_ELISION as u32);
         add(JIT_INDIRECT_REGIONS as u32);
         add(JIT_INDIRECT_REGION_MIN_SHARE);
@@ -5192,15 +6275,30 @@ fn jit_codegen_fingerprint() -> u64 {
         add(JIT_RET_SPEC_MAX_INSTR);
         add(JIT_TIER2_RET_SPEC_MAX_INSTR);
         add(TIER2_MAX_PAGES);
+        // OFF modules omit retired-accounting calls; ON modules contain them. The
+        // absolute threshold remains policy-only, but zero/nonzero changes code shape.
+        add((JIT_TIER2_THRESHOLD != 0) as u32);
         add(JIT_FASTMEM_WRITES as u32);
         add(JIT_FLAG_LOCALS as u32);
         add(JIT_BRANCH_HINTS);
         add(JIT_BRANCH_HINT_OFFSET_FUZZ);
         add(JIT_FUNCTION_NAMES as u32);
+        add(JIT_READ_TLB_CACHE_MODE);
+        add(JIT_READ_TLB_CACHE_PAGE);
+        add(JIT_X87_PC_LOCAL as u32);
         add(DISPATCH_STATS as u32);
     }
     add(crate::softfloat::get_relaxed_fpu());
     add(crate::softfloat::get_fpu_relaxed_stats());
+    // Diagnostic switches that CHANGE THE EMITTED CODE, so a unit compiled under one and
+    // replayed under another is not the code the caller thinks it is: the perm-map probe adds
+    // a branch and skips the tlb path, stack-raw drops the access check outright, and the
+    // opcode census inserts counter increments. All three ship off; the AOT cache keys
+    // persisted units on this hash, and a checkless unit must not be replayable in a normal
+    // session merely because the flag it was recorded under is invisible here.
+    add(crate::cpu::perm_map::get_perm_map_reads());
+    add(crate::codegen::get_stack_raw_unsafe());
+    add(crate::opstats::opstats_enabled() as u32);
     add(FASTMEM_LOW_MEM_END);
     add(FASTMEM_GUARD_BASE);
     add(FASTMEM_GUARD_SIZE);
@@ -5223,6 +6321,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) -> u32 {
         1 => MAX_PAGES = value,
         2 => JIT_USE_LOOP_SAFETY = value != 0,
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
+        4 => JIT_BLOCK_CHAINING = value != 0,
         5 => JIT_DEAD_FLAG_ELISION = value != 0,
         6 => JIT_INDIRECT_REGIONS = value != 0,
         7 => JIT_INDIRECT_REGION_MIN_SHARE = value,
@@ -5232,7 +6331,15 @@ pub unsafe fn set_jit_config(index: u32, value: u32) -> u32 {
         12 => JIT_RET_CHAINING = value != 0,
         13 => JIT_RET_SPECULATION = value != 0,
         14 => JIT_RET_SPEC_MAX_INSTR = value,
-        15 => JIT_TIER2_THRESHOLD = value,
+        15 => {
+            let was_enabled = JIT_TIER2_THRESHOLD != 0;
+            JIT_TIER2_THRESHOLD = value;
+            if value == 0 { tier2_disable_and_clear(); }
+            else if !was_enabled {
+                // OFF-compiled modules contain no retired-accounting calls.
+                jit_clear_cache(&mut get_jit_state());
+            }
+        },
         16 => JIT_TIER2_RET_SPEC_MAX_INSTR = value,
         17 => TIER2_MAX_PAGES = value,
         19 => JIT_FASTMEM_WRITES = value != 0,
@@ -5259,6 +6366,9 @@ pub unsafe fn set_jit_config(index: u32, value: u32) -> u32 {
             CHAIN_NOTE_MASK = (1u32 << (31 - stride.leading_zeros())) - 1;
         },
         28 => JIT_FUNCTION_NAMES = value != 0,
+        29 => JIT_READ_TLB_CACHE_MODE = value.min(2),
+        30 => JIT_READ_TLB_CACHE_PAGE = value & 0xFFFFF,
+        31 => JIT_X87_PC_LOCAL = value != 0,
         _ => unreachable!(),
     }
     0
@@ -5274,6 +6384,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         1 => MAX_PAGES as u32,
         2 => JIT_USE_LOOP_SAFETY as u32,
         3 => MAX_EXTRA_BASIC_BLOCKS as u32,
+        4 => JIT_BLOCK_CHAINING as u32,
         5 => JIT_DEAD_FLAG_ELISION as u32,
         6 => JIT_INDIRECT_REGIONS as u32,
         7 => JIT_INDIRECT_REGION_MIN_SHARE,
@@ -5296,6 +6407,9 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         26 => RET_CACHE_HASH_MIX as u32,
         27 => CHAIN_NOTE_MASK + 1,
         28 => JIT_FUNCTION_NAMES as u32,
+        29 => JIT_READ_TLB_CACHE_MODE,
+        30 => JIT_READ_TLB_CACHE_PAGE,
+        31 => JIT_X87_PC_LOCAL as u32,
         _ => unreachable!(),
     }
 }

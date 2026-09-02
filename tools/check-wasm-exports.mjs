@@ -14,6 +14,7 @@ const REQUIRED = [
     'd3d9_reset_frame',
     'd3d9_record_draw',
     'd3d9_record_draw_indexed',
+    'd3d9_record_wbuf_indexed_run',
     'd3d9_record_draw_up',
     'd3d9_record_draw_indexed_up',
     'd3d9_block_capture',

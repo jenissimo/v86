@@ -36,6 +36,7 @@ const CW_NEAR = DATA + 64;
 const CW_CEIL = DATA + 66;
 const CW_TRUNC = DATA + 68;
 const CW_FLOOR = DATA + 70;        // RC=01 (round down)
+const CW_SINGLE = DATA + 72;       // PC=00: round arithmetic to a 24-bit significand
 const ROUND_POS = DATA + 80;      // f64 2.5
 const ROUND_NEG = DATA + 112;     // f64 -2.5
 const OUT0    = DATA + 96;
@@ -44,6 +45,8 @@ const OUT2    = DATA + 104;
 const OUT3    = DATA + 108;
 const I16V    = DATA + 120;       // i16 7
 const I64V    = DATA + 128;       // i64 5
+const C32_TINY = DATA + 136;      // f32 2^-30: lost when added to 1 at PC=00
+const C64_ONE = DATA + 144;       // f64 1.0
 
 function build_image(bodyName)
 {
@@ -75,10 +78,13 @@ function build_image(bodyName)
     dv.setUint16(CW_CEIL - BASE, 0x0B7F, true);
     dv.setUint16(CW_TRUNC - BASE, 0x0F7F, true);
     dv.setUint16(CW_FLOOR - BASE, 0x077F, true);
+    dv.setUint16(CW_SINGLE - BASE, 0x007F, true);
     dv.setFloat64(ROUND_POS - BASE, 2.5, true);
     dv.setFloat64(ROUND_NEG - BASE, -2.5, true);
     dv.setInt16(I16V - BASE, 7, true);
     dv.setBigInt64(I64V - BASE, 5n, true);
+    dv.setFloat32(C32_TINY - BASE, 2 ** -30, true);
+    dv.setFloat64(C64_ONE - BASE, 1.0, true);
 
     let o = ENTRY_OFF;
     const labels = {}, patches = [];
@@ -235,6 +241,30 @@ function build_image(bodyName)
             emit(0xDC, 0xC1);                // fadd st1,st0 (slow, no pop)
             fstp64(ACC);                     // helper pop
             fstp64(ACC);                     // helper pop (overwrites — fine)
+        },
+        // PC-local dominance: the first arithmetic instruction takes its F80 slow
+        // branch but leaves the relaxed ST0 untouched; the immediately following D8
+        // takes the fast branch. The live PC predicate must be initialized on both paths.
+        pc_local_mixed() {
+            // Alternate two predecessor paths into one compiled arithmetic block. Odd
+            // iterations initialize its PC local to true through the fast branch;
+            // even iterations change PC to double precision and take the first op's
+            // F80 slow branch. The latter must overwrite, rather than reuse, that one.
+            emit(0xF7, 0x05); imm32(COUNTER); imm32(1); // test dword [counter],1
+            emit(0x0F, 0x84); rel32("pc_single");
+            fldcw(CW_SINGLE);
+            fld64(C64);                      // relaxed ST1 seed
+            emit(0xE9); rel32("pc_join");
+            label("pc_single");
+            fldcw(CW_NEAR);
+            emit(0xDB, 0x2D); imm32(C80);    // F80 ST1 seed
+            label("pc_join");
+            fld64(C64_ONE);                  // ST0: relaxed 1.0
+            emit(0xDC, 0xC1);                // slow on even iterations; ST0 unchanged
+            d8mem(0x05, C32_TINY);            // even: must retain the 2^-30 increment
+            fstp64(ACC);
+            fstp64(OUT0);                    // drain the F80 result
+            fldcw(CW_NEAR);
         },
         tag_pop() {                          // tagged values through the SAME DE faddp
             fld32(C32);
@@ -589,7 +619,7 @@ function run(bodyName, { jit, relaxed, x87Locals = false })
 
 const fmt = (r) => `${r.status} acc=${r.ebx.toString(16).padStart(8,"0")}:${r.eax.toString(16).padStart(8,"0")} last=${r.ecx.toString(16).padStart(8,"0")} n=${r.edx} hit=${r.hit} fallback=${r.fallback}`;
 
-const variants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_sti", "m80_mem", "m80_pop", "m80_nopop", "tag_pop", "full", "fxch_sticky", "fcom_sticky", "consts_sign", "fist_round", "fist_round_neg", "fcomi_flags",
+const variants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_sti", "m80_mem", "m80_pop", "m80_nopop", "pc_local_mixed", "tag_pop", "full", "fxch_sticky", "fcom_sticky", "consts_sign", "fist_round", "fist_round_neg", "fcomi_flags",
     // newly-covered families (previously untested, where Bug #2 is hypothesised to live)
     "fcom_mem", "fst_reg", "fild_widths", "fist16_round", "consts_all", "fcomi_more", "tl_mix",
     "fnstsw_top", "fiarith32", "fiarith16",
