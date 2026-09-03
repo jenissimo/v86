@@ -355,8 +355,75 @@ impl F80 {
         F80::of_f64((src as f64).to_bits())
     }
 
+    /// `fild m64` is EXACT on real x87 — the 80-bit format carries a 64-bit mantissa, so
+    /// every i64 lands without rounding. Going through f64 (53-bit) rounds away the low
+    /// bits of any |value| >= 2^53, and `fild qword`/`fistp qword` is a 90s CRT block-COPY
+    /// idiom, so that rounding corrupts COPIED DATA — one wrong 16-bit word per 8 bytes.
+    /// Build the true 80-bit encoding instead. Relaxed mode cannot hold this exactly
+    /// either, so an integer load is always strict; a mixed pair already falls back to the
+    /// strict arithmetic path, and an i64's exponent (<= 0x403E) can never alias
+    /// RELAXED_TAG.
     pub fn of_i64(src: i64) -> F80 {
-        F80::of_f64((src as f64).to_bits())
+        if src == 0 {
+            return F80::ZERO;
+        }
+        let sign = if src < 0 { 1u16 } else { 0 };
+        let mag = (src as i128).unsigned_abs() as u64;
+        let shift = mag.leading_zeros() as u16;
+        F80 {
+            mantissa: mag << shift,
+            sign_exponent: (sign << 15) | (0x3FFF + 63 - shift),
+        }
+    }
+
+    /// Exact i64 for a true 80-bit value — the inverse of `of_i64`, and the reason a
+    /// fild/fistp round trip is lossless. `None` means "the f64 path is correct here or
+    /// the value is out of range": a relaxed encoding, NaN/Inf, an unnormal, |x| < 1
+    /// (f64 is exact below 2^53), or a magnitude i64 cannot hold.
+    fn to_i64_exact(&self, truncate: bool) -> Option<i64> {
+        if self.is_relaxed() {
+            return None;
+        }
+        let exp = (self.sign_exponent & 0x7FFF) as i32;
+        if exp == 0x7FFF {
+            return None; // NaN / Inf -> indefinite, handled by the f64 path
+        }
+        let unbiased = exp - 0x3FFF;
+        if !(0..=63).contains(&unbiased) {
+            return None;
+        }
+        let mant = self.mantissa;
+        if mant >> 63 == 0 {
+            return None; // denormal / unnormal image: no implicit one to lean on
+        }
+        let sign = self.sign_exponent >> 15 != 0;
+        let shift = (63 - unbiased) as u32;
+        let int_part = mant >> shift;
+        let frac = if shift == 0 { 0 } else { mant & ((1u64 << shift) - 1) };
+        let mut mag = int_part;
+        if frac != 0 && !truncate {
+            let half = 1u64 << (shift - 1);
+            let round_up = match rounding_mode() {
+                1 => sign,  // toward -inf: away from zero only when negative
+                2 => !sign, // toward +inf
+                3 => false, // toward zero
+                _ => frac > half || (frac == half && int_part & 1 == 1),
+            };
+            if round_up {
+                mag = mag.checked_add(1)?;
+            }
+        }
+        if sign {
+            if mag > 1u64 << 63 {
+                return None;
+            }
+            Some((mag as i64).wrapping_neg())
+        } else {
+            if mag > i64::MAX as u64 {
+                return None;
+            }
+            Some(mag as i64)
+        }
     }
 
     pub fn to_i32(&self) -> i32 {
@@ -373,6 +440,9 @@ impl F80 {
     }
 
     pub fn to_i64(&self) -> i64 {
+        if let Some(v) = self.to_i64_exact(false) {
+            return v;
+        }
         let f = f64::from_bits(self.to_f64());
         if f.is_nan() {
             return i64::MIN; // x87 indefinite integer
@@ -395,6 +465,9 @@ impl F80 {
     }
 
     pub fn truncate_to_i64(&self) -> i64 {
+        if let Some(v) = self.to_i64_exact(true) {
+            return v;
+        }
         let f = f64::from_bits(self.to_f64());
         if f.is_nan() || f >= (i64::MAX as f64 + 1.0) || f < (i64::MIN as f64) {
             i64::MIN

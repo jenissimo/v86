@@ -3454,14 +3454,14 @@ pub fn gen_fpu_load_i32(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     }
     gen_fpu_load_i32_f80(ctx, modrm_byte);
 }
+/// `fild m64` has NO relaxed form: f64 carries 53 mantissa bits and an i64 needs 64, so
+/// `convert_i64_to_f64` rounds away the low bits of any |value| >= 2^53. That is not a
+/// precision nicety — `fild qword`/`fistp qword` is a 90s CRT block-COPY idiom (Carmageddon
+/// 2's memcpy moves 8 bytes per pair), so the rounding lands in copied DATA: one corrupted
+/// 16-bit word per 8 bytes. Load the true 80-bit value in both modes, matching the
+/// interpreter's fpu_load_i64. The 16/32-bit loaders above stay relaxed — they fit in f64
+/// exactly.
 pub fn gen_fpu_load_i64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    if crate::softfloat::is_fpu_relaxed() {
-        gen_modrm_resolve_safe_read64(ctx, modrm_byte);
-        ctx.builder.convert_i64_to_f64();
-        ctx.builder.reinterpret_f64_as_i64();
-        ctx.builder.const_i32(FPU_RELAXED_TAG);
-        return;
-    }
     gen_fpu_load_i64_f80(ctx, modrm_byte);
 }
 
