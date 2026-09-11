@@ -1794,6 +1794,7 @@ CPU.prototype.load_bios = function()
         }.bind(this));
 };
 
+CPU.prototype["jit_publication_capture_version"] = 1;
 CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, ptr, len)
 {
     ptr >>>= 0;
@@ -1900,6 +1901,11 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         this.test_hook_did_generate_wasm(instantiation_code);
     }
 
+    // Capture the instantiated bytes, including test mutations, before the builder is reused.
+    const publicationCapture = globalThis["__jitPublicationCapture"];
+    const publication = publicationCapture && publicationCapture["begin"](
+        start >>> 0, wasm_table_index, wasm_table_index + WASM_TABLE_OFFSET, instantiation_code);
+
     const SYNC_COMPILATION = false;
 
     if(SYNC_COMPILATION)
@@ -1909,6 +1915,7 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         const f = result.exports["f"];
 
         this.wm.wasm_table.set(wasm_table_index + WASM_TABLE_OFFSET, f);
+        if(publication) publication["published"]();
         this.codegen_finalize_finished(wasm_table_index, start, state_flags);
 
         if(this.test_hook_did_finalize_wasm)
@@ -1923,6 +1930,7 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         const f = result.instance.exports["f"];
 
         this.wm.wasm_table.set(wasm_table_index + WASM_TABLE_OFFSET, f);
+        if(publication) publication["published"]();
         this.codegen_finalize_finished(wasm_table_index, start, state_flags);
 
         if(this.test_hook_did_finalize_wasm)
@@ -1932,6 +1940,7 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
     });
 
     result.catch(e => {
+        if(publication) publication["failed"]();
         const error_kind = e instanceof WebAssembly.CompileError ? 1 :
             e instanceof WebAssembly.LinkError ? 2 : 3;
         const recovery_status = this.codegen_finalize_failed(
