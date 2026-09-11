@@ -121,6 +121,18 @@ pub struct WasmBuilder {
     // (unknown helper = spilled = safe; covers arith flag-protocol helpers AND
     // OUT/hypercall thunks whose context switches read cpu.get_eflags()).
     pub flag_locals: Option<[(u8, u32); 5]>,
+    /// Which flag locals may differ from their memory globals at this point in the emission.
+    ///
+    /// A word nothing has written since the last sync is already in memory, so the spill before a
+    /// call has nothing to write for it. That is the whole cost of this feature in code that never
+    /// touches flags — x87 runs, where every instruction is a helper call and the tuple is
+    /// untouched between them — and it is why the feature measured as a loss there.
+    ///
+    /// The tracking is LINEAR, and codegen here sees one path at a time, so it is pessimised to
+    /// "all dirty" at every control-flow boundary: a label can be reached from a path that left a
+    /// word in its local. A set bit costs a store that may be redundant; a clear bit is a claim
+    /// that memory is already right on EVERY path reaching here.
+    flag_dirty: u8,
 
     // Branch hints (jit config idx 22). Offsets are recorded relative to the start of
     // instruction_body and rebased onto the locals declaration in finish(); this is only
@@ -199,6 +211,7 @@ impl WasmBuilder {
             local_count: 0,
             arg_local_initial_state: WasmLocal(0),
             flag_locals: None,
+            flag_dirty: 0,
 
             branch_hints: Vec::new(),
             branch_hint_mask: 0,
@@ -236,6 +249,7 @@ impl WasmBuilder {
         self.free_locals_i64.clear();
         self.local_count = 0;
         self.flag_locals = None;
+        self.flag_dirty = 0;
         self.branch_hints.clear();
         self.function_name.clear();
 
@@ -1171,51 +1185,62 @@ impl WasmBuilder {
     pub fn select(&mut self) { self.instruction_body.push(op::OP_SELECT); }
 
     pub fn if_i32(&mut self) {
+        self.flag_boundary();
         self.open_block();
         self.instruction_body.push(op::OP_IF);
         self.instruction_body.push(op::TYPE_I32);
     }
     #[allow(dead_code)]
     pub fn if_i64(&mut self) {
+        self.flag_boundary();
         self.open_block();
         self.instruction_body.push(op::OP_IF);
         self.instruction_body.push(op::TYPE_I64);
     }
     pub fn block_i32(&mut self) -> Label {
+        self.flag_boundary();
         self.instruction_body.push(op::OP_BLOCK);
         self.instruction_body.push(op::TYPE_I32);
         self.open_block()
     }
 
     pub fn if_void(&mut self) {
+        self.flag_boundary();
         self.open_block();
         self.instruction_body.push(op::OP_IF);
         self.instruction_body.push(op::TYPE_VOID_BLOCK);
     }
 
     pub fn else_(&mut self) {
+        self.flag_boundary();
         dbg_assert!(!self.label_stack.is_empty());
         self.instruction_body.push(op::OP_ELSE);
     }
 
     pub fn loop_void(&mut self) -> Label {
+        self.flag_boundary();
         self.instruction_body.push(op::OP_LOOP);
         self.instruction_body.push(op::TYPE_VOID_BLOCK);
         self.open_block()
     }
 
     pub fn block_void(&mut self) -> Label {
+        self.flag_boundary();
         self.instruction_body.push(op::OP_BLOCK);
         self.instruction_body.push(op::TYPE_VOID_BLOCK);
         self.open_block()
     }
 
     pub fn block_end(&mut self) {
+        self.flag_boundary();
         self.close_block();
         self.instruction_body.push(op::OP_END);
     }
 
-    pub fn return_(&mut self) { self.instruction_body.push(op::OP_RETURN); }
+    pub fn return_(&mut self) {
+        self.flag_boundary();
+        self.instruction_body.push(op::OP_RETURN);
+    }
 
     #[allow(dead_code)]
     pub fn drop_(&mut self) { self.instruction_body.push(op::OP_DROP); }
@@ -1225,6 +1250,7 @@ impl WasmBuilder {
         default_case: Label,
         cases: &mut dyn std::iter::ExactSizeIterator<Item = &Label>,
     ) {
+        self.flag_boundary();
         self.instruction_body.push(op::OP_BRTABLE);
         write_leb_u32(&mut self.instruction_body, cases.len() as u32);
         for case in cases {
@@ -1234,10 +1260,12 @@ impl WasmBuilder {
     }
 
     pub fn br(&mut self, label: Label) {
+        self.flag_boundary();
         self.instruction_body.push(op::OP_BR);
         self.write_label(label);
     }
     pub fn br_if(&mut self, label: Label) {
+        self.flag_boundary();
         self.instruction_body.push(op::OP_BRIF);
         self.write_label(label);
     }
@@ -1298,15 +1326,19 @@ impl WasmBuilder {
         }
     }
 
-    /// Locals → memory globals (call sites + module epilogues).
+    /// Locals → memory globals (call sites + module epilogues), for the words that can differ.
     pub fn emit_flag_spill(&mut self) {
         if let Some(locals) = self.flag_locals {
-            for (idx, addr) in locals {
+            for (slot, (idx, addr)) in locals.into_iter().enumerate() {
+                if self.flag_dirty & (1 << slot) == 0 {
+                    continue;
+                }
                 self.const_i32(addr as i32);
                 self.instruction_body.push(op::OP_GETLOCAL);
                 self.instruction_body.push(idx);
                 self.store_aligned_i32(0);
             }
+            self.flag_dirty = 0;
         }
     }
 
@@ -1318,6 +1350,15 @@ impl WasmBuilder {
                 self.instruction_body.push(op::OP_SETLOCAL);
                 self.instruction_body.push(idx);
             }
+            self.flag_dirty = 0;
+        }
+    }
+
+    /// A point another path can reach. Nothing is known about what it left in the locals, so every
+    /// word is assumed to need storing again.
+    fn flag_boundary(&mut self) {
+        if self.flag_locals.is_some() {
+            self.flag_dirty = 0x1f;
         }
     }
 
@@ -1338,6 +1379,7 @@ impl WasmBuilder {
         match self.flag_locals {
             Some(locals) => {
                 self.set_local_raw(locals[slot].0);
+                self.flag_dirty |= 1 << slot;
                 true
             },
             None => false,
@@ -1353,6 +1395,7 @@ impl WasmBuilder {
             Some(locals) => {
                 self.set_local_raw(locals[slot].0);
                 self.drop_();
+                self.flag_dirty |= 1 << slot;
             },
             None => self.store_aligned_i32(0),
         }
