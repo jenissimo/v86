@@ -2390,6 +2390,7 @@ fn flags_dead_from_addr(
     addr_in: u32,
     block: &BasicBlock,
     basic_blocks: &HashMap<u32, BasicBlock>,
+    loop_heads: &HashSet<u32>,
     steps: &mut u32,
 ) -> bool {
     let mut addr = addr_in;
@@ -2417,9 +2418,16 @@ fn flags_dead_from_addr(
 
     match &block.ty {
         BasicBlockType::Normal { next_block_addr: Some(next), .. } => match basic_blocks.get(next) {
-            Some(next_block) => {
-                flags_dead_from_addr(cpu, origin_addr, *next, next_block, basic_blocks, steps)
-            },
+            // A loop head carries the loop-safety exit (JIT_USE_LOOP_SAFETY), which leaves the
+            // MODULE before the successor's first instruction runs. The guest's flags are
+            // architectural at that exit, so an overwriter beyond this edge does not make the
+            // current instruction's flags dead — control can be gone before it ever runs. This
+            // is the only exit a fallthrough edge can reach without executing an instruction;
+            // every other module exit sits after a terminator, which the walk already stops on.
+            Some(_) if loop_heads.contains(next) => false,
+            Some(next_block) => flags_dead_from_addr(
+                cpu, origin_addr, *next, next_block, basic_blocks, loop_heads, steps,
+            ),
             // Successor isn't part of this compiled module (e.g. not yet discovered) — can't
             // prove anything about it, so don't elide.
             None => false,
@@ -2451,6 +2459,7 @@ fn should_elide_current_flags(
     current_addr: u32,
     block: &BasicBlock,
     basic_blocks: &HashMap<u32, BasicBlock>,
+    loop_heads: &HashSet<u32>,
 ) -> bool {
     if !dead_flag_elision_enabled() {
         return false;
@@ -2467,7 +2476,7 @@ fn should_elide_current_flags(
     // faulting / control-flow instruction, a dead end at module scope, or the step limit).
     let addr = instruction_end(cpu, current_addr);
     let mut steps = 0;
-    flags_dead_from_addr(cpu, current_addr, addr, block, basic_blocks, &mut steps)
+    flags_dead_from_addr(cpu, current_addr, addr, block, basic_blocks, loop_heads, &mut steps)
 }
 
 pub fn jit_find_cache_entry(phys_address: u32, state_flags: CachedStateFlags) -> CachedCode {
@@ -4619,6 +4628,33 @@ fn jit_generate_module(
             olds: HashMap<u32, (Label, Option<u16>)>,
         },
     }
+    // Every address a `WasmStructure::Loop` can be entered at. The loop-safety exit is emitted
+    // there, so a fallthrough edge into one can leave the module with the guest's flags visible —
+    // which is what makes an overwriter past that edge no proof of deadness.
+    let loop_heads = {
+        fn collect(s: &WasmStructure, out: &mut HashSet<u32>) {
+            match s {
+                WasmStructure::Loop(children) => {
+                    out.extend(children.first().unwrap().head());
+                    for c in children {
+                        collect(c, out);
+                    }
+                },
+                WasmStructure::Block(children) => {
+                    for c in children {
+                        collect(c, out);
+                    }
+                },
+                WasmStructure::BasicBlock(_) | WasmStructure::Dispatcher(_) => {},
+            }
+        }
+        let mut out = HashSet::new();
+        for s in &structure {
+            collect(s, &mut out);
+        }
+        out
+    };
+
     let mut work: VecDeque<Work> = structure
         .into_iter()
         .map(|x| Work::WasmStructure(x))
@@ -4634,7 +4670,7 @@ fn jit_generate_module(
         match block {
             Work::WasmStructure(WasmStructure::BasicBlock(addr)) => {
                 let block = basic_blocks.get(&addr).unwrap();
-                jit_generate_basic_block(ctx, block, basic_blocks);
+                jit_generate_basic_block(ctx, block, basic_blocks, &loop_heads);
 
                 if block.has_sti {
                     match block.ty {
@@ -5591,6 +5627,7 @@ fn jit_generate_basic_block(
     ctx: &mut JitContext,
     block: &BasicBlock,
     basic_blocks: &HashMap<u32, BasicBlock>,
+    loop_heads: &HashSet<u32>,
 ) {
     let needs_eip_updated = match block.ty {
         BasicBlockType::Exit => true,
@@ -5695,7 +5732,7 @@ fn jit_generate_basic_block(
         ctx.start_of_current_instruction = ctx.cpu.eip;
         let start_eip = ctx.cpu.eip;
         ctx.elide_current_flags =
-            should_elide_current_flags(&*ctx.cpu, start_eip, block, basic_blocks);
+            should_elide_current_flags(&*ctx.cpu, start_eip, block, basic_blocks, loop_heads);
         // Relaxed x87 wrappers set this when they keep the st cache coherent.
         ctx.x87_cache_kept = false;
         ctx.fpu_pc_cache_kept = false;
