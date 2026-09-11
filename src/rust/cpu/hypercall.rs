@@ -198,6 +198,24 @@ const SLAB_MAGIC: u32 = 0x534C4100; // "SLA\0" (BUSY) — low nibble reserved fo
 // double-free is rejected (the BUSY-only validate fails) and getSlabSizeForPtr won't report a
 // free-listed block as a live sized allocation. MUST mirror the inline stubs + TS SLAB_MAGIC_FREE.
 const SLAB_MAGIC_FREE: u32 = 0x534C4600;
+// Free-list link offset below the user pointer: [user-16..user-4) is the block's header
+// zone, [user-4] the magic. MUST mirror the inline stubs (heap-slab-stubs.ts,
+// crt-slab-stubs.ts) and the TS walkers in kernel32/memory.ts.
+const SLAB_LINK: u32 = 8;
+// Large-bin FIFO. NT5's front-end LIFO lookaside only covers allocations whose index
+// (size >> 3) is < 128, i.e. sizes < 1024 bytes (heap.h HEAP_MAXIMUM_FREELISTS=128,
+// HEAP_GRANULARITY=8). Blocks >= 1024 bypass the lookaside and land on the coalescing
+// back-end, which does NOT hand the just-freed block back to the very next same-size
+// allocation. Our slab was strict LIFO for every bin, so a just-freed 2 KiB object was
+// re-handed and (on HEAP_ZERO_MEMORY) zeroed immediately — turning a benign app
+// use-after-free (a freed widget still linked in a parent list, read once more before
+// the parent forgets it — Worms Armageddon's results screen) into a NULL-vtable crash.
+// So bins >= SLAB_LARGE_BIN_MIN use a FIFO free list (append at tail, pop at head): a
+// freed large block is reused only after every other free block of its size, giving its
+// bytes the same grace the real back-end does. Small bins stay LIFO, matching the
+// lookaside. FREELIST_TAIL is per-bin and only meaningful for the large bins.
+const SLAB_REL_FREELIST_TAIL: u32 = 0x48; // 9 × u32 — per-bin free-list tail (large bins)
+const SLAB_LARGE_BIN_MIN: u32 = 6; // bins 6,7,8 = 1024/2048/4096 bytes
 const HEAP_ZERO_MEMORY_FLAG: u32 = 0x08;
 const BIN_SIZES: [u32; 9] = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
@@ -2348,11 +2366,19 @@ unsafe fn handle_heap_alloc() -> bool {
         if !slab_block_ok(head, size_class, slab_base, slab_end_checked) {
             HC_SLAB_POISONED = HC_SLAB_POISONED.wrapping_add(1);
             slab_wr(ctl, fl_rel, 0);
+            if bin >= SLAB_LARGE_BIN_MIN {
+                slab_wr(ctl, SLAB_REL_FREELIST_TAIL + bin * 4, 0);
+            }
             return false;
         }
-        // Pop from free list: first 4 bytes of user data = next pointer
-        let next = memory::read32_no_mmap_check(head) as u32;
+        // Pop from free list: the link lives in the block's header zone (see SLAB_LINK).
+        let next = memory::read32_no_mmap_check(head - SLAB_LINK) as u32;
         slab_wr(ctl, fl_rel, next);
+        // FIFO large bins keep a tail pointer; when the list drains to empty the tail must
+        // follow, or the next free would append after a stale (now live) block.
+        if bin >= SLAB_LARGE_BIN_MIN && next == 0 {
+            slab_wr(ctl, SLAB_REL_FREELIST_TAIL + bin * 4, 0);
+        }
         // Restore the BUSY marker (free() flipped it to FREE) — mirrors the inline stub's
         // `MOV byte [EAX-3],'A'`. Without this a popped block stays FREE-marked while live,
         // so getSlabSizeForPtr (BUSY-only) reports it as not-live and a later inline free
@@ -2430,11 +2456,27 @@ unsafe fn handle_heap_free() -> bool {
     // of being pushed twice → free-list cycle → the same block handed to two owners.
     memory::write32_no_mmap_or_dirty_check(lp_mem - 4, (SLAB_MAGIC_FREE | bin) as i32);
 
-    // Push to free list: store current head in freed block's first 4 bytes
+    // Push to free list. The link goes in the header zone, NOT the user data: a real
+    // heap leaves a freed block's contents intact (LFH), and titles that read a freed
+    // object's vtable before the parent forgets it depend on that.
     let fl_rel = SLAB_REL_FREELIST + bin * 4;
-    let old_head = slab_rd(ctl, fl_rel);
-    memory::write32_no_mmap_or_dirty_check(lp_mem, old_head as i32);
-    slab_wr(ctl, fl_rel, lp_mem);
+    if bin >= SLAB_LARGE_BIN_MIN {
+        // FIFO tail-append (see SLAB_LARGE_BIN_MIN): the freed block becomes the new tail
+        // with no successor; the old tail (if any) links forward to it.
+        let tl_rel = SLAB_REL_FREELIST_TAIL + bin * 4;
+        let tail = slab_rd(ctl, tl_rel);
+        memory::write32_no_mmap_or_dirty_check(lp_mem - SLAB_LINK, 0);
+        if tail == 0 {
+            slab_wr(ctl, fl_rel, lp_mem);
+        } else {
+            memory::write32_no_mmap_or_dirty_check(tail - SLAB_LINK, lp_mem as i32);
+        }
+        slab_wr(ctl, tl_rel, lp_mem);
+    } else {
+        let old_head = slab_rd(ctl, fl_rel);
+        memory::write32_no_mmap_or_dirty_check(lp_mem - SLAB_LINK, old_head as i32);
+        slab_wr(ctl, fl_rel, lp_mem);
+    }
 
     slab_wr(ctl, SLAB_REL_FREE_COUNT, slab_rd(ctl, SLAB_REL_FREE_COUNT).wrapping_add(1));
     write_reg32(EAX, 1); // TRUE
