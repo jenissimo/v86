@@ -17,6 +17,10 @@
 //
 //   node tests/fpu-relaxed-diff.mjs
 const { V86 } = await import("../build/libv86.mjs");
+// Resolved from THIS FILE, not the working directory: the loader's default is relative to the
+// cwd, so the suite only ran from inside vendor/v86 and its own npm script could not start it.
+const WASM_PATH = process.env.V86_WASM_PATH || new URL("../build/v86.wasm", import.meta.url)
+    .pathname.replace(/^\/([A-Za-z]:)/, "$1");
 
 const BASE = 0x100000, ENTRY_OFF = 0x40;
 const DATA = BASE + 0x3000;
@@ -529,6 +533,25 @@ function build_image(bodyName)
             fstp64(ACC);                       // ACC = what FST wrote into ST(1)
             emit(0xDB, 0xE3);                  // fninit
         },
+        // An ARITHMETIC binop reads its operands the same way FST does, and the inline relaxed
+        // path has its own operand check: the f64 tag in the slot's exponent word. FFREE leaves
+        // that word — and the value — untouched, so the tag still says "an f64 lives here" while
+        // the register is empty. The helper path raises SF|IE and computes on INDEFINITE_NAN;
+        // an inline path that only trusts the tag computes on the freed 0.75 and reports neither.
+        fadd_empty_src() {
+            emit(0xDB, 0xE3);                  // fninit
+            fld1();                            // TOP=7, phys7 = 1.0
+            fld64(C64);                        // TOP=6, phys6 = 0.75
+            emit(0xDD, 0xC0);                  // ffree st(0) -> phys6 empty, stale bytes = 0.75
+            emit(0xDB, 0xE2);                  // fnclex (measure this iteration's flags)
+            emit(0xDC, 0xC1);                  // FADD ST(1), ST(0) with an empty ST(0)
+            emit(0x31, 0xC0);                  // xor eax,eax
+            fnstsw_ax();
+            movMemEax(LAST);                   // LAST = status word
+            emit(0xD9, 0xF7);                  // fincstp -> ST(0) is now the destination
+            fstp64(ACC);                       // ACC = what FADD left in ST(1)
+            emit(0xDB, 0xE3);                  // fninit
+        },
         // A successful push clears C1 (fpu_push); FXAM sets it first so a skipped clear shows.
         push_c1() {
             fld64(C64);                        // 0.75
@@ -579,6 +602,7 @@ function run(bodyName, { jit, relaxed, x87Locals = false })
     return new Promise((resolve) => {
         const img = build_image(bodyName);
         const emulator = new V86({ autostart:false, memory_size:MEM_SIZE,
+                                   wasm_path: WASM_PATH,
                                    disable_jit: jit ? 0 : 1, log_level:0 });
         let halted = false, timer;
         const finish = (status) => {
@@ -610,6 +634,7 @@ function run(bodyName, { jit, relaxed, x87Locals = false })
             // read-through local cache. The central invalidation in jit.rs must keep
             // it coherent across helper-path x87 ops (fld m80 / fild / fsqrt / etc.).
             cpu.wm?.exports?.set_jit_config?.(10, (jit && relaxed && x87Locals) ? 1 : 0);
+            cpu.wm?.exports?.set_jit_config?.(21, process.env.V86_FLAG_LOCALS === '1' ? 1 : 0);
             cpu.wm?.exports?.profiler_init?.();
             timer = setTimeout(() => { if(!halted) finish("HANG"); }, TIMEOUT_MS);
             emulator.run();
@@ -626,7 +651,7 @@ const variants = ["push", "d8mem", "dcmem", "reg", "pfx", "addr", "m80", "m80_st
     // architectural state the inline paths used to drop: tag word, empty-slot reads, C1
     "fst_tagword", "fld_empty", "push_c1",
     // stack faults the inline paths used to swallow: push overflow, FST from an empty ST(0)
-    "push_overflow", "fst_empty_src"]
+    "push_overflow", "fst_empty_src", "fadd_empty_src"]
     // optional argv filter: `node tests/fpu-relaxed-diff.mjs fld_empty push_c1`
     .filter(v => process.argv.length <= 2 || process.argv.slice(2).includes(v));
 // FCOM/FXCH between two relaxed values must not fall back to the helper (that re-poisons

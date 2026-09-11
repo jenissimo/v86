@@ -3565,6 +3565,33 @@ fn gen_fpu_relaxed_st_ok(ctx: &mut JitContext, i: u32, addr: &WasmLocal) {
     else {
         gen_fpu_relaxed_tag_ok(ctx, addr);
     }
+    // …and the register must hold a value at all.
+    //
+    // Neither test above can tell: FFREE marks the register empty and leaves its sixteen bytes
+    // untouched, so the tag still says "an f64 lives here" and the slot cache still holds what was
+    // read before. The interpreter checks `fpu_stack_empty` on every read (`fpu_get_sti`), raises
+    // a stack fault and yields INDEFINITE_NAN; the inline path without this test computes on the
+    // freed value instead and the fault never happens.
+    gen_fpu_relaxed_not_empty(ctx, addr);
+    ctx.builder.and_i32();
+}
+
+/// Whether the physical register this address names is non-empty, as an i32 predicate.
+///
+/// `fpu_stack_empty` is indexed by the PHYSICAL register, which is what the address already
+/// encodes: `gen_fpu_st_addr` built it as `fpu_st + ((stack_ptr + i) & 7) * 16`.
+fn gen_fpu_relaxed_not_empty(ctx: &mut JitContext, addr: &WasmLocal) {
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder.get_local(addr);
+    ctx.builder.const_i32(global_pointers::fpu_st as i32);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32(4);
+    ctx.builder.shr_u_i32();
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
 }
 
 fn gen_fpu_load_relaxed_st_bits(
