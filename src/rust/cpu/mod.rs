@@ -1,5 +1,6 @@
 pub mod apic;
 pub mod arith;
+pub mod bulk_memory;
 pub mod call_indirect;
 pub mod cpu;
 pub mod fpu;
@@ -15,6 +16,9 @@ pub mod misc_instr;
 pub mod perm_map;
 pub mod modrm;
 pub mod pic;
+pub mod rep_memory;
 pub mod sse_instr;
 pub mod string;
+pub mod string_memory;
+pub mod unaligned_memory;
 pub mod vga;

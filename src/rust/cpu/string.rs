@@ -142,6 +142,52 @@ unsafe fn string_instruction(
 
     let is_aligned = (ds + src) & (size_bytes - 1) == 0 && (es + dst) & (size_bytes - 1) == 0;
 
+    // Alignment is this gate's demand, not the vector bodies'. Route an unaligned
+    // word/dword compare, scan or store to them instead of dropping the whole
+    // instruction to one safe accessor per element.
+    if !is_aligned && is_asize_32 && matches!(rep, Rep::Z | Rep::NZ) {
+        let backwards = direction == -1;
+        let z = matches!(rep, Rep::Z);
+        let progress = return_on_pagefault!(match (instruction, size_bytes) {
+            (Instruction::Cmps, 2) => super::unaligned_memory::run::<2, 0>(
+                ds.wrapping_add(src), es.wrapping_add(dst), count, backwards, z, data),
+            (Instruction::Cmps, 4) => super::unaligned_memory::run::<4, 0>(
+                ds.wrapping_add(src), es.wrapping_add(dst), count, backwards, z, data),
+            (Instruction::Scas, 2) => super::unaligned_memory::run::<2, 1>(
+                0, es.wrapping_add(dst), count, backwards, z, data),
+            (Instruction::Scas, 4) => super::unaligned_memory::run::<4, 1>(
+                0, es.wrapping_add(dst), count, backwards, z, data),
+            (Instruction::Stos, 2) => super::unaligned_memory::run::<2, 2>(
+                0, es.wrapping_add(dst), count, backwards, true, data),
+            (Instruction::Stos, 4) => super::unaligned_memory::run::<4, 2>(
+                0, es.wrapping_add(dst), count, backwards, true, data),
+            _ => Ok(None),
+        });
+        if let Some((completed, left, right)) = progress {
+            count -= completed;
+            let compares = instruction != Instruction::Stos;
+            let finished = count == 0 || (compares && (left == right) != z);
+            if finished && compares {
+                match size {
+                    Size::W => cmp16(left, right),
+                    Size::D => cmp32(left, right),
+                    Size::B => dbg_assert!(false),
+                };
+            }
+            let delta = (completed as i32).wrapping_mul(increment);
+            if compares && instruction == Instruction::Cmps {
+                set_reg_asize(is_asize_32, ESI, src.wrapping_add(delta));
+            }
+            set_reg_asize(is_asize_32, EDI, dst.wrapping_add(delta));
+            set_reg_asize(is_asize_32, ECX, count as i32);
+            // More pages to go: re-enter the instruction rather than reporting it done.
+            if !finished {
+                *instruction_pointer = *previous_ip;
+            }
+            return;
+        }
+    }
+
     // unaligned movs is properly handled in the fast path
     let mut rep_fast = (instruction == Instruction::Movs || is_aligned)
         && is_asize_32 // 16-bit address wraparound
@@ -251,7 +297,65 @@ unsafe fn string_instruction(
         let mut rep_cmp_finished = false;
 
         let mut i = 0;
-        while i < count_until_end_of_page {
+
+        // Vector bodies for the element-at-a-time instructions. Movs and byte-sized Stos
+        // already leave this loop after one bulk copy/fill, so they are not routed here
+        // and stay the controls for any measurement of this path.
+        let accelerated = match instruction {
+            Instruction::Cmps => {
+                let backwards = direction == -1;
+                let z = matches!(rep, Rep::Z);
+                match size {
+                    Size::B => super::rep_memory::compare::<1, false>(
+                        phys_src, phys_dst, count_until_end_of_page, backwards, z, data),
+                    Size::W => super::rep_memory::compare::<2, false>(
+                        phys_src, phys_dst, count_until_end_of_page, backwards, z, data),
+                    Size::D => super::rep_memory::compare::<4, false>(
+                        phys_src, phys_dst, count_until_end_of_page, backwards, z, data),
+                }
+            },
+            Instruction::Scas => {
+                let backwards = direction == -1;
+                let z = matches!(rep, Rep::Z);
+                match size {
+                    Size::B => super::rep_memory::compare::<1, true>(
+                        phys_src, phys_dst, count_until_end_of_page, backwards, z, data),
+                    Size::W => super::rep_memory::compare::<2, true>(
+                        phys_src, phys_dst, count_until_end_of_page, backwards, z, data),
+                    Size::D => super::rep_memory::compare::<4, true>(
+                        phys_src, phys_dst, count_until_end_of_page, backwards, z, data),
+                }
+            },
+            Instruction::Stos => {
+                let filled = match size {
+                    Size::W => super::rep_memory::fill::<2>(
+                        phys_dst, count_until_end_of_page, direction == -1, data),
+                    Size::D => super::rep_memory::fill::<4>(
+                        phys_dst, count_until_end_of_page, direction == -1, data),
+                    Size::B => false,
+                };
+                if filled {
+                    i = count_until_end_of_page;
+                }
+                None
+            },
+            _ => None,
+        };
+        if let Some((completed, left, right)) = accelerated {
+            i = completed;
+            // Same termination test the per-element loop applies, and the same cmp call,
+            // so EFLAGS keeps coming from one place and stays lazily consistent.
+            rep_cmp_finished = i == count || (left == right) != matches!(rep, Rep::Z);
+            if rep_cmp_finished {
+                match size {
+                    Size::B => cmp8(left, right),
+                    Size::W => cmp16(left, right),
+                    Size::D => cmp32(left, right),
+                };
+            }
+        }
+
+        while i < count_until_end_of_page && !rep_cmp_finished {
             i += 1;
 
             let src_val = match instruction {

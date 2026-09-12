@@ -412,6 +412,8 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         81 => handle_wait_for_single_object(),
         82 => handle_get_capture(),
         83 => handle_resume_thread(),
+        84 => handle_memmove(),
+        85 => handle_memchr(),
 
         // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels,
         //    kept in a distinct range from the
@@ -1207,6 +1209,10 @@ unsafe fn handle_wcslen() -> bool {
         write_reg32(EAX, 0);
         return true;
     }
+    if let Some(n) = super::string_memory::try_length::<true>(str_ptr as u32) {
+        write_reg32(EAX, n as i32);
+        return true;
+    }
     let mut len: u32 = 0;
     loop {
         let ch = match hc_safe_read16(str_ptr + len as i32 * 2) {
@@ -1233,6 +1239,10 @@ unsafe fn handle_wcscpy() -> bool {
         Err(_) => return false,
     };
     if dst == 0 || src == 0 {
+        write_reg32(EAX, dst);
+        return true;
+    }
+    if super::string_memory::try_copy::<true>(dst as u32, src as u32) {
         write_reg32(EAX, dst);
         return true;
     }
@@ -1304,6 +1314,10 @@ unsafe fn handle_wcsicmp() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
+    if let Some(d) = super::string_memory::try_compare::<true, true>(s1 as u32, s2 as u32) {
+        write_reg32(EAX, d);
+        return true;
+    }
     let mut i: u32 = 0;
     let result = loop {
         let c1 = match hc_safe_read16(s1 + i as i32 * 2) {
@@ -1339,6 +1353,10 @@ unsafe fn handle_wcschr() -> bool {
     };
     if str_ptr == 0 {
         write_reg32(EAX, 0);
+        return true;
+    }
+    if let Some(found) = super::string_memory::try_find::<true, false>(str_ptr as u32, target as u32) {
+        write_reg32(EAX, found as i32);
         return true;
     }
     let mut i: u32 = 0;
@@ -1505,6 +1523,11 @@ unsafe fn handle_wcsncpy() -> bool {
     true
 }
 
+/// Shortest span worth handing to the bulk kernels. The residency probe walks a TLB entry
+/// per page and is charged even on a miss, so below roughly a cache line the scalar loop
+/// wins outright.
+const BULK_MIN_LEN: u32 = 64;
+
 /// memcpy(void* dst, void* src, size_t n): copy n bytes
 unsafe fn handle_memcpy() -> bool {
     let esp = read_reg32(ESP);
@@ -1521,6 +1544,11 @@ unsafe fn handle_memcpy() -> bool {
         Err(_) => return false,
     };
     if dst == 0 || src == 0 || len == 0 {
+        write_reg32(EAX, dst);
+        return true;
+    }
+    // Below this the residency probe costs more than the scalar loop it saves.
+    if len >= BULK_MIN_LEN && super::bulk_memory::try_copy(dst as u32, src as u32, len, false) {
         write_reg32(EAX, dst);
         return true;
     }
@@ -1565,6 +1593,10 @@ unsafe fn handle_memset() -> bool {
         write_reg32(EAX, dst);
         return true;
     }
+    if len >= BULK_MIN_LEN && super::bulk_memory::try_fill(dst as u32, c as u8, len) {
+        write_reg32(EAX, dst);
+        return true;
+    }
     // Fill 4 bytes at a time
     let fill32 = c | (c << 8) | (c << 16) | (c << 24);
     let mut i: u32 = 0;
@@ -1589,6 +1621,10 @@ unsafe fn handle_strlen() -> bool {
     };
     if str_ptr == 0 {
         write_reg32(EAX, 0);
+        return true;
+    }
+    if let Some(n) = super::string_memory::try_length::<false>(str_ptr as u32) {
+        write_reg32(EAX, n as i32);
         return true;
     }
     let mut len: u32 = 0;
@@ -1616,6 +1652,10 @@ unsafe fn handle_strcmp() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
+    if let Some(d) = super::string_memory::try_compare::<false, false>(s1 as u32, s2 as u32) {
+        write_reg32(EAX, d);
+        return true;
+    }
     let mut i: u32 = 0;
     let result = loop {
         let c1 = match hc_safe_read8(s1 + i as i32) {
@@ -1650,6 +1690,10 @@ unsafe fn handle_strcpy() -> bool {
         write_reg32(EAX, dst);
         return true;
     }
+    if super::string_memory::try_copy::<false>(dst as u32, src as u32) {
+        write_reg32(EAX, dst);
+        return true;
+    }
     let mut i: u32 = 0;
     loop {
         let ch = match hc_safe_read8(src + i as i32) {
@@ -1676,6 +1720,10 @@ unsafe fn handle_stricmp() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
+    if let Some(d) = super::string_memory::try_compare::<false, true>(s1 as u32, s2 as u32) {
+        write_reg32(EAX, d);
+        return true;
+    }
     let mut i: u32 = 0;
     let result = loop {
         let c1 = match hc_safe_read8(s1 + i as i32) {
@@ -1712,6 +1760,12 @@ unsafe fn handle_memcmp() -> bool {
         Ok(v) => v as u32,
         Err(_) => return false,
     };
+    if len >= BULK_MIN_LEN {
+        if let Some(result) = super::bulk_memory::try_compare(s1 as u32, s2 as u32, len) {
+            write_reg32(EAX, result);
+            return true;
+        }
+    }
     let mut i: u32 = 0;
     while i < len {
         let c1 = match hc_safe_read8(s1 + i as i32) {
@@ -2519,6 +2573,39 @@ unsafe fn handle_rt_dynamic_cast() -> bool {
             true
         }
         RtDynamicCastResult::FailBadCast => false,
+    }
+}
+
+/// memmove(void* dst, void* src, size_t n): copy n bytes, overlap defined.
+///
+/// Unlike the other CRT memory leaves this has no scalar body here: a guard miss returns
+/// false and the JS implementation answers, which is the Tier-4 fallback the whole
+/// dispatch rests on. Registration is gated on `get_bulk_memory_abi`, so a v86 build
+/// without the kernel never reaches this id in the first place.
+unsafe fn handle_memmove() -> bool {
+    let esp = read_reg32(ESP);
+    let Ok(dst) = safe_read32s(esp.wrapping_add(4)) else { return false; };
+    let Ok(src) = safe_read32s(esp.wrapping_add(8)) else { return false; };
+    let Ok(len) = safe_read32s(esp.wrapping_add(12)) else { return false; };
+    if len == 0 || super::bulk_memory::try_copy(dst as u32, src as u32, len as u32, true) {
+        write_reg32(EAX, dst);
+        return true;
+    }
+    false
+}
+
+/// memchr(void* s, int c, size_t n): first occurrence of c, or NULL.
+unsafe fn handle_memchr() -> bool {
+    let esp = read_reg32(ESP);
+    let Ok(src) = safe_read32s(esp.wrapping_add(4)) else { return false; };
+    let Ok(value) = safe_read32s(esp.wrapping_add(8)) else { return false; };
+    let Ok(len) = safe_read32s(esp.wrapping_add(12)) else { return false; };
+    match super::bulk_memory::try_find(src as u32, value as u8, len as u32) {
+        Some(found) => {
+            write_reg32(EAX, found as i32);
+            true
+        },
+        None => false,
     }
 }
 
