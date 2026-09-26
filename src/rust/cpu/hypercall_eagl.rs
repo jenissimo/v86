@@ -13,10 +13,497 @@
 
 use std::ptr::{addr_of, addr_of_mut};
 
-use crate::cpu::cpu::{
-    read_reg32, safe_read16, safe_read32s, safe_write32, write_reg32, EAX, ECX, ESP,
+use crate::cpu::cpu::{read_reg32, safe_read32s, write_reg32, EAX, ECX, ESP};
+use crate::cpu::hypercall::{hp_ptr, OFF_HC_EAGL_TOKEN_CFG_PTR};
+
+// Every guest access in this module that does not go through `eagl_read32`. They are the plain
+// cpu.rs functions unless the page views are on (then a page validated earlier in the same
+// invocation is accessed directly), plus census counting in a census build.
+#[inline(always)]
+#[track_caller]
+unsafe fn safe_write32(addr: i32, value: i32) -> crate::paging::OrPageFault<()> {
+    if EAGL_PAGE_VIEWS {
+        if let Some(phys) = pv_write_hit(addr as u32) {
+            if EAGL_CENSUS { census_access(addr, CC_WRITES, CC_WRITES_SEEN, true, census_line(), false); }
+            pv_store32(addr, phys, value);
+            return Ok(());
+        }
+        if EAGL_CENSUS { census_access(addr, CC_WRITES, CC_WRITES_SEEN, true, census_line(), true); }
+        return eagl_write32_pv_miss(addr, value);
+    }
+    if EAGL_CENSUS { census_access(addr, CC_WRITES, CC_WRITES_SEEN, true, census_line(), true); }
+    crate::cpu::cpu::safe_write32(addr, value)
+}
+#[inline(always)]
+#[track_caller]
+unsafe fn safe_read16(addr: i32) -> crate::paging::OrPageFault<i32> {
+    if EAGL_PAGE_VIEWS {
+        if let Some(host) = pv_read_hit(addr as u32, 2) {
+            if EAGL_CENSUS { census_access(addr, CC_NARROW, CC_NARROW_SEEN, false, census_line(), false); }
+            pv_note_narrow_read();
+            let v = std::ptr::read_unaligned(host as *const u16) as i32;
+            if PV_VERIFY { pv_verify_read(addr, v, 2); }
+            return Ok(v);
+        }
+        if EAGL_CENSUS { census_access(addr, CC_NARROW, CC_NARROW_SEEN, false, census_line(), true); }
+        return eagl_read16_pv_miss(addr);
+    }
+    if EAGL_CENSUS { census_access(addr, CC_NARROW, CC_NARROW_SEEN, false, census_line(), true); }
+    crate::cpu::cpu::safe_read16(addr)
+}
+#[inline(always)]
+#[track_caller]
+unsafe fn hc_safe_read8(addr: i32) -> Result<i32, ()> {
+    if EAGL_PAGE_VIEWS {
+        if let Some(host) = pv_read_hit(addr as u32, 1) {
+            if EAGL_CENSUS { census_access(addr, CC_NARROW, CC_NARROW_SEEN, false, census_line(), false); }
+            pv_note_narrow_read();
+            let v = *(host as *const u8) as i32;
+            if PV_VERIFY { pv_verify_read(addr, v, 1); }
+            return Ok(v);
+        }
+        if EAGL_CENSUS { census_access(addr, CC_NARROW, CC_NARROW_SEEN, false, census_line(), true); }
+        return eagl_read8_pv_miss(addr);
+    }
+    if EAGL_CENSUS { census_access(addr, CC_NARROW, CC_NARROW_SEEN, false, census_line(), true); }
+    crate::cpu::hypercall::hc_safe_read8(addr)
+}
+
+// --- per-invocation page views --------------------------------------------------------------
+//
+// The handlers walk a handful of guest structures (token node, token table, ctx, vtable, stub,
+// shader record, default-constant table, cfg shadow tables, the ring) and ping-pong between
+// them, so the one-entry cursor misses on most reads, and every write and narrow read
+// translates. A page view validates a page ONCE per invocation and later accesses to it are a
+// plain load/store through the host view: no translate, no cursor, no MMIO/dirty re-check.
+//
+// EXACTNESS. A view is installed only AFTER the exact per-access path (cursor/translate for
+// reads, cpu::safe_write32 for writes) completed an access to that page that did not straddle
+// it, from the TLB entry that access consulted or filled. So the first access to every page in
+// an invocation — and with it every #PF (cr2, error code, order), every A/D-bit and TLB fill,
+// every MMIO access and every jit_dirty_page — happens exactly where it did before. A view page
+// is never device-mapped (TLB_IN_MAPPED_RANGE refused, so it lies below memory_size and the old
+// accessor's range check cannot fire); a write view never has code (TLB_HAS_CODE refused — the
+// slow write that dirtied the page cleared it, which is also when the old path stops calling
+// jit_dirty_page). An access that straddles a page never hits and keeps the old split path.
+//
+// LIFETIME. Every view is dropped wherever v86 drops a TLB entry (`eagl_read_cursor_invalidate`,
+// called from every clearing site — pinned by tools/validate-eagl-read-cursor.mjs), so a view
+// never outlives the TLB entry it was read from. READ views then follow the cursor's policy:
+// per dispatch, or — under the TLB-driven policy — until that drop, keyed on the CPL they were
+// validated at (a read translation depends on it). WRITE views always die with the invocation:
+// between invocations the JIT can put code on a page (TLB_HAS_CODE set without a TLB drop), and
+// a stale write view would skip the jit_dirty_page the old path makes.
+/// Runtime switch, default off. Toggled only between hypercalls.
+static mut EAGL_PAGE_VIEWS: bool = false;
+const PV_R: usize = 32;
+const PV_W: usize = 8;
+/// Table slot of a page. Folded, not the low bits alone: the guest heap places related
+/// structures at 64 KB-aligned strides often enough that low-bit indexing conflicts on them.
+#[inline(always)]
+fn pv_slot(a: u32, n: usize) -> usize {
+    let p = a >> 12;
+    (p ^ (p >> 5) ^ (p >> 10)) as usize & (n - 1)
+}
+/// Low bits set: never equal to a page base.
+const PV_EMPTY: u32 = u32::MAX;
+static mut PV_RTAG: [u32; PV_R] = [PV_EMPTY; PV_R];
+/// Absolute (wasm-linear) address of the page's first byte.
+static mut PV_RHOST: [u32; PV_R] = [0; PV_R];
+/// CPL the read views were validated at.
+static mut PV_CPL: u8 = 0;
+static mut PV_WTAG: [u32; PV_W] = [PV_EMPTY; PV_W];
+/// Physical (mem8-relative) address of the page's first byte: what the old write path stores to.
+static mut PV_WPHYS: [u32; PV_W] = [0; PV_W];
+/// Differential oracle for the view path: every view read compared against the exact accessor;
+/// every view write's target compared against the old path's translation, plus its no-code and
+/// no-MMIO premises. Also counts hits and installs, so "on but never hitting" is visible.
+static mut PV_VERIFY: bool = false;
+static mut PV_CHECKED: u32 = 0;
+static mut PV_MISMATCH: u32 = 0;
+static mut PV_HITS: u32 = 0;
+static mut PV_FILLS: u32 = 0;
+
+#[no_mangle]
+pub unsafe fn eagl_page_views_set(on: u32) {
+    EAGL_PAGE_VIEWS = on != 0;
+    pv_reset();
+}
+#[no_mangle]
+pub unsafe fn eagl_page_views_get() -> u32 { EAGL_PAGE_VIEWS as u32 }
+#[no_mangle]
+pub unsafe fn eagl_page_views_set_verify(on: u32) { PV_VERIFY = on != 0; }
+/// 0 hits, 1 installs, 2 oracle checks, 3 oracle mismatches (hits/installs count only while
+/// the oracle is on — the shipping hot path carries no counter).
+#[no_mangle]
+pub unsafe fn eagl_page_views_stat(i: u32) -> u32 {
+    match i { 0 => PV_HITS, 1 => PV_FILLS, 2 => PV_CHECKED, 3 => PV_MISMATCH, _ => 0 }
+}
+#[no_mangle]
+pub unsafe fn eagl_page_views_reset_stats() {
+    PV_HITS = 0;
+    PV_FILLS = 0;
+    PV_CHECKED = 0;
+    PV_MISMATCH = 0;
+}
+/// Build-time negative-control mutant (0 in every shipping build); see EAGL_PV_MUTANT.
+#[no_mangle]
+pub unsafe fn eagl_page_views_mutant() -> u32 { EAGL_PV_MUTANT }
+
+#[inline(always)]
+unsafe fn pv_reset() {
+    PV_RTAG = [PV_EMPTY; PV_R];
+    PV_WTAG = [PV_EMPTY; PV_W];
+}
+/// Invocation entry: write views always go; read views go unless the TLB-driven policy keeps
+/// them and the privilege level they were validated at still holds.
+#[inline(always)]
+unsafe fn pv_enter() {
+    let cpl = *crate::cpu::global_pointers::cpl;
+    if EAGL_PV_MUTANT == 2 {
+        return;
+    }
+    if !EAGL_READ_CURSOR_POLICY_TLB || (cpl != PV_CPL && EAGL_PV_MUTANT != 4) {
+        PV_RTAG = [PV_EMPTY; PV_R];
+        PV_CPL = cpl;
+    }
+    PV_WTAG = [PV_EMPTY; PV_W];
+}
+
+/// Host address of `a` if its page has a read view and the `width`-byte access stays inside it.
+#[inline(always)]
+unsafe fn pv_read_hit(a: u32, width: u32) -> Option<u32> {
+    let i = pv_slot(a, PV_R);
+    if PV_RTAG[i] == a & !0xFFF && a & 0xFFF <= 0x1000 - width {
+        if PV_VERIFY { PV_HITS = PV_HITS.wrapping_add(1); }
+        return Some(PV_RHOST[i] + (a & 0xFFF));
+    }
+    None
+}
+/// Physical address of `a` if its page has a write view and the dword stays inside it.
+#[inline(always)]
+unsafe fn pv_write_hit(a: u32) -> Option<u32> {
+    let i = pv_slot(a, PV_W);
+    if PV_WTAG[i] == a & !0xFFF && a & 0xFFF <= 0xFFC {
+        if PV_VERIFY { PV_HITS = PV_HITS.wrapping_add(1); }
+        return Some(PV_WPHYS[i] + (a & 0xFFF));
+    }
+    None
+}
+
+/// The old write path's final step for a non-straddling, non-MMIO, no-code page, with the
+/// guest-access census increment safe_write32 makes.
+#[inline(always)]
+unsafe fn pv_store32(addr: i32, phys: u32, value: i32) {
+    if crate::cpu::cpu::GUEST_ACCESS_TRACKING {
+        let c = crate::cpu::cpu::GUEST_ACCESS_CLASS;
+        crate::cpu::cpu::GUEST_ACCESS_WRITES[c] = crate::cpu::cpu::GUEST_ACCESS_WRITES[c].wrapping_add(1);
+    }
+    if PV_VERIFY { pv_verify_write(addr, phys); }
+    // write32_no_mmap_or_dirty_check minus its guest-range check, which a view page (below
+    // memory_size, never mapped) always passes; the debug write watch stays.
+    crate::cpu::cpu::dbg_check_write(phys, 4, value);
+    std::ptr::write_unaligned(crate::cpu::memory::mem8.offset(phys as isize) as *mut i32, value);
+}
+/// safe_read16/safe_read8 count their reads in the guest-access census; the view must too.
+#[inline(always)]
+unsafe fn pv_note_narrow_read() {
+    if crate::cpu::cpu::GUEST_ACCESS_TRACKING {
+        let c = crate::cpu::cpu::GUEST_ACCESS_CLASS;
+        crate::cpu::cpu::GUEST_ACCESS_READS[c] = crate::cpu::cpu::GUEST_ACCESS_READS[c].wrapping_add(1);
+    }
+}
+
+/// Install a read view for `a`'s page. Call ONLY right after the exact path completed a
+/// `width`-byte read at `a`: the TLB entry read here is the one that access consulted or filled.
+#[inline(never)]
+unsafe fn pv_fill_read(a: u32, width: u32) {
+    use crate::cpu::cpu::{tlb_data, TLB_IN_MAPPED_RANGE, TLB_NO_USER, TLB_VALID};
+    if !EAGL_READ_CURSOR || a & 0xFFF > 0x1000 - width || EAGL_PV_MUTANT == 3 {
+        return;
+    }
+    let entry = tlb_data[(a >> 12) as usize];
+    let user = *crate::cpu::global_pointers::cpl == 3;
+    let need = TLB_VALID | TLB_IN_MAPPED_RANGE | if user { TLB_NO_USER } else { 0 };
+    if entry & need != TLB_VALID {
+        return;
+    }
+    let i = pv_slot(a, PV_R);
+    PV_RTAG[i] = a & !0xFFF;
+    PV_RHOST[i] = (entry as u32 & !0xFFF) ^ (a & !0xFFF);
+    if PV_VERIFY { PV_FILLS = PV_FILLS.wrapping_add(1); }
+}
+/// Install a write view for `a`'s page. Call ONLY right after cpu::safe_write32 completed a
+/// non-straddling write at `a`: the entry is then valid-for-write (READONLY cleared by the write
+/// walk) and, if the page had code, jit_dirty_page has already cleared TLB_HAS_CODE.
+#[inline(never)]
+unsafe fn pv_fill_write(a: u32) {
+    use crate::cpu::cpu::{tlb_data, TLB_HAS_CODE, TLB_IN_MAPPED_RANGE, TLB_NO_USER, TLB_READONLY, TLB_VALID};
+    if !EAGL_READ_CURSOR || a & 0xFFF > 0xFFC {
+        return;
+    }
+    let entry = tlb_data[(a >> 12) as usize];
+    let user = *crate::cpu::global_pointers::cpl == 3;
+    let need = TLB_VALID | TLB_READONLY | TLB_IN_MAPPED_RANGE | TLB_HAS_CODE
+        | if user { TLB_NO_USER } else { 0 };
+    if entry & need != TLB_VALID {
+        return;
+    }
+    let i = pv_slot(a, PV_W);
+    PV_WTAG[i] = a & !0xFFF;
+    PV_WPHYS[i] = ((entry as u32 & !0xFFF) ^ (a & !0xFFF)).wrapping_sub(crate::cpu::memory::mem8 as u32);
+    if PV_VERIFY { PV_FILLS = PV_FILLS.wrapping_add(1); }
+}
+
+#[inline(never)]
+unsafe fn eagl_write32_pv_miss(addr: i32, value: i32) -> crate::paging::OrPageFault<()> {
+    crate::cpu::cpu::safe_write32(addr, value)?;
+    pv_fill_write(addr as u32);
+    Ok(())
+}
+#[inline(never)]
+unsafe fn eagl_read16_pv_miss(addr: i32) -> crate::paging::OrPageFault<i32> {
+    let v = crate::cpu::cpu::safe_read16(addr)?;
+    pv_fill_read(addr as u32, 2);
+    Ok(v)
+}
+#[inline(never)]
+unsafe fn eagl_read8_pv_miss(addr: i32) -> Result<i32, ()> {
+    let v = crate::cpu::hypercall::hc_safe_read8(addr)?;
+    pv_fill_read(addr as u32, 1);
+    Ok(v)
+}
+/// A read the views could not answer. Kill switch and straddling dword: the old path verbatim.
+/// Otherwise the old path's non-straddling outcome — a cursor hit is a translation whose TLB entry
+/// is live (a TLB hit, no side effects), the cold path translates — so translate + read32s is
+/// the same access, then the page is installed from that translation.
+#[inline(never)]
+unsafe fn eagl_read32_pv_miss(addr: i32) -> Result<i32, ()> {
+    let a = addr as u32;
+    if !EAGL_READ_CURSOR || a & 0xFFF > 0xFFC || EAGL_PV_MUTANT == 3 {
+        return eagl_read32_exact(addr);
+    }
+    let phys = crate::cpu::cpu::translate_address_read(addr)?;
+    let v = crate::cpu::memory::read32s(phys);
+    if EAGL_READ_CURSOR_VERIFY { eagl_read32_verify(addr, v); }
+    let page = phys & !0xFFF;
+    if !crate::cpu::memory::in_mapped_range(page) && !crate::cpu::memory::in_mapped_range(page | 0xFFF) {
+        let i = pv_slot(a, PV_R);
+        PV_RTAG[i] = a & !0xFFF;
+        PV_RHOST[i] = (crate::cpu::memory::mem8 as u32).wrapping_add(page);
+        if PV_VERIFY { PV_FILLS = PV_FILLS.wrapping_add(1); }
+    }
+    Ok(v)
+}
+
+#[inline(never)]
+unsafe fn pv_verify_read(addr: i32, v: i32, width: u32) {
+    PV_CHECKED = PV_CHECKED.wrapping_add(1);
+    let reference = match width {
+        4 => safe_read32s(addr),
+        2 => crate::cpu::cpu::safe_read16(addr),
+        _ => crate::cpu::hypercall::hc_safe_read8(addr),
+    };
+    if reference != Ok(v) { PV_MISMATCH = PV_MISMATCH.wrapping_add(1); }
+}
+/// A write view must store where the old path would have stored, to a page the old path would
+/// neither dirty (no code) nor route to a device (not mapped).
+#[inline(never)]
+unsafe fn pv_verify_write(addr: i32, phys: u32) {
+    PV_CHECKED = PV_CHECKED.wrapping_add(1);
+    let ok = match crate::cpu::cpu::translate_address_read_no_side_effects(addr) {
+        Ok(p) => p == phys
+            && !crate::cpu::memory::in_mapped_range(phys)
+            && !crate::jit::jit_page_has_code(crate::page::Page::page_of(phys)),
+        Err(()) => false,
+    };
+    if !ok { PV_MISMATCH = PV_MISMATCH.wrapping_add(1); }
+}
+
+/// Negative-control mutants for the differential test (build with V86_EAGL_PV_MUTANT=<n>;
+/// 0 = none, the only value any shipping build has). 1: a read hit skips the in-page check, so
+/// a straddling dword is read from the first page's host view. 2: views are never reset
+/// (neither per invocation nor on a TLB drop). 3: read views are never installed — must NOT
+/// diverge (a control on the control). 4: read views survive a CPL change.
+const EAGL_PV_MUTANT: u32 = match option_env!("V86_EAGL_PV_MUTANT") {
+    Some(v) => (v.as_bytes()[0] - b'0') as u32,
+    None => 0,
 };
-use crate::cpu::hypercall::{hc_safe_read8, hp_ptr, OFF_HC_EAGL_TOKEN_CFG_PTR};
+
+/// Structural self-test of the view tables, driven through the shipped lookup/lifetime code
+/// (pv_read_hit, pv_write_hit, pv_enter, eagl_read_cursor_invalidate). Needs no guest and no
+/// translation. Returns 0 on pass, else a bitmask of failing cases. It WRITES the tables, so it
+/// is for boot (PreemptionManager gates the switch on it), not for a live guest; it leaves the
+/// views dropped and the cursor policy as it found it.
+#[no_mangle]
+pub unsafe fn eagl_page_views_selftest() -> u32 {
+    const A: u32 = 0x0123_4000;
+    const HOST: u32 = 0x0050_0000;
+    let policy = EAGL_READ_CURSOR_POLICY_TLB;
+    let put = |a: u32| {
+        let i = pv_slot(a, PV_R);
+        PV_RTAG[i] = a & !0xFFF;
+        PV_RHOST[i] = HOST;
+        let j = pv_slot(a, PV_W);
+        PV_WTAG[j] = a & !0xFFF;
+        PV_WPHYS[j] = HOST;
+    };
+    let mut fail = 0u32;
+    // 0: the empty tag can never equal a page base.
+    if PV_EMPTY & 0xFFF == 0 { fail |= 1 << 0; }
+    // 1: a view answers inside its page, never across the boundary, never for another page.
+    pv_reset();
+    put(A);
+    if pv_read_hit(A + 0x10, 4) != Some(HOST + 0x10) || pv_read_hit(A + 0xFFC, 4) != Some(HOST + 0xFFC)
+        || pv_read_hit(A + 0xFFD, 4).is_some() || pv_read_hit(A + 0xFFF, 2).is_some()
+        || pv_read_hit(A + 0xFFF, 1) != Some(HOST + 0xFFF) || pv_read_hit(A + 0x1000, 1).is_some()
+        || pv_write_hit(A + 8) != Some(HOST + 8) || pv_write_hit(A + 0xFFE).is_some()
+    {
+        fail |= 1 << 1;
+    }
+    // 2: the TLB-drop hook leaves nothing that can answer.
+    eagl_read_cursor_invalidate();
+    if pv_read_hit(A, 1).is_some() || pv_write_hit(A).is_some() { fail |= 1 << 2; }
+    // 3: invocation entry under the TLB policy at an unchanged CPL keeps reads, drops writes.
+    EAGL_READ_CURSOR_POLICY_TLB = true;
+    PV_CPL = *crate::cpu::global_pointers::cpl;
+    put(A);
+    pv_enter();
+    if pv_read_hit(A, 4).is_none() || pv_write_hit(A).is_some() { fail |= 1 << 3; }
+    // 4: a CPL change drops reads.
+    PV_CPL = PV_CPL ^ 3;
+    pv_enter();
+    if pv_read_hit(A, 4).is_some() { fail |= 1 << 4; }
+    // 5: the per-dispatch policy drops reads at every entry.
+    EAGL_READ_CURSOR_POLICY_TLB = false;
+    put(A);
+    pv_enter();
+    if pv_read_hit(A, 4).is_some() || pv_write_hit(A).is_some() { fail |= 1 << 5; }
+    EAGL_READ_CURSOR_POLICY_TLB = policy;
+    pv_reset();
+    PV_HITS = 0;
+    fail
+}
+
+/// Test entry: run one inner-loop handler exactly as try_dispatch would (for
+/// tests/eagl-page-views-diff.mjs). Returns 1 = handled, 0 = declined.
+#[no_mangle]
+pub unsafe fn eagl_test_dispatch(handler_id: u32) -> u32 {
+    dispatch_inner_loop(handler_id as u8) as u32
+}
+
+// --- compile-gated access census (build with V86_EAGL_CENSUS=1; no code otherwise) ---------
+//
+// Answers, per handler bucket and per invocation: how many reads the cursor answered, how many
+// translated, how many of those translations were of a page THIS invocation had already
+// translated (removable by per-invocation struct/page validation), how many dwords straddled a
+// page, and the same for writes and narrow reads.
+const EAGL_CENSUS: bool = option_env!("V86_EAGL_CENSUS").is_some();
+const CB_N: usize = 8;
+const CB_128: usize = 0;
+const CB_132_HEAD: usize = 4;
+const CB_132_SIMPLE: usize = 5;
+const CB_132_SCAN: usize = 6;
+const CB_132_COMMIT: usize = 7;
+const CC_INV: usize = 0;
+const CC_READS: usize = 1;
+const CC_HOT: usize = 2;
+const CC_COLD: usize = 3;
+const CC_COLD_SEEN: usize = 4;
+const CC_STRADDLE: usize = 5;
+const CC_RPAGES: usize = 6;
+const CC_NARROW: usize = 7;
+const CC_NARROW_SEEN: usize = 8;
+const CC_WRITES: usize = 9;
+const CC_WRITES_SEEN: usize = 10;
+const CC_WPAGES: usize = 11;
+const CC_HOT_SEEN: usize = 12;
+const CC_OVF: usize = 13;
+/// Accesses answered by a page view (reads, narrow reads and writes together).
+const CC_VHIT: usize = 14;
+const CC_N: usize = 15;
+static mut CEN: [[u64; CC_N]; CB_N] = [[0; CC_N]; CB_N];
+static mut CEN_B: usize = 0;
+static mut CEN_RP: [u32; 64] = [0; 64];
+static mut CEN_RPN: usize = 0;
+static mut CEN_WP: [u32; 64] = [0; 64];
+static mut CEN_WPN: usize = 0;
+
+/// Records `addr`'s page in the invocation's read (or write) page set; true if it was there.
+#[inline(never)]
+unsafe fn census_page(addr: i32, write: bool) -> bool {
+    let pg = addr as u32 >> 12;
+    let (set, n) = if write {
+        (&mut *addr_of_mut!(CEN_WP), &mut *addr_of_mut!(CEN_WPN))
+    } else {
+        (&mut *addr_of_mut!(CEN_RP), &mut *addr_of_mut!(CEN_RPN))
+    };
+    for i in 0..*n {
+        if set[i] == pg { return true; }
+    }
+    if *n < set.len() {
+        set[*n] = pg;
+        *n += 1;
+        CEN[CEN_B][if write { CC_WPAGES } else { CC_RPAGES }] += 1;
+    } else {
+        CEN[CEN_B][CC_OVF] += 1;
+    }
+    false
+}
+#[inline(never)]
+unsafe fn census_access(addr: i32, total: usize, seen: usize, write: bool, line: u32, translated: bool) {
+    CEN[CEN_B][total] += 1;
+    if !translated { CEN[CEN_B][CC_VHIT] += 1; }
+    let was = census_page(addr, write);
+    if was { CEN[CEN_B][seen] += 1; }
+    census_line_note(line, was, translated);
+}
+/// Per-source-line counters: [accesses, page already seen this invocation, translated,
+/// translated although seen]. The line is the call site's (track_caller), so every site is
+/// named without threading an id through the handlers.
+const CEN_LINES: usize = 4096;
+static mut CEN_LINE: [[u32; 4]; CEN_LINES] = [[0; 4]; CEN_LINES];
+#[inline(always)]
+#[track_caller]
+fn census_line() -> u32 { core::panic::Location::caller().line() }
+#[inline(never)]
+unsafe fn census_line_note(line: u32, seen: bool, translated: bool) {
+    let l = (line as usize).min(CEN_LINES - 1);
+    CEN_LINE[l][0] += 1;
+    if seen { CEN_LINE[l][1] += 1; }
+    if translated { CEN_LINE[l][2] += 1; }
+    if seen && translated { CEN_LINE[l][3] += 1; }
+}
+#[no_mangle]
+pub unsafe fn eagl_census_line(line: u32, ctr: u32) -> u32 {
+    if line as usize >= CEN_LINES || ctr >= 4 { return 0; }
+    CEN_LINE[line as usize][ctr as usize]
+}
+#[inline(never)]
+unsafe fn census_invocation(bucket: usize) {
+    CEN_B = bucket;
+    CEN[bucket][CC_INV] += 1;
+    CEN_RPN = 0;
+    CEN_WPN = 0;
+}
+/// Re-attribute the rest of this invocation to another bucket (132's class split) without
+/// resetting the page sets — the head reads' pages stay "seen".
+#[inline(always)]
+unsafe fn census_bucket(bucket: usize) {
+    if EAGL_CENSUS {
+        CEN_B = bucket;
+        CEN[bucket][CC_INV] += 1;
+    }
+}
+#[no_mangle]
+pub unsafe fn eagl_census_enabled() -> u32 { EAGL_CENSUS as u32 }
+#[no_mangle]
+pub unsafe fn eagl_census_get(bucket: u32, counter: u32) -> f64 {
+    if bucket as usize >= CB_N || counter as usize >= CC_N { return -1.0; }
+    CEN[bucket as usize][counter as usize] as f64
+}
+#[no_mangle]
+pub unsafe fn eagl_census_reset() { CEN = [[0; CC_N]; CB_N]; CEN_LINE = [[0; 4]; CEN_LINES]; }
 
 /// Inner-loop band router (handler ids 128..=255, called from
 /// hypercall.rs::try_dispatch). All EAGL today; when a second engine lands,
@@ -28,6 +515,12 @@ pub(crate) unsafe fn dispatch_inner_loop(handler_id: u8) -> bool {
     // its own TLB instead (see EAGL_READ_CURSOR_POLICY_TLB).
     if !EAGL_READ_CURSOR_POLICY_TLB {
         eagl_read_cursor_reset();
+    }
+    if EAGL_PAGE_VIEWS {
+        pv_enter();
+    }
+    if EAGL_CENSUS {
+        census_invocation(match handler_id { 128..=131 => CB_128 + (handler_id - 128) as usize, _ => CB_132_HEAD });
     }
     match handler_id {
         // 128 = shader-constant converter (FUN_005cbd17): kilo-calls/frame;
@@ -182,6 +675,7 @@ static mut EAGL_READ_CURSOR_MISMATCH: u32 = 0;
 pub unsafe fn eagl_read_cursor_set(on: u32) {
     EAGL_READ_CURSOR = on != 0;
     eagl_read_cursor_drop();
+    pv_reset();
 }
 #[no_mangle]
 pub unsafe fn eagl_read_cursor_get() -> u32 { EAGL_READ_CURSOR as u32 }
@@ -190,6 +684,7 @@ pub unsafe fn eagl_read_cursor_get() -> u32 { EAGL_READ_CURSOR as u32 }
 pub unsafe fn eagl_read_cursor_set_policy(tlb_driven: u32) {
     EAGL_READ_CURSOR_POLICY_TLB = tlb_driven != 0;
     eagl_read_cursor_drop();
+    pv_reset();
 }
 #[no_mangle]
 pub unsafe fn eagl_read_cursor_get_policy() -> u32 { EAGL_READ_CURSOR_POLICY_TLB as u32 }
@@ -227,6 +722,10 @@ pub unsafe fn eagl_read_cursor_invalidate() {
         EAGL_READ_CURSOR_INVALIDATIONS = EAGL_READ_CURSOR_INVALIDATIONS.wrapping_add(1);
     }
     eagl_read_cursor_drop();
+    // The page views are translations too: they must not outlive the TLB entry either.
+    if EAGL_PV_MUTANT != 2 {
+        pv_reset();
+    }
 }
 
 /// Cursor tag for `addr`: page number in the high 20 bits, CPL folded into the low bits the
@@ -244,14 +743,52 @@ unsafe fn rc_tag(a: u32) -> u32 {
 /// everything else — first touch of a page, the straddling dword, the kill switch, the
 /// differential oracle — lives in the outlined half.
 #[inline(always)]
+#[track_caller]
 unsafe fn eagl_read32(addr: i32) -> Result<i32, ()> {
+    if EAGL_PAGE_VIEWS {
+        let a = addr as u32;
+        let hit = if EAGL_PV_MUTANT == 1 {
+            let i = pv_slot(a, PV_R);
+            if PV_RTAG[i] == a & !0xFFF { Some(PV_RHOST[i] + (a & 0xFFF)) } else { None }
+        } else {
+            pv_read_hit(a, 4)
+        };
+        if let Some(host) = hit {
+            let v = std::ptr::read_unaligned(host as *const i32);
+            if EAGL_CENSUS { census_read(addr, CC_VHIT, CC_VHIT, census_line()); }
+            if PV_VERIFY { pv_verify_read(addr, v, 4); }
+            return Ok(v);
+        }
+        return eagl_read32_pv_miss(addr);
+    }
+    eagl_read32_exact(addr)
+}
+
+/// The per-dword read as it always was: the one-entry cursor, then the translating cold path.
+#[inline(always)]
+#[track_caller]
+unsafe fn eagl_read32_exact(addr: i32) -> Result<i32, ()> {
     let a = addr as u32;
     if a & 0xFFF <= 0xFFC {
         if let Some(host) = rc_lookup(rc_tag(a)) {
+            if EAGL_CENSUS { census_read(addr, CC_HOT, CC_HOT_SEEN, census_line()); }
             return Ok(eagl_cursor_load(addr, host));
         }
     }
+    if EAGL_CENSUS {
+        if a & 0xFFF > 0xFFC { census_read(addr, CC_STRADDLE, CC_STRADDLE, census_line()); }
+        else { census_read(addr, CC_COLD, CC_COLD_SEEN, census_line()); }
+    }
     eagl_read32_cold(addr)
+}
+
+#[inline(never)]
+unsafe fn census_read(addr: i32, kind: usize, seen: usize, line: u32) {
+    CEN[CEN_B][CC_READS] += 1;
+    CEN[CEN_B][kind] += 1;
+    let was = census_page(addr, false);
+    if was && seen != kind { CEN[CEN_B][seen] += 1; }
+    census_line_note(line, was, kind != CC_HOT && kind != CC_VHIT);
 }
 
 /// The single funnel EVERY cursor hit goes through, the cold fill included, so the oracle
@@ -741,6 +1278,7 @@ unsafe fn handle_eagl_token_dispatch() -> bool {
     let dev = match eagl_read32(this_ctx + 8) { Ok(v) => v, Err(_) => return false };
     let vt = match eagl_read32(dev) { Ok(v) => v, Err(_) => return false };
 
+    census_bucket(if class == 6 { CB_132_SCAN } else { CB_132_SIMPLE });
     match class {
         1 | 2 | 8 => eagl_dispatch_simple(c, dev, vt, class, desc, stage, n),
         6 => eagl_dispatch_class6_batch(c, this_ctx, dev, vt, node, stage),
@@ -1319,6 +1857,7 @@ unsafe fn eagl_dispatch_class6_batch(
     if scan.head > c.capacity - 64 {
         return false;
     }
+    census_bucket(CB_132_COMMIT);
     let mut com = EaglPass::new(true, head0);
     // The commit pass repeats exactly the scan's reads (no guest code ran in
     // between) and writes only to our own RW structures — an Err here is
