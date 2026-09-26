@@ -25,6 +25,7 @@ node gen/generate_interpreter.js --output-dir build/ --table interpreter
 node gen/generate_interpreter.js --output-dir build/ --table interpreter0f
 node gen/generate_analyzer.js --output-dir build/ --table analyzer
 node gen/generate_analyzer.js --output-dir build/ --table analyzer0f
+node gen/generate_flag_contracts.js
 
 echo "=== Compiling C dependencies (zstd) ==="
 mkdir -p build

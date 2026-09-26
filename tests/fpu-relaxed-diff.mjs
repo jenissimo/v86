@@ -635,6 +635,7 @@ function run(bodyName, { jit, relaxed, x87Locals = false })
             // it coherent across helper-path x87 ops (fld m80 / fild / fsqrt / etc.).
             cpu.wm?.exports?.set_jit_config?.(10, (jit && relaxed && x87Locals) ? 1 : 0);
             cpu.wm?.exports?.set_jit_config?.(21, process.env.V86_FLAG_LOCALS === '1' ? 1 : 0);
+            cpu.wm?.exports?.set_flag_helper_contract?.(process.env.V86_FLAG_CONTRACT === '1' ? 1 : 0);
             cpu.wm?.exports?.profiler_init?.();
             timer = setTimeout(() => { if(!halted) finish("HANG"); }, TIMEOUT_MS);
             emulator.run();

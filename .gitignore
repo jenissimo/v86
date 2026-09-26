@@ -28,3 +28,4 @@ src/rust/gen/jit.rs
 src/rust/gen/jit0f.rs
 bios/seabios
 bench-results
+src/rust/gen/flag_contracts.rs

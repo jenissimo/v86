@@ -437,6 +437,232 @@ pub unsafe fn jit_wbuf_intrinsic_clear_registry() {
 static mut MAX_PAGES: u32 = 3;
 
 static mut JIT_USE_LOOP_SAFETY: bool = true;
+
+// Page-tail compilation. Stock v86 never analyses an instruction that STARTS in the last
+// MAX_INSTRUCTION_LENGTH bytes of a page: the analyser reads raw physical bytes, and an
+// instruction there may run onto the next PHYSICAL page, which is not the next virtual page,
+// may be unmapped or MMIO, and whose later writes would not invalidate this page's module.
+// With this on, every analysis is bounded to the page (cpu_context::decode_within): an
+// instruction that fits -- including one ending exactly at the page end -- is compiled, and
+// one that would cross is cut off before any byte of the next page is read and left to the
+// interpreter's real page-crossing fetch. Code-shaping; default off emits byte-identical
+// modules. Needs a JIT cache clear to take effect on already-compiled pages.
+static mut JIT_PAGE_TAILS: bool = false;
+
+#[no_mangle]
+pub fn set_jit_page_tails(on: u32) { unsafe { JIT_PAGE_TAILS = on != 0 } }
+#[no_mangle]
+pub fn get_jit_page_tails() -> u32 { unsafe { JIT_PAGE_TAILS as u32 } }
+fn page_tails_enabled() -> bool { unsafe { JIT_PAGE_TAILS } }
+
+// Hot-edge region formation. A module stops growing at a page whose entries are already
+// compiled elsewhere (page_blacklist) or at MAX_PAGES, so a hot direct CALL/JMP between two
+// such pages leaves the module on every execution: spill, return to cycle_internal, dispatch,
+// reload. With this on, generated code tags each constant-target module exit with its source
+// page; cycle_internal samples (source page, target eip) pairs, and a pair that stays hot is
+// JOINED: the source module is freed, and its recompilation may pull the target's page in
+// beyond both the blacklist and the page cap (at most HOT_EDGE_EXTRA_PAGES more). The joined
+// module becomes the target page's dispatch owner; the previous owner keeps it as a hidden
+// page, so every module containing the page is still freed by a write to it. Only WHICH pages
+// a module covers changes -- the multi-page machinery (page-switch checks, per-page entry
+// lists, page-granular invalidation) is the stock one. Code-shaping; default off emits
+// byte-identical modules.
+static mut JIT_HOT_EDGE_REGIONS: bool = false;
+static mut HOT_EDGE_THRESHOLD: u32 = 256;
+static mut HOT_EDGE_EXTRA_PAGES: u32 = 5;
+static mut HOT_EDGE_MAX_JOINS: u32 = 256;
+// Sample one exit in 2^HOT_EDGE_SAMPLE_SHIFT: the per-exit cost is then one load and a branch.
+const HOT_EDGE_SAMPLE_SHIFT: u32 = 4;
+// Halve every counter each 2^16 samples (~1M exits), so "hot" means a sustained rate.
+const HOT_EDGE_DECAY_MASK: u32 = 0xFFFF;
+const HOT_EDGE_SLOTS: usize = 1024;
+#[derive(Clone, Copy)]
+struct HotEdgeSlot {
+    src: u32,
+    tgt: u32,
+    hits: u32,
+}
+// Heap-allocated on first use, not a static: std on this target seeds every HashMap from the
+// address of its first heap allocation, and 12 KB of new statics moves the heap base -- which
+// reorders the stock page walk and hands the switch-OFF engine different (equally valid)
+// modules than a build without this feature. OFF must stay byte-identical, so OFF allocates
+// nothing.
+static mut HOT_EDGES: Option<Box<[HotEdgeSlot; HOT_EDGE_SLOTS]>> = None;
+fn hot_edges() -> &'static mut [HotEdgeSlot; HOT_EDGE_SLOTS] {
+    unsafe {
+        let slot = &mut *std::ptr::addr_of_mut!(HOT_EDGES);
+        slot.get_or_insert_with(|| Box::new([HotEdgeSlot { src: 0, tgt: 0, hits: 0 }; HOT_EDGE_SLOTS]))
+    }
+}
+// Written by generated code right before a constant-target exit: source phys page + 1.
+static mut HOT_EDGE_EXIT_SRC: u32 = 0;
+static mut HOT_EDGE_TICK: u32 = 0;
+static mut HOT_EDGE_SAMPLES: u32 = 0;
+// [joins, reforms, refused, joined compiles, joined bytes, all compiles, all bytes,
+//  samples, joined pages admitted]
+static mut HOT_EDGE_STATS: [u64; 9] = [0; 9];
+
+#[no_mangle]
+pub fn set_jit_hot_edge_regions(on: u32) { unsafe { JIT_HOT_EDGE_REGIONS = on != 0 } }
+#[no_mangle]
+pub fn get_jit_hot_edge_regions() -> u32 { unsafe { JIT_HOT_EDGE_REGIONS as u32 } }
+/// threshold = samples within a decay window; extra = pages a join may add past MAX_PAGES.
+#[no_mangle]
+pub fn set_jit_hot_edge_params(threshold: u32, extra_pages: u32, max_joins: u32) {
+    unsafe {
+        HOT_EDGE_THRESHOLD = threshold.max(1);
+        HOT_EDGE_EXTRA_PAGES = extra_pages.min(16);
+        HOT_EDGE_MAX_JOINS = max_joins;
+    }
+}
+#[no_mangle]
+pub fn get_jit_hot_edge_stat(i: u32) -> f64 {
+    unsafe { (&*std::ptr::addr_of!(HOT_EDGE_STATS)).get(i as usize).map_or(0.0, |v| *v as f64) }
+}
+/// Forget all evidence and joins (the A/B harness calls this with every cache clear, so an
+/// arm never inherits the other arm's region decisions).
+#[no_mangle]
+pub fn jit_hot_edge_reset() {
+    unsafe {
+        if let Some(t) = (*std::ptr::addr_of_mut!(HOT_EDGES)).as_mut() {
+            for e in t.iter_mut() {
+                *e = HotEdgeSlot { src: 0, tgt: 0, hits: 0 };
+            }
+        }
+        HOT_EDGE_EXIT_SRC = 0;
+        HOT_EDGE_TICK = 0;
+        HOT_EDGE_SAMPLES = 0;
+        HOT_EDGE_STATS = [0; 9];
+    }
+    let mut ctx = get_jit_state();
+    ctx.region_joins.clear();
+    ctx.region_join_done.clear();
+}
+pub fn hot_edge_regions_enabled() -> bool { unsafe { JIT_HOT_EDGE_REGIONS } }
+fn hot_edge_exit_src_addr() -> u32 { std::ptr::addr_of!(HOT_EDGE_EXIT_SRC) as u32 }
+
+/// cycle_internal, right after a compiled module returned: `target` is the eip it left at.
+/// Only a constant-target exit tags HOT_EDGE_EXIT_SRC, and the tag is consumed here, so a
+/// pair is never formed across an interrupt, a thread switch or a different exit kind.
+#[inline]
+pub fn hot_edge_note_exit(target: u32) {
+    let src = unsafe { HOT_EDGE_EXIT_SRC };
+    if src == 0 {
+        return;
+    }
+    unsafe {
+        HOT_EDGE_EXIT_SRC = 0;
+        HOT_EDGE_TICK = HOT_EDGE_TICK.wrapping_add(1);
+        if HOT_EDGE_TICK & ((1 << HOT_EDGE_SAMPLE_SHIFT) - 1) != 0 {
+            return;
+        }
+    }
+    hot_edge_sample(src, target);
+}
+
+#[cold]
+fn hot_edge_sample(src: u32, target: u32) {
+    let fire = unsafe {
+        HOT_EDGE_STATS[7] += 1;
+        HOT_EDGE_SAMPLES = HOT_EDGE_SAMPLES.wrapping_add(1);
+        if HOT_EDGE_SAMPLES & HOT_EDGE_DECAY_MASK == 0 {
+            for e in hot_edges().iter_mut() {
+                e.hits >>= 1;
+            }
+        }
+        let h = (src.wrapping_mul(0x9E37_79B1) ^ target.wrapping_mul(0x85EB_CA6B)) >> 22;
+        let slot = &mut hot_edges()[h as usize & (HOT_EDGE_SLOTS - 1)];
+        if slot.src == src && slot.tgt == target {
+            slot.hits += 1;
+        }
+        else if slot.hits == 0 {
+            *slot = HotEdgeSlot { src, tgt: target, hits: 1 };
+        }
+        else {
+            // Space-saving decrement: a hot pair survives a stream of cold ones sharing its slot.
+            slot.hits -= 1;
+        }
+        if slot.hits >= HOT_EDGE_THRESHOLD {
+            slot.hits = 0;
+            true
+        }
+        else {
+            false
+        }
+    };
+    if fire {
+        hot_edge_form(Page::of_u32(src - 1), target);
+    }
+}
+
+/// Record a join and free the source module so it recompiles with the target page in reach.
+/// Runs between module entries (cycle_internal), where freeing modules is safe.
+fn hot_edge_form(src_page: Page, target: u32) {
+    let mut ctx = get_jit_state();
+    let refuse = |ctx: &mut JitState| {
+        let _ = ctx;
+        unsafe { HOT_EDGE_STATS[2] += 1 };
+    };
+    if ctx.compiling.is_some() {
+        // A module is in flight; its publication could race the free below. Try again later.
+        return refuse(&mut ctx);
+    }
+    let tgt_phys = match cpu::translate_address_read_no_side_effects(target as i32) {
+        Ok(p) => p,
+        Err(()) => return refuse(&mut ctx),
+    };
+    let tgt_page = Page::page_of(tgt_phys);
+    if tgt_page == src_page
+        || region_target_excluded(target)
+        || ctx.region_join_done.contains(&(src_page, tgt_page))
+        || unsafe { HOT_EDGE_STATS[0] } >= unsafe { HOT_EDGE_MAX_JOINS } as u64
+    {
+        return refuse(&mut ctx);
+    }
+    let src_index = match ctx.pages.get(&src_page) {
+        Some(info) => info.wasm_table_index,
+        None => return refuse(&mut ctx),
+    };
+    if ctx.pages.get(&tgt_page).map_or(false, |info| info.wasm_table_index == src_index) {
+        return refuse(&mut ctx);
+    }
+    ctx.region_join_done.insert((src_page, tgt_page));
+    let joins = ctx.region_joins.entry(src_page).or_insert_with(Vec::new);
+    if joins.len() as u32 >= unsafe { HOT_EDGE_EXTRA_PAGES } {
+        return refuse(&mut ctx);
+    }
+    joins.push(tgt_page);
+    unsafe {
+        HOT_EDGE_STATS[0] += 1;
+        HOT_EDGE_STATS[1] += 1;
+    }
+    free_wasm_module_tree(&mut ctx, src_index);
+}
+
+/// Analyse one instruction without reading past the end of its page. None = it would cross.
+fn analyze_step_within_page(cpu: &mut CpuContext) -> Option<analysis::Analysis> {
+    let limit = (cpu.eip & !0xFFF).wrapping_add(0x1000);
+    let (analysis, fits) =
+        crate::cpu_context::decode_within(limit, || analysis::analyze_step(cpu));
+    if fits { Some(analysis) } else { None }
+}
+
+/// Whether an entry point in a page tail can ever start a compiled block: the instruction
+/// there must lie wholly inside the page, and STI is cut off near the end in any case.
+/// Registering one that cannot would leave the page permanently "not fully compiled" and
+/// recompile it at every hotness threshold.
+fn tail_entry_compilable(phys_address: u32, cs_offset: u32, state_flags: CachedStateFlags) -> bool {
+    let mut cpu = CpuContext { eip: phys_address, prefixes: 0, cs_offset, state_flags };
+    match analyze_step_within_page(&mut cpu) {
+        Some(a) => a.ty != AnalysisType::STI,
+        None => false,
+    }
+}
+
+/// Byte offset of `end` from the page that holds `start`, in [1, 0x1000]. Equal to
+/// `end & 0xFFF` except for a block/instruction ending exactly at the page end, where the
+/// low bits alone would name the START of the same page.
+pub fn page_offset_of_end(start: u32, end: u32) -> i32 { end.wrapping_sub(start & !0xFFF) as i32 }
 // Direct known-successor cross-module chaining: after a direct jump leaves the
 // current module, resolve the already-written runtime EIP through DISPATCH_META
 // and tail-call the destination module instead of returning to cycle_internal.
@@ -1955,6 +2181,13 @@ struct JitState {
     // "one candidate gathering evidence" from "hundreds of distinct pages competing", so
     // keep this distinct-page view alongside it for diagnostics.
     tier2_blocked_pages: HashSet<Page>,
+    // Hot-edge region formation: source page -> target pages its module may absorb, and every
+    // (source, target) pair ever decided, so a pair is joined (or refused) once.
+    // Fixed-key hasher, not RandomState: std seeds each RandomState from a per-thread counter,
+    // so two extra RandomState maps here would reseed every HashSet created after them and
+    // reorder the page walk -- changing which pages a stock module admits under its cap.
+    region_joins: HashMap<Page, Vec<Page>, FixedHasher>,
+    region_join_done: HashSet<(Page, Page), FixedHasher>,
     #[cfg(debug_assertions)]
     wasm_table_index_to_page: HashMap<WasmTableIndex, HashSet<Page>>,
 }
@@ -2056,6 +2289,8 @@ impl JitState {
             tier2_touch_clock: 0,
             tier2_candidates: HashMap::new(),
             tier2_blocked_pages: HashSet::new(),
+            region_joins: HashMap::default(),
+            region_join_done: HashSet::default(),
 
             #[cfg(debug_assertions)]
             wasm_table_index_to_page: HashMap::new(),
@@ -2835,6 +3070,16 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(
     -1
 }
 
+type FixedHasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+
+struct JoinBudget {
+    // pages admitted past the page cap by hot-edge joins
+    extra: u32,
+    // pages admitted by hot-edge joins at all
+    pages: u32,
+}
+static mut LAST_COMPILE_JOINED_PAGES: Vec<Page> = Vec::new();
+
 fn jit_find_basic_blocks(
     ctx: &mut JitState,
     entry_points: HashSet<i32>,
@@ -2848,8 +3093,10 @@ fn jit_find_basic_blocks(
         max_pages: u32,
         marked_as_entry: &mut HashSet<i32>,
         to_visit_stack: &mut Vec<i32>,
+        from: Option<Page>,
+        join: &mut JoinBudget,
     ) -> Option<u32> {
-        if is_near_end_of_page(virt_target as u32) {
+        if !page_tails_enabled() && is_near_end_of_page(virt_target as u32) {
             return None;
         }
         let phys_target = match cpu::translate_address_read_no_side_effects(virt_target) {
@@ -2878,11 +3125,21 @@ fn jit_find_basic_blocks(
             return None;
         }
 
+        // A hot-edge join admits the page past the blacklist (it is compiled elsewhere) and past
+        // the page cap, up to its own budget.
+        let joining = hot_edge_regions_enabled()
+            && !pages.contains(&phys_page)
+            && from.map_or(false, |f| {
+                ctx.region_joins.get(&f).map_or(false, |targets| targets.contains(&phys_page))
+            })
+            && (pages.len() < max_pages as usize || join.extra < unsafe { HOT_EDGE_EXTRA_PAGES });
+
         // `>=` (not `==`): a proper ceiling. Equivalent to the original for the
         // single-cap default path (growth is monotonic), but required so the cap
         // holds when region formation seeds the page set above the base cap.
-        if !pages.contains(&phys_page) && pages.len() as u32 >= max_pages
-            || page_blacklist.contains(&phys_page)
+        if !joining
+            && (!pages.contains(&phys_page) && pages.len() as u32 >= max_pages
+                || page_blacklist.contains(&phys_page))
         {
             return None;
         }
@@ -2897,9 +3154,10 @@ fn jit_find_basic_blocks(
                     None => HashSet::new(),
                 };
 
-                if entry_points
-                    .iter()
-                    .all(|entry_point| existing_entry_points.contains(entry_point))
+                if !joining
+                    && entry_points
+                        .iter()
+                        .all(|entry_point| existing_entry_points.contains(entry_point))
                 {
                     page_blacklist.insert(phys_page);
                     return None;
@@ -2926,8 +3184,15 @@ fn jit_find_basic_blocks(
                 return None;
             }
 
+            if joining {
+                if pages.len() as u32 >= max_pages {
+                    join.extra += 1;
+                }
+                join.pages += 1;
+                unsafe { (*std::ptr::addr_of_mut!(LAST_COMPILE_JOINED_PAGES)).push(phys_page) };
+            }
             pages.insert(phys_page);
-            dbg_assert!(pages.len() as u32 <= max_pages);
+            dbg_assert!(pages.len() as u32 <= max_pages + join.extra);
         }
 
         to_visit_stack.push(virt_target);
@@ -2966,6 +3231,9 @@ fn jit_find_basic_blocks(
         1
     };
 
+    let mut join = JoinBudget { extra: 0, pages: 0 };
+    unsafe { (*std::ptr::addr_of_mut!(LAST_COMPILE_JOINED_PAGES)).clear() };
+
     for virt_addr in entry_points {
         let ok = follow_jump(
             virt_addr,
@@ -2975,10 +3243,14 @@ fn jit_find_basic_blocks(
             max_pages,
             &mut marked_as_entry,
             &mut to_visit_stack,
+            None,
+            &mut join,
         );
         dbg_assert!(ok.is_some());
         dbg_assert!(marked_as_entry.contains(&virt_addr));
     }
+
+    let tails = page_tails_enabled();
 
     while let Some(to_visit) = to_visit_stack.pop() {
         let phys_addr = match cpu::translate_address_read_no_side_effects(to_visit) {
@@ -2993,7 +3265,7 @@ fn jit_find_basic_blocks(
             continue;
         }
 
-        if is_near_end_of_page(phys_addr) {
+        if !tails && is_near_end_of_page(phys_addr) {
             // Empty basic block, don't insert
             profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
             continue;
@@ -3018,14 +3290,34 @@ fn jit_find_basic_blocks(
                 eip: current_address,
                 ..cpu
             };
-            let analysis = analysis::analyze_step(&mut cpu);
+            let analysis = if tails {
+                match analyze_step_within_page(&mut cpu) {
+                    Some(analysis) => analysis,
+                    None => {
+                        // Straddles the page end: the block ends before it, the interpreter
+                        // runs it with the real two-page fetch.
+                        profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                        break;
+                    },
+                }
+            }
+            else {
+                analysis::analyze_step(&mut cpu)
+            };
             let has_next_instruction = !analysis.no_next_instruction;
             current_address = cpu.eip;
 
-            dbg_assert!(Page::page_of(current_address) == Page::page_of(addr_before_instruction));
-            let current_virt_addr = to_visit & !0xFFF | current_address as i32 & 0xFFF;
+            // False only in page-tail mode, for an instruction ending exactly at the page end:
+            // what follows it is on another page and must not be analysed as part of this one.
+            let next_on_page =
+                Page::page_of(current_address) == Page::page_of(addr_before_instruction);
+            dbg_assert!(Page::page_of(current_address - 1) == Page::page_of(addr_before_instruction));
+            let current_virt_addr = (to_visit & !0xFFF)
+                + page_offset_of_end(addr_before_instruction, current_address);
 
-            if analysis.ty == AnalysisType::STI && is_near_end_of_page(current_address) {
+            if analysis.ty == AnalysisType::STI
+                && (is_near_end_of_page(current_address) || !next_on_page)
+            {
                 // cut off before the STI so that it is handled by interpreted mode
                 profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
                 break;
@@ -3043,8 +3335,10 @@ fn jit_find_basic_blocks(
                     if current_block.has_sti {
                         // Convert next instruction after STI (i.e., the current instruction) into block boundary
 
-                        marked_as_entry.insert(current_virt_addr);
-                        to_visit_stack.push(current_virt_addr);
+                        if next_on_page {
+                            marked_as_entry.insert(current_virt_addr);
+                            to_visit_stack.push(current_virt_addr);
+                        }
 
                         break;
                     }
@@ -3061,8 +3355,8 @@ fn jit_find_basic_blocks(
                         // Only split non-STI blocks (one instruction needs to run after STI before
                         // handle_irqs may be called)
 
-                        if basic_blocks.contains_key(&current_address) {
-                            dbg_assert!(!is_near_end_of_page(current_address));
+                        if next_on_page && basic_blocks.contains_key(&current_address) {
+                            dbg_assert!(tails || !is_near_end_of_page(current_address));
                             current_block.ty = BasicBlockType::Normal {
                                 next_block_addr: Some(current_address),
                                 jump_offset: 0,
@@ -3089,9 +3383,13 @@ fn jit_find_basic_blocks(
                     };
 
                     dbg_assert!(has_next_instruction);
-                    to_visit_stack.push(current_virt_addr);
+                    if next_on_page {
+                        to_visit_stack.push(current_virt_addr);
+                    }
 
-                    let next_block_addr = if is_near_end_of_page(current_address) {
+                    let next_block_addr = if !next_on_page
+                        || !tails && is_near_end_of_page(current_address)
+                    {
                         None
                     }
                     else {
@@ -3108,6 +3406,8 @@ fn jit_find_basic_blocks(
                             max_pages,
                             &mut marked_as_entry,
                             &mut to_visit_stack,
+                            Some(Page::page_of(phys_addr)),
+                            &mut join,
                         ),
                         condition,
                         jump_offset: offset,
@@ -3132,7 +3432,7 @@ fn jit_find_basic_blocks(
                             + (current_virt_addr - cpu.cs_offset as i32 + offset & 0xFFFF)
                     };
 
-                    if has_next_instruction {
+                    if has_next_instruction && next_on_page {
                         // Execution will eventually come back to the next instruction (CALL)
                         marked_as_entry.insert(current_virt_addr);
                         to_visit_stack.push(current_virt_addr);
@@ -3147,6 +3447,8 @@ fn jit_find_basic_blocks(
                             max_pages,
                             &mut marked_as_entry,
                             &mut to_visit_stack,
+                            Some(Page::page_of(phys_addr)),
+                            &mut join,
                         ),
                         jump_offset: offset,
                         jump_offset_is_32: is_32,
@@ -3157,7 +3459,7 @@ fn jit_find_basic_blocks(
                 AnalysisType::BlockBoundary => {
                     // a block boundary but not a jump, get out
 
-                    if has_next_instruction {
+                    if has_next_instruction && next_on_page {
                         // block boundary, but execution will eventually come back
                         // to the next instruction. Create a new basic block
                         // starting at the next instruction and register it as an
@@ -3225,6 +3527,8 @@ fn jit_find_basic_blocks(
                                     max_pages,
                                     &mut marked_as_entry,
                                     &mut to_visit_stack,
+                                    Some(Page::page_of(phys_addr)),
+                                    &mut join,
                                 )
                                 {
                                     marked_as_entry.insert(target as i32);
@@ -3248,7 +3552,7 @@ fn jit_find_basic_blocks(
                 },
             }
 
-            if is_near_end_of_page(current_address) {
+            if !next_on_page || !tails && is_near_end_of_page(current_address) {
                 profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
                 break;
             }
@@ -3286,7 +3590,7 @@ fn jit_find_basic_blocks(
         basic_blocks.insert(current_block.addr, current_block);
     }
 
-    dbg_assert!(pages.len() as u32 <= max_pages);
+    dbg_assert!(pages.len() as u32 <= max_pages + join.extra);
 
     for block in basic_blocks.values_mut() {
         if marked_as_entry.contains(&block.virt_addr) {
@@ -3334,7 +3638,7 @@ fn jit_find_basic_blocks(
     // sweep in free_wasm_module), annotations included — no new SMC surface.
     if ret_speculation_enabled() {
         let fall_through_virt =
-            |b: &BasicBlock| b.virt_addr & !0xFFF | b.end_addr as i32 & 0xFFF;
+            |b: &BasicBlock| (b.virt_addr & !0xFFF) + page_offset_of_end(b.addr, b.end_addr);
 
         let mut call_sites: Vec<(u32, i32, u32)> = Vec::new();
         for block in basic_blocks.values() {
@@ -3545,7 +3849,7 @@ fn jit_analyze_and_generate(
 
     for b in basic_blocks.iter() {
         // Remove this assertion once page-crossing jit is enabled
-        dbg_assert!(Page::page_of(b.addr) == Page::page_of(b.end_addr));
+        dbg_assert!(Page::page_of(b.addr) == Page::page_of(b.end_addr - 1));
         pages.insert(Page::page_of(b.addr));
     }
 
@@ -3664,6 +3968,7 @@ fn jit_analyze_and_generate(
                 MAX_PAGES
                     .max(JIT_INDIRECT_REGION_MAX_PAGES)
                     .max(TIER2_MAX_PAGES)
+                    + HOT_EDGE_EXTRA_PAGES
             } as usize
     );
 
@@ -3712,6 +4017,19 @@ fn jit_analyze_and_generate(
         stat::COMPILE_WASM_TOTAL_BYTES,
         ctx.wasm_builder.get_output_len() as u64,
     );
+    if hot_edge_regions_enabled() {
+        let bytes = ctx.wasm_builder.get_output_len() as u64;
+        let joined = unsafe { (*std::ptr::addr_of!(LAST_COMPILE_JOINED_PAGES)).len() as u64 };
+        unsafe {
+            HOT_EDGE_STATS[5] += 1;
+            HOT_EDGE_STATS[6] += bytes;
+            if joined > 0 {
+                HOT_EDGE_STATS[3] += 1;
+                HOT_EDGE_STATS[4] += bytes;
+                HOT_EDGE_STATS[8] += joined;
+            }
+        }
+    }
     profiler::stat_increment_by(stat::COMPILE_PAGE, pages.len() as u64);
 
     for &p in &pages {
@@ -4321,6 +4639,14 @@ fn gen_chain_or_exit_to_known_successor(
     last_instruction_addr: u32,
 ) {
     if !block_chaining_enabled() {
+        if hot_edge_regions_enabled() {
+            // Tag the exit with its source page for cycle_internal's hot-edge sampler. Only on
+            // this unchained exit: a chained one never returns to cycle_internal, and a tag it
+            // left behind would pair this source with some later module's exit eip.
+            ctx.builder.const_i32(hot_edge_exit_src_addr() as i32);
+            ctx.builder.const_i32(Page::page_of(last_instruction_addr).to_u32() as i32 + 1);
+            ctx.builder.store_aligned_i32(0);
+        }
         codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
         ctx.builder.br(ctx.exit_label);
         return;
@@ -4682,7 +5008,7 @@ fn jit_generate_module(
                         } => {
                             codegen::gen_set_eip_low_bits(
                                 ctx.builder,
-                                block.end_addr as i32 & 0xFFF,
+                                page_offset_of_end(block.addr, block.end_addr),
                             );
                             codegen::gen_condition_fn(ctx, condition);
                             ctx.builder.if_void();
@@ -4702,14 +5028,14 @@ fn jit_generate_module(
                             if jump_offset_is_32 {
                                 codegen::gen_set_eip_low_bits_and_jump_rel32(
                                     ctx.builder,
-                                    block.end_addr as i32 & 0xFFF,
+                                    page_offset_of_end(block.addr, block.end_addr),
                                     jump_offset,
                                 );
                             }
                             else {
                                 codegen::gen_set_eip_low_bits(
                                     ctx.builder,
-                                    block.end_addr as i32 & 0xFFF,
+                                    page_offset_of_end(block.addr, block.end_addr),
                                 );
                                 codegen::gen_jmp_rel16(ctx.builder, jump_offset as u16);
                             }
@@ -4896,14 +5222,14 @@ fn jit_generate_module(
                         if jump_offset_is_32 {
                             codegen::gen_set_eip_low_bits_and_jump_rel32(
                                 ctx.builder,
-                                block.end_addr as i32 & 0xFFF,
+                                page_offset_of_end(block.addr, block.end_addr),
                                 jump_offset,
                             );
                         }
                         else {
                             codegen::gen_set_eip_low_bits(
                                 ctx.builder,
-                                block.end_addr as i32 & 0xFFF,
+                                page_offset_of_end(block.addr, block.end_addr),
                             );
                             codegen::gen_jmp_rel16(ctx.builder, jump_offset as u16);
                         }
@@ -4930,14 +5256,14 @@ fn jit_generate_module(
                             if jump_offset_is_32 {
                                 codegen::gen_set_eip_low_bits_and_jump_rel32(
                                     ctx.builder,
-                                    block.end_addr as i32 & 0xFFF,
+                                    page_offset_of_end(block.addr, block.end_addr),
                                     jump_offset,
                                 );
                             }
                             else {
                                 codegen::gen_set_eip_low_bits(
                                     ctx.builder,
-                                    block.end_addr as i32 & 0xFFF,
+                                    page_offset_of_end(block.addr, block.end_addr),
                                 );
                                 codegen::gen_jmp_rel16(ctx.builder, jump_offset as u16);
                             }
@@ -5067,14 +5393,14 @@ fn jit_generate_module(
                                     if jump_offset_is_32 {
                                         codegen::gen_set_eip_low_bits_and_jump_rel32(
                                             ctx.builder,
-                                            block.end_addr as i32 & 0xFFF,
+                                            page_offset_of_end(block.addr, block.end_addr),
                                             jump_offset,
                                         );
                                     }
                                     else {
                                         codegen::gen_set_eip_low_bits(
                                             ctx.builder,
-                                            block.end_addr as i32 & 0xFFF,
+                                            page_offset_of_end(block.addr, block.end_addr),
                                         );
                                         codegen::gen_jmp_rel16(ctx.builder, jump_offset as u16);
                                     }
@@ -5192,14 +5518,14 @@ fn jit_generate_module(
                                     if jump_offset_is_32 {
                                         codegen::gen_set_eip_low_bits_and_jump_rel32(
                                             ctx.builder,
-                                            block.end_addr as i32 & 0xFFF,
+                                            page_offset_of_end(block.addr, block.end_addr),
                                             jump_offset,
                                         );
                                     }
                                     else {
                                         codegen::gen_set_eip_low_bits(
                                             ctx.builder,
-                                            block.end_addr as i32 & 0xFFF,
+                                            page_offset_of_end(block.addr, block.end_addr),
                                         );
                                         codegen::gen_jmp_rel16(ctx.builder, jump_offset as u16);
                                     }
@@ -5207,7 +5533,7 @@ fn jit_generate_module(
                                 else {
                                     codegen::gen_set_eip_low_bits(
                                         ctx.builder,
-                                        block.end_addr as i32 & 0xFFF,
+                                        page_offset_of_end(block.addr, block.end_addr),
                                     );
                                 }
 
@@ -5263,14 +5589,14 @@ fn jit_generate_module(
                                 if jump_offset_is_32 {
                                     codegen::gen_set_eip_low_bits_and_jump_rel32(
                                         ctx.builder,
-                                        block.end_addr as i32 & 0xFFF,
+                                        page_offset_of_end(block.addr, block.end_addr),
                                         jump_offset,
                                     );
                                 }
                                 else {
                                     codegen::gen_set_eip_low_bits(
                                         ctx.builder,
-                                        block.end_addr as i32 & 0xFFF,
+                                        page_offset_of_end(block.addr, block.end_addr),
                                     );
                                     codegen::gen_jmp_rel16(ctx.builder, jump_offset as u16);
                                 }
@@ -5641,7 +5967,7 @@ fn jit_generate_basic_block(
     let stop_addr = block.end_addr;
 
     // First iteration of do-while assumes the caller confirms this condition
-    dbg_assert!(!is_near_end_of_page(start_addr));
+    dbg_assert!(page_tails_enabled() || !is_near_end_of_page(start_addr));
 
     if cfg!(feature = "profiler") {
         ctx.builder.const_i32(start_addr as i32);
@@ -5723,7 +6049,7 @@ fn jit_generate_basic_block(
                     ctx.builder,
                     last_instruction_addr as i32 & 0xFFF,
                 );
-                codegen::gen_set_eip_low_bits(ctx.builder, stop_addr as i32 & 0xFFF);
+                codegen::gen_set_eip_low_bits(ctx.builder, page_offset_of_end(start_addr, stop_addr));
             }
         }
 
@@ -5769,7 +6095,7 @@ fn jit_generate_basic_block(
 
         if end_addr == stop_addr {
             // no page was crossed
-            dbg_assert!(Page::page_of(end_addr) == Page::page_of(start_addr));
+            dbg_assert!(Page::page_of(end_addr - 1) == Page::page_of(start_addr));
             codegen::gen_x87_local_cache_free_all(ctx);
             codegen::gen_push32_write_cache_free(ctx);
             codegen::gen_read_tlb_cache_free(ctx);
@@ -5778,7 +6104,10 @@ fn jit_generate_basic_block(
             break;
         }
 
-        if was_block_boundary || is_near_end_of_page(end_addr) || end_addr > stop_addr {
+        if was_block_boundary
+            || !page_tails_enabled() && is_near_end_of_page(end_addr)
+            || end_addr > stop_addr
+        {
             dbg_log!(
                 "Overlapping basic blocks start={:x} expected_end={:x} end={:x} was_block_boundary={} near_end_of_page={}",
                 start_addr,
@@ -5820,7 +6149,9 @@ pub fn jit_increase_hotness_and_maybe_compile(
         (0, HashSet::new())
     });
 
-    if !is_near_end_of_page(phys_address) {
+    if !is_near_end_of_page(phys_address)
+        || page_tails_enabled() && tail_entry_compilable(phys_address, cs_offset, state_flags)
+    {
         entry_points.insert(phys_address as u16 & 0xFFF);
     }
 
@@ -6328,17 +6659,33 @@ fn jit_codegen_fingerprint() -> u64 {
     add(crate::softfloat::get_relaxed_fpu());
     add(crate::softfloat::get_fpu_relaxed_stats());
     // Diagnostic switches that CHANGE THE EMITTED CODE, so a unit compiled under one and
-    // replayed under another is not the code the caller thinks it is: the perm-map probe adds
-    // a branch and skips the tlb path, stack-raw drops the access check outright, and the
+    // replayed under another is not the code the caller thinks it is: both perm-map modes
+    // take reads off the inline TLB chain, stack-raw drops the access check outright, and the
     // opcode census inserts counter increments. All three ship off; the AOT cache keys
     // persisted units on this hash, and a checkless unit must not be replayable in a normal
     // session merely because the flag it was recorded under is invisible here.
     add(crate::cpu::perm_map::get_perm_map_reads());
     add(crate::codegen::get_stack_raw_unsafe());
     add(crate::opstats::opstats_enabled() as u32);
+    // Flag-helper contracts narrow the flag sync around helper calls; sync counting inserts
+    // increments; a mutated contract table is a deliberately wrong build.
+    add(crate::wasmgen::wasm_builder::get_flag_helper_contract());
+    add(crate::wasmgen::wasm_builder::get_flag_sync_counting());
+    add(crate::wasmgen::wasm_builder::get_flag_helper_contract_mutated());
     add(FASTMEM_LOW_MEM_END);
     add(FASTMEM_GUARD_BASE);
     add(FASTMEM_GUARD_SIZE);
+    // Page tails and hot-edge regions change what a module contains. Folded in only when on,
+    // so the hash of an engine with both off is the hash it had before they existed.
+    unsafe {
+        if JIT_PAGE_TAILS {
+            add(0x7A11_0001);
+        }
+        if JIT_HOT_EDGE_REGIONS {
+            add(0x7A11_0002);
+            add(HOT_EDGE_EXTRA_PAGES);
+        }
+    }
     hash
 }
 

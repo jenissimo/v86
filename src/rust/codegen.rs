@@ -4,6 +4,7 @@ use crate::cpu::cpu::{
 };
 use crate::cpu::global_pointers;
 use crate::cpu::memory;
+use crate::jit;
 use crate::jit::{Instruction, InstructionOperand, InstructionOperandDest, JitContext};
 use crate::modrm;
 use crate::modrm::ModrmByte;
@@ -41,14 +42,33 @@ pub fn gen_mark_fpu_simd_dirty_once(ctx: &mut JitContext) {
     ctx.fpu_simd_dirty_marked = true;
 }
 
+/// `page_base | offset` for an offset in [0, 0x1000]. 0x1000 (an instruction ending exactly at
+/// the page end, page-tail mode only) must ADD: the low bits alone would be the page's start.
+/// Below 0x1000 this emits the stock `or`, so modules compiled without page tails are unchanged.
+fn gen_or_page_offset(builder: &mut WasmBuilder, offset: i32) {
+    dbg_assert!(offset >= 0 && offset <= 0x1000);
+    if offset == 0x1000 {
+        builder.const_i32(0x1000);
+        builder.add_i32();
+    }
+    else {
+        builder.const_i32(offset);
+        builder.or_i32();
+    }
+}
+
+fn current_instruction_end_offset(ctx: &JitContext) -> i32 {
+    jit::page_offset_of_end(ctx.start_of_current_instruction, ctx.cpu.eip)
+}
+
 pub fn gen_set_eip_to_after_current_instruction(ctx: &mut JitContext) {
     ctx.builder
         .const_i32(global_pointers::instruction_pointer as i32);
     gen_get_eip(ctx.builder);
     ctx.builder.const_i32(!0xFFF);
     ctx.builder.and_i32();
-    ctx.builder.const_i32(ctx.cpu.eip as i32 & 0xFFF);
-    ctx.builder.or_i32();
+    let offset = current_instruction_end_offset(ctx);
+    gen_or_page_offset(ctx.builder, offset);
     ctx.builder.store_aligned_i32(0);
 }
 
@@ -69,25 +89,22 @@ pub fn gen_set_previous_eip_offset_from_eip_with_low_bits(
 
 pub fn gen_set_eip_low_bits(builder: &mut WasmBuilder, low_bits: i32) {
     // instruction_pointer = instruction_pointer & ~0xFFF | low_bits;
-    dbg_assert!(low_bits & !0xFFF == 0);
+    // (low_bits == 0x1000: the end of the page, see gen_or_page_offset)
     builder.const_i32(global_pointers::instruction_pointer as i32);
     gen_get_eip(builder);
     builder.const_i32(!0xFFF);
     builder.and_i32();
-    builder.const_i32(low_bits);
-    builder.or_i32();
+    gen_or_page_offset(builder, low_bits);
     builder.store_aligned_i32(0);
 }
 
 pub fn gen_set_eip_low_bits_and_jump_rel32(builder: &mut WasmBuilder, low_bits: i32, n: i32) {
     // instruction_pointer = (instruction_pointer & ~0xFFF | low_bits) + n;
-    dbg_assert!(low_bits & !0xFFF == 0);
     builder.const_i32(global_pointers::instruction_pointer as i32);
     gen_get_eip(builder);
     builder.const_i32(!0xFFF);
     builder.and_i32();
-    builder.const_i32(low_bits);
-    builder.or_i32();
+    gen_or_page_offset(builder, low_bits);
     if n != 0 {
         builder.const_i32(n);
         builder.add_i32();
@@ -853,12 +870,129 @@ fn gen_perm_map_read_probe(
     Some((done, off))
 }
 
+/// The load of a replacement-read arm. `base` is the static wasm offset: `mem8` on the fast
+/// arm (the operand is the guest linear address), 0 on the slow arm (the operand is the host
+/// address the slow helper answered, possibly its page-crossing scratch buffer).
+fn gen_perm_read_load(ctx: &mut JitContext, bits: BitSize, base: u32, where_to_write: Option<u32>) {
+    match bits {
+        BitSize::BYTE => ctx.builder.load_u8(base),
+        BitSize::WORD => ctx.builder.load_unaligned_u16(base),
+        BitSize::DWORD => ctx.builder.load_unaligned_i32(base),
+        BitSize::QWORD => ctx.builder.load_unaligned_i64(base),
+        BitSize::DQWORD => {
+            let where_to_write = where_to_write.unwrap();
+            let operand = ctx.builder.set_new_local();
+            ctx.builder.const_i32(0);
+            ctx.builder.get_local(&operand);
+            ctx.builder.load_unaligned_i64(base);
+            ctx.builder.store_unaligned_i64(where_to_write);
+            ctx.builder.const_i32(0);
+            ctx.builder.get_local(&operand);
+            ctx.builder.load_unaligned_i64(base + 8);
+            ctx.builder.store_unaligned_i64(where_to_write + 8);
+            ctx.builder.free_local(operand);
+        },
+    }
+}
+
+/// Permission-byte read, replacement shape (perm_map mode 2).
+///
+///   if !(perm_map[addr >> 12] & FAST) | (addr & 0xFFF) > 0x1000 - bytes: goto slow
+///   value <- mem[mem8 + addr]                           (mem8 is the load's static offset)
+///   slow: entry <- safe_read*_slow_jit(addr); fault? exit; value <- mem[entry & ~0xFFF ^ addr]
+///
+/// There is no TLB probe inline: the TLB is walked and filled inside the slow helper only.
+/// The byte is exact rather than speculative — it is written in the same statement as the
+/// TLB entry it mirrors (cpu::set_tlb_entry), so every flush, INVLPG, CR3 reload and page
+/// fault that drops the entry drops the byte, and it is re-read on every access, never held
+/// in a local across a helper call. A hit therefore means exactly "the TLB path would have
+/// hit, and translated to mem8 + addr"; FAST additionally requires an identity translation,
+/// so a non-identity page is served correctly by the slow arm, just never by this one.
+/// A page-crossing access always takes the slow arm, which already reads both pages through
+/// the full translation.
+fn gen_perm_read(ctx: &mut JitContext, bits: BitSize, address_local: &WasmLocal, where_to_write: Option<u32>, mem8: u32) {
+    use crate::cpu::perm_map;
+    dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
+    let fast = if ctx.cpu.cpl3() { perm_map::PERM_FAST_READ_CPL3 } else { perm_map::PERM_FAST_READ_CPL0 };
+
+    let done = match bits {
+        BitSize::BYTE | BitSize::WORD | BitSize::DWORD => ctx.builder.block_i32(),
+        BitSize::QWORD => ctx.builder.block_i64(),
+        BitSize::DQWORD => ctx.builder.block_void(),
+    };
+    let slow = ctx.builder.block_void();
+
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder.load_u8(perm_map::perm_map_base());
+    ctx.builder.const_i32(fast as i32);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    if bits != BitSize::BYTE {
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
+        ctx.builder.gtu_i32();
+        ctx.builder.or_i32();
+    }
+    ctx.builder.br_if_hinted(slow, HINT_GROUP_MEM, HINT_UNLIKELY);
+
+    gen_dispatch_stat_increment(ctx.builder, profiler::stat::PERM_MAP_READ_HIT);
+    ctx.builder.get_local(address_local);
+    gen_perm_read_load(ctx, bits, mem8, where_to_write);
+    ctx.builder.br(done);
+    ctx.builder.block_end();
+
+    gen_dispatch_stat_increment(ctx.builder, profiler::stat::PERM_MAP_READ_MISS);
+    if perm_map::perm_map_reads_ablate_no_call() {
+        // Mode 3 (UNSOUND ablation): no call edge in the block. The counter keeps the two
+        // arms distinct, so the optimizer cannot fold the branch away as redundant.
+        ctx.builder.increment_fixed_i64(perm_map::perm_ablation_misses_addr(), 1);
+        ctx.builder.get_local(address_local);
+        gen_perm_read_load(ctx, bits, mem8, where_to_write);
+        ctx.builder.block_end();
+        return;
+    }
+    ctx.builder.get_local(address_local);
+    ctx.builder
+        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    match bits {
+        BitSize::BYTE => ctx.builder.call_fn2_ret("safe_read8_slow_jit"),
+        BitSize::WORD => ctx.builder.call_fn2_ret("safe_read16_slow_jit"),
+        BitSize::DWORD => ctx.builder.call_fn2_ret("safe_read32s_slow_jit"),
+        BitSize::QWORD => ctx.builder.call_fn2_ret("safe_read64s_slow_jit"),
+        BitSize::DQWORD => ctx.builder.call_fn2_ret("safe_read128s_slow_jit"),
+    }
+    let entry = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
+    ctx.builder.get_local(&entry);
+    ctx.builder.const_i32(!0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(address_local);
+    ctx.builder.xor_i32();
+    ctx.builder.free_local(entry);
+    gen_perm_read_load(ctx, bits, 0, where_to_write);
+    ctx.builder.block_end();
+}
+
 fn gen_safe_read(
     ctx: &mut JitContext,
     bits: BitSize,
     address_local: &WasmLocal,
     where_to_write: Option<u32>,
 ) {
+    if crate::cpu::perm_map::perm_map_reads_replace() {
+        if let Some(mem8) = raw_guest_base() {
+            gen_perm_read(ctx, bits, address_local, where_to_write, mem8);
+            return;
+        }
+    }
+
     // Execute a virtual memory read. All slow paths (memory-mapped IO, tlb miss, page fault and
     // read across page boundary are handled in safe_read_jit_slow
     //   entry <- tlb_data[addr >> 12 << 2]
@@ -2392,8 +2526,8 @@ pub fn gen_get_real_eip(ctx: &mut JitContext) {
     gen_get_eip(ctx.builder);
     ctx.builder.const_i32(!0xFFF);
     ctx.builder.and_i32();
-    ctx.builder.const_i32(ctx.cpu.eip as i32 & 0xFFF);
-    ctx.builder.or_i32();
+    let offset = current_instruction_end_offset(ctx);
+    gen_or_page_offset(ctx.builder, offset);
     if !ctx.cpu.has_flat_segmentation() {
         ctx.builder
             .load_fixed_i32(global_pointers::get_seg_offset(regs::CS));

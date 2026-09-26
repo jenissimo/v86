@@ -51,7 +51,7 @@ for(const test of cases)for(const mode of ['interpreter','off','on']){
     await new Promise(r=>em.add_listener('emulator-loaded',r));
     const c=em.v86.cpu,w=c.wm.exports;c.reboot_internal();c.reset_memory();c.load_multiboot(image(test).buffer);
     for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);
-    w.set_jit_config(0,mode==='interpreter'?1:0);w.set_jit_config(21,mode==='on'?1:0);
+    w.set_jit_config(0,mode==='interpreter'?1:0);w.set_jit_config(21,mode==='on'?1:0);w.set_flag_helper_contract?.(process.env.V86_FLAG_CONTRACT==='1'?1:0);
     globalThis.__wasmDump={out:[]};
     let mulpdCalls=0;
     const mulpdHelper=c.jit_imports.instr_660F59;

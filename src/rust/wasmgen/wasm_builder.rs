@@ -162,6 +162,75 @@ fn flag_spill_whitelisted(name: &str) -> bool {
         || name == "coverage_log"
 }
 
+// Flag-helper contracts: with flag locals on, a helper whose effect gen/generate_flag_contracts.js
+// derived from its Rust source spills only the dirty words it may read OR write and reloads only
+// the words it may write, instead of the full five-word sync. A written word is spilled too
+// because the write may be conditional: reloading a word the helper did not store would replace
+// a newer local with a stale global. Unknown helpers (absent from the table: JS imports, fn
+// pointers, anything the analysis cannot resolve) keep the full sync.
+//
+// Mode 0 is off (byte-identical codegen to the pre-contract builder). Debug builds never consult
+// the table: it is derived with `if DEBUG` blocks treated as dead, and those reach JS.
+pub const FLAG_CONTRACT_OFF: u32 = 0;
+pub const FLAG_CONTRACT_ON: u32 = 1;
+static mut FLAG_HELPER_CONTRACT: u32 = FLAG_CONTRACT_OFF;
+
+/// Unknown modes select OFF, so an arm asking for a mode this build lacks reads back as baseline.
+/// Codegen shape changes: the caller must clear the JIT cache.
+#[no_mangle]
+pub fn set_flag_helper_contract(mode: u32) {
+    unsafe { FLAG_HELPER_CONTRACT = if mode == FLAG_CONTRACT_ON { mode } else { FLAG_CONTRACT_OFF } }
+}
+#[no_mangle]
+pub fn get_flag_helper_contract() -> u32 { unsafe { FLAG_HELPER_CONTRACT } }
+/// 1 when the linked table was generated with `--mutate` (a negative-control build).
+#[no_mangle]
+pub fn get_flag_helper_contract_mutated() -> u32 {
+    crate::gen::flag_contracts::FLAG_CONTRACT_MUTATED as u32
+}
+
+/// (words the call may read-or-write → spill, words it may write → reload), or None = full sync.
+fn flag_helper_effect(name: &str) -> Option<(u8, u8)> {
+    if cfg!(debug_assertions) || unsafe { FLAG_HELPER_CONTRACT } != FLAG_CONTRACT_ON {
+        return None;
+    }
+    let table = &crate::gen::flag_contracts::FLAG_EFFECTS;
+    table
+        .binary_search_by(|&(n, _, _)| n.cmp(name))
+        .ok()
+        .map(|i| (table[i].1 | table[i].2, table[i].2))
+}
+
+// Call-site flag-sync accounting (flag locals on, non-whitelisted helpers only; module-exit and
+// register-move syncs are not counted). EMITTED counters are codegen-time and always kept;
+// EXECUTED counters are increments compiled into modules only while counting is enabled, so they
+// measure blocks compiled under it and perturb timing — use them for counts, never for FPS.
+pub const FLAG_SYNC_STAT_CALLS: usize = 0;
+pub const FLAG_SYNC_STAT_CALLS_CONTRACTED: usize = 1;
+pub const FLAG_SYNC_STAT_SPILL_WORDS: usize = 2;
+pub const FLAG_SYNC_STAT_RELOAD_WORDS: usize = 3;
+pub const FLAG_SYNC_STAT_SPILL_WORDS_ELIDED: usize = 4;
+pub const FLAG_SYNC_STAT_RELOAD_WORDS_ELIDED: usize = 5;
+pub const FLAG_SYNC_STAT_EXEC_CALLS: usize = 6;
+pub const FLAG_SYNC_STAT_EXEC_SPILL_WORDS: usize = 7;
+pub const FLAG_SYNC_STAT_EXEC_RELOAD_WORDS: usize = 8;
+const FLAG_SYNC_STAT_COUNT: usize = 9;
+static mut FLAG_SYNC_STATS: [u64; FLAG_SYNC_STAT_COUNT] = [0; FLAG_SYNC_STAT_COUNT];
+static mut FLAG_SYNC_COUNTING: bool = false;
+
+#[no_mangle]
+pub fn set_flag_sync_counting(on: u32) { unsafe { FLAG_SYNC_COUNTING = on != 0 } }
+#[no_mangle]
+pub fn get_flag_sync_counting() -> u32 { unsafe { FLAG_SYNC_COUNTING as u32 } }
+#[no_mangle]
+pub fn flag_sync_stat_get(i: u32) -> f64 {
+    unsafe { if (i as usize) < FLAG_SYNC_STAT_COUNT { FLAG_SYNC_STATS[i as usize] as f64 } else { -1.0 } }
+}
+#[no_mangle]
+pub fn flag_sync_stats_reset() { unsafe { FLAG_SYNC_STATS = [0; FLAG_SYNC_STAT_COUNT] } }
+fn flag_sync_stat_add(i: usize, n: u32) { unsafe { FLAG_SYNC_STATS[i] += n as u64 } }
+fn flag_sync_stat_addr(i: usize) -> u32 { unsafe { (&raw mut FLAG_SYNC_STATS[i]) as u32 } }
+
 #[derive(Eq, PartialEq)]
 pub struct WasmLocal(u8);
 impl WasmLocal {
@@ -1203,6 +1272,12 @@ impl WasmBuilder {
         self.instruction_body.push(op::TYPE_I32);
         self.open_block()
     }
+    pub fn block_i64(&mut self) -> Label {
+        self.flag_boundary();
+        self.instruction_body.push(op::OP_BLOCK);
+        self.instruction_body.push(op::TYPE_I64);
+        self.open_block()
+    }
 
     pub fn if_void(&mut self) {
         self.flag_boundary();
@@ -1315,14 +1390,71 @@ impl WasmBuilder {
         // stack-safe even with the call's arguments already pushed: each store
         // pops exactly the address/value pair it pushes.
         let spill = self.flag_locals.is_some() && !flag_spill_whitelisted(name);
-        if spill {
-            self.emit_flag_spill();
+        if !spill {
+            let i = self.get_fn_idx(name, function);
+            self.instruction_body.push(op::OP_CALL);
+            write_leb_u32(&mut self.instruction_body, i as u32);
+            return;
         }
+        let (spill_mask, reload_mask) = match flag_helper_effect(name) {
+            Some(effect) => {
+                flag_sync_stat_add(FLAG_SYNC_STAT_CALLS_CONTRACTED, 1);
+                effect
+            },
+            None => (0x1f, 0x1f),
+        };
+        let dirty = self.flag_dirty;
+        let spilled = (dirty & spill_mask).count_ones();
+        let reloaded = reload_mask.count_ones();
+        flag_sync_stat_add(FLAG_SYNC_STAT_CALLS, 1);
+        flag_sync_stat_add(FLAG_SYNC_STAT_SPILL_WORDS, spilled);
+        flag_sync_stat_add(FLAG_SYNC_STAT_RELOAD_WORDS, reloaded);
+        flag_sync_stat_add(FLAG_SYNC_STAT_SPILL_WORDS_ELIDED, dirty.count_ones() - spilled);
+        flag_sync_stat_add(FLAG_SYNC_STAT_RELOAD_WORDS_ELIDED, 5 - reloaded);
+        if unsafe { FLAG_SYNC_COUNTING } {
+            self.increment_fixed_i64(flag_sync_stat_addr(FLAG_SYNC_STAT_EXEC_CALLS), 1);
+            if spilled != 0 {
+                self.increment_fixed_i64(flag_sync_stat_addr(FLAG_SYNC_STAT_EXEC_SPILL_WORDS), spilled as i64);
+            }
+            if reloaded != 0 {
+                self.increment_fixed_i64(flag_sync_stat_addr(FLAG_SYNC_STAT_EXEC_RELOAD_WORDS), reloaded as i64);
+            }
+        }
+        self.emit_flag_spill_masked(spill_mask);
         let i = self.get_fn_idx(name, function);
         self.instruction_body.push(op::OP_CALL);
         write_leb_u32(&mut self.instruction_body, i as u32);
-        if spill {
-            self.emit_flag_reload();
+        self.emit_flag_reload_masked(reload_mask);
+    }
+
+    /// Stores the dirty words selected by `mask`; words outside it stay dirty in their locals.
+    fn emit_flag_spill_masked(&mut self, mask: u8) {
+        if let Some(locals) = self.flag_locals {
+            for (slot, (idx, addr)) in locals.into_iter().enumerate() {
+                if self.flag_dirty & mask & (1 << slot) == 0 {
+                    continue;
+                }
+                self.const_i32(addr as i32);
+                self.instruction_body.push(op::OP_GETLOCAL);
+                self.instruction_body.push(idx);
+                self.store_aligned_i32(0);
+            }
+            self.flag_dirty &= !mask;
+        }
+    }
+
+    /// Reloads the words selected by `mask` from their memory globals.
+    fn emit_flag_reload_masked(&mut self, mask: u8) {
+        if let Some(locals) = self.flag_locals {
+            for (slot, (idx, addr)) in locals.into_iter().enumerate() {
+                if mask & (1 << slot) == 0 {
+                    continue;
+                }
+                self.load_fixed_i32(addr);
+                self.instruction_body.push(op::OP_SETLOCAL);
+                self.instruction_body.push(idx);
+            }
+            self.flag_dirty &= !mask;
         }
     }
 

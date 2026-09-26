@@ -23,7 +23,7 @@ async function run(op,writesFlags,relaxed,locals){
     await new Promise(r=>em.add_listener('emulator-loaded',r));
     const c=em.v86.cpu,w=c.wm.exports;c.reboot_internal();c.reset_memory();c.load_multiboot(image(op,writesFlags).buffer);
     for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);
-    w.set_relaxed_fpu(relaxed);w.set_jit_config(21,locals);
+    w.set_relaxed_fpu(relaxed);w.set_jit_config(21,locals);w.set_flag_helper_contract?.(process.env.V86_FLAG_CONTRACT==='1'?1:0);
     globalThis.__wasmDump={out:[]};
     await new Promise((resolve,reject)=>{
         const timer=setTimeout(()=>{em.stop();reject(Error('timeout'));},20000);

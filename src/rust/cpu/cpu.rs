@@ -3334,6 +3334,10 @@ pub unsafe fn cycle_internal() {
             in_jit = false;
         }
 
+        if jit::hot_edge_regions_enabled() {
+            jit::hot_edge_note_exit(*instruction_pointer as u32);
+        }
+
         // Block-chaining: a compiled module just returned control to the dispatch loop.
         // This is the per-module-entry overhead. The breakdown of WHY it exited
         // (chainable / dynamic / indirect) is counted at the exit sites in jit.rs.

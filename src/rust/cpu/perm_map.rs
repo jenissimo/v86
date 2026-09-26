@@ -39,6 +39,11 @@ pub const PERM_USER: u8 = 1 << 2;
 pub const PERM_IDENTITY: u8 = 1 << 3;
 /// Mirrors TLB_HAS_CODE. Reads do not care; a future write path must.
 pub const PERM_HAS_CODE: u8 = 1 << 4;
+/// READABLE & IDENTITY, precomputed so the replacement read path tests ONE bit. Positive
+/// sense on purpose: the map starts zeroed, and zero must mean "take the slow path".
+pub const PERM_FAST_READ_CPL0: u8 = 1 << 5;
+/// READABLE & IDENTITY & USER.
+pub const PERM_FAST_READ_CPL3: u8 = 1 << 6;
 
 /// What a read at CPL3 requires. CPL0 drops the USER bit from the mask, exactly as
 /// `gen_safe_read` drops TLB_NO_USER from its own mask.
@@ -75,6 +80,12 @@ pub fn perm_byte_of(page: i32, entry: i32) -> u8 {
     if entry & TLB_NO_USER == 0 {
         b |= PERM_USER;
     }
+    if b & PERM_READ_MASK_CPL0 == PERM_READ_MASK_CPL0 {
+        b |= PERM_FAST_READ_CPL0;
+    }
+    if b & PERM_READ_MASK_CPL3 == PERM_READ_MASK_CPL3 {
+        b |= PERM_FAST_READ_CPL3;
+    }
     b
 }
 
@@ -90,17 +101,73 @@ pub fn perm_map_base() -> u32 {
 // The feature switch
 // ---------------------------------------------------------------------------
 //
-// Default OFF, so the shipped read path is byte-identical to what it was: the wrapper is
-// only emitted when this is on, which is what makes the OFF arm a real baseline rather
+// Default OFF, so the shipped read path is byte-identical to what it was: nothing below is
+// emitted unless a mode is selected, which is what makes the OFF arm a real baseline rather
 // than a differently-compiled approximation of one.
+//
+// Modes are mutually exclusive by construction:
+//   0  off — the TLB chain alone.
+//   1  probe — the byte is tested IN FRONT of the unchanged TLB chain (measured 0.9626).
+//   2  replace — the byte is the ONLY inline check; the TLB is consulted only by the slow
+//      helper (codegen.rs gen_perm_read). Exact because the byte is written in the same
+//      statement as the TLB entry, never cached in a local, and zero means slow.
+//   3  ABLATION, UNSOUND, measurement only — mode 2 with the slow arm's helper call removed:
+//      a miss reads mem8 + addr raw (no translation, no #PF, no page-crossing split) and
+//      bumps PERM_ABLATION_MISSES. It asks one question: does the CALL EDGE in the cold arm
+//      cost what deleting the whole guard once measured, although mode 2's fewer ops did not?
+//      The setter refuses it unless arm_perm_map_unsound_ablation(1) was called first.
+
+pub const PERM_READS_OFF: u8 = 0;
+pub const PERM_READS_PROBE: u8 = 1;
+pub const PERM_READS_REPLACE: u8 = 2;
+pub const PERM_READS_ABLATE_NO_CALL: u8 = 3;
+
+static mut PERM_ABLATION_ARMED: bool = false;
+/// Reads that took mode 3's call-free slow arm, i.e. would have been translated (or faulted)
+/// by the real one. Nonzero means the arm's guest-visible behaviour may differ from mode 2.
+#[allow(non_upper_case_globals)]
+pub static mut PERM_ABLATION_MISSES: u64 = 0;
+pub fn perm_ablation_misses_addr() -> u32 { unsafe { (&raw mut PERM_ABLATION_MISSES) as u32 } }
+
+/// Must precede set_perm_map_reads(3). Disarming also drops an active mode 3 to OFF.
+#[no_mangle]
+pub fn arm_perm_map_unsound_ablation(on: u32) {
+    unsafe {
+        PERM_ABLATION_ARMED = on != 0;
+        if !PERM_ABLATION_ARMED && PERM_MAP_READS == PERM_READS_ABLATE_NO_CALL {
+            PERM_MAP_READS = PERM_READS_OFF;
+        }
+    }
+}
+#[no_mangle]
+pub fn perm_ablation_misses() -> f64 { unsafe { PERM_ABLATION_MISSES as f64 } }
 
 #[allow(non_upper_case_globals)]
-pub static mut PERM_MAP_READS: bool = false;
+pub static mut PERM_MAP_READS: u8 = PERM_READS_OFF;
 
-pub fn perm_map_reads_enabled() -> bool { unsafe { PERM_MAP_READS } }
+pub fn perm_map_reads_enabled() -> bool { unsafe { PERM_MAP_READS == PERM_READS_PROBE } }
+/// Modes 2 and 3 share the replacement shape; 3 differs only in its slow arm.
+pub fn perm_map_reads_replace() -> bool {
+    unsafe { PERM_MAP_READS == PERM_READS_REPLACE || PERM_MAP_READS == PERM_READS_ABLATE_NO_CALL }
+}
+pub fn perm_map_reads_ablate_no_call() -> bool { unsafe { PERM_MAP_READS == PERM_READS_ABLATE_NO_CALL } }
 
+/// Unknown modes select OFF rather than the nearest valid one: an arm that asked for a mode
+/// this build does not have must read back as the baseline, not as a different experiment.
 #[no_mangle]
-pub fn set_perm_map_reads(enabled: u32) { unsafe { PERM_MAP_READS = enabled != 0 } }
+pub fn set_perm_map_reads(mode: u32) {
+    unsafe {
+        PERM_MAP_READS = if mode <= PERM_READS_REPLACE as u32 {
+            mode as u8
+        }
+        else if mode == PERM_READS_ABLATE_NO_CALL as u32 && PERM_ABLATION_ARMED {
+            PERM_READS_ABLATE_NO_CALL
+        }
+        else {
+            PERM_READS_OFF
+        }
+    }
+}
 
 #[no_mangle]
 pub fn get_perm_map_reads() -> u32 { unsafe { PERM_MAP_READS as u32 } }
