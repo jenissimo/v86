@@ -150,6 +150,92 @@ pub struct WasmBuilder {
     /// Empty = no section (the default; the JIT fills it only when its naming knob is on).
     /// Owned buffer reused across modules so naming costs no allocation per compile.
     pub function_name: Vec<u8>,
+
+    /// Guard-group recording (codegen::gg_*, analysis::gg_plan). Inactive unless the JIT
+    /// switch is on for the module being compiled; while inactive nothing below is touched.
+    pub gg: GgBuilderState,
+}
+
+pub struct GgBuilderState {
+    /// Recording is on for the module (register writes and block markers are logged).
+    pub active: bool,
+    /// Inside an instruction's codegen: helper-call barriers are logged only here. Block
+    /// epilogues call nothing but flag tests (pure) and exit paths (the module leaves).
+    pub in_insn: bool,
+    pub log: Vec<crate::analysis::GgEvent>,
+    /// Index of the EAX register local; the eight register locals are consecutive.
+    pub reg_base: u8,
+    pub insn_depth: usize,
+    /// (local index, delta) declared for the very next write of that register local.
+    pub pending_delta: Option<(u8, i32)>,
+    /// Write sequence per local index, and the structure sequence (block open/close/else):
+    /// an address binding is valid only while neither moved.
+    pub seq: u32,
+    pub last_write: Vec<u32>,
+    pub struct_seq: u32,
+    /// kill_seq[d]: struct_seq of the last close/else at depth d. A binding made at depth d
+    /// dies with the block (or if-arm) it was made in.
+    pub kill_seq: Vec<u32>,
+    /// Bumped by every loop opened: a use inside a loop can follow writes that are lexically
+    /// after it, so no binding survives into a loop opened after it.
+    pub loop_seq: u32,
+    /// Dry-run pass: codegen-time counters are left alone.
+    pub dry_run: bool,
+}
+
+impl GgBuilderState {
+    fn new() -> Self {
+        GgBuilderState {
+            active: false,
+            in_insn: false,
+            log: Vec::new(),
+            reg_base: 0,
+            insn_depth: 0,
+            pending_delta: None,
+            seq: 0,
+            last_write: vec![0; 256],
+            struct_seq: 0,
+            kill_seq: vec![0; 256],
+            loop_seq: 0,
+            dry_run: false,
+        }
+    }
+    pub fn begin(&mut self, reg_base: u8, dry_run: bool) {
+        self.active = true;
+        self.in_insn = false;
+        self.log.clear();
+        self.reg_base = reg_base;
+        self.pending_delta = None;
+        self.seq = 0;
+        for w in self.last_write.iter_mut() {
+            *w = 0;
+        }
+        self.struct_seq = 0;
+        for k in self.kill_seq.iter_mut() {
+            *k = 0;
+        }
+        self.dry_run = dry_run;
+    }
+    pub fn end(&mut self) {
+        self.active = false;
+        self.in_insn = false;
+        self.dry_run = false;
+        self.pending_delta = None;
+    }
+    #[inline]
+    fn note_write(&mut self, idx: u8, depth: usize) {
+        self.seq += 1;
+        self.last_write[idx as usize] = self.seq;
+        let pending = self.pending_delta.take();
+        let r = idx.wrapping_sub(self.reg_base);
+        if r < 8 {
+            let delta = match pending {
+                Some((i, d)) if i == idx && self.in_insn && depth == self.insn_depth => Some(d),
+                _ => None,
+            };
+            self.log.push(crate::analysis::GgEvent::RegWrite { reg: r, delta });
+        }
+    }
 }
 
 // Helpers proven not to touch the lazy-flag globals. Everything else
@@ -286,6 +372,7 @@ impl WasmBuilder {
             branch_hint_mask: 0,
             branch_hint_offset_fuzz: 0,
             function_name: Vec::new(),
+            gg: GgBuilderState::new(),
         };
         b.init();
         b
@@ -824,6 +911,7 @@ impl WasmBuilder {
         label
     }
     fn close_block(&mut self) {
+        self.gg_kill_depth();
         let label = self.label_stack.pop().unwrap();
         let old_depth = self.label_to_depth.remove(&label).unwrap();
         dbg_assert!(self.label_to_depth.len() + 1 == old_depth);
@@ -853,6 +941,7 @@ impl WasmBuilder {
         let local = self.alloc_local();
         self.instruction_body.push(op::OP_SETLOCAL);
         self.instruction_body.push(local.idx());
+        self.gg_note_write(local.idx());
         local
     }
     #[must_use = "local allocated but not used"]
@@ -860,16 +949,39 @@ impl WasmBuilder {
         let local = self.alloc_local();
         self.instruction_body.push(op::OP_TEELOCAL);
         self.instruction_body.push(local.idx());
+        self.gg_note_write(local.idx());
         local
     }
     pub fn set_local(&mut self, local: &WasmLocal) {
         self.instruction_body.push(op::OP_SETLOCAL);
         self.instruction_body.push(local.idx());
+        self.gg_note_write(local.idx());
     }
     pub fn tee_local(&mut self, local: &WasmLocal) {
         self.instruction_body.push(op::OP_TEELOCAL);
         self.instruction_body.push(local.idx());
+        self.gg_note_write(local.idx());
     }
+    #[inline]
+    fn gg_note_write(&mut self, idx: u8) {
+        if self.gg.active {
+            let depth = self.label_stack.len();
+            self.gg.note_write(idx, depth);
+        }
+    }
+    fn gg_kill_depth(&mut self) {
+        if self.gg.active {
+            self.gg.struct_seq += 1;
+            let d = self.label_stack.len().min(255);
+            self.gg.kill_seq[d] = self.gg.struct_seq;
+        }
+    }
+    /// Current structured-control nesting depth.
+    pub fn depth(&self) -> usize { self.label_stack.len() }
+    /// A fresh i32 local with no initialiser (wasm locals start at zero).
+    #[must_use = "local allocated but not used"]
+    pub fn new_local_uninit(&mut self) -> WasmLocal { self.alloc_local() }
+    pub fn local_count(&self) -> u8 { self.local_count }
     pub fn get_local(&mut self, local: &WasmLocal) {
         self.instruction_body.push(op::OP_GETLOCAL);
         self.instruction_body.push(local.idx());
@@ -1287,12 +1399,16 @@ impl WasmBuilder {
     }
 
     pub fn else_(&mut self) {
+        self.gg_kill_depth();
         self.flag_boundary();
         dbg_assert!(!self.label_stack.is_empty());
         self.instruction_body.push(op::OP_ELSE);
     }
 
     pub fn loop_void(&mut self) -> Label {
+        if self.gg.active {
+            self.gg.loop_seq += 1;
+        }
         self.flag_boundary();
         self.instruction_body.push(op::OP_LOOP);
         self.instruction_body.push(op::TYPE_VOID_BLOCK);
@@ -1384,6 +1500,10 @@ impl WasmBuilder {
     }
 
     fn call_fn(&mut self, name: &str, function: FunctionType) {
+        if self.gg.active && self.gg.in_insn && !crate::analysis::gg_call_is_transparent(name) {
+            self.gg.log.push(crate::analysis::GgEvent::Barrier);
+            crate::jit::gg_note_barrier_name(name);
+        }
         // Flag-locals funnel: materialize the lazy-flag tuple to its
         // memory globals before any helper that may read them, and re-read after
         // any helper that may have written them. Emitting stores/loads here is
@@ -1396,9 +1516,12 @@ impl WasmBuilder {
             write_leb_u32(&mut self.instruction_body, i as u32);
             return;
         }
+        let dry = self.gg.dry_run;
         let (spill_mask, reload_mask) = match flag_helper_effect(name) {
             Some(effect) => {
-                flag_sync_stat_add(FLAG_SYNC_STAT_CALLS_CONTRACTED, 1);
+                if !dry {
+                    flag_sync_stat_add(FLAG_SYNC_STAT_CALLS_CONTRACTED, 1);
+                }
                 effect
             },
             None => (0x1f, 0x1f),
@@ -1406,11 +1529,13 @@ impl WasmBuilder {
         let dirty = self.flag_dirty;
         let spilled = (dirty & spill_mask).count_ones();
         let reloaded = reload_mask.count_ones();
-        flag_sync_stat_add(FLAG_SYNC_STAT_CALLS, 1);
-        flag_sync_stat_add(FLAG_SYNC_STAT_SPILL_WORDS, spilled);
-        flag_sync_stat_add(FLAG_SYNC_STAT_RELOAD_WORDS, reloaded);
-        flag_sync_stat_add(FLAG_SYNC_STAT_SPILL_WORDS_ELIDED, dirty.count_ones() - spilled);
-        flag_sync_stat_add(FLAG_SYNC_STAT_RELOAD_WORDS_ELIDED, 5 - reloaded);
+        if !dry {
+            flag_sync_stat_add(FLAG_SYNC_STAT_CALLS, 1);
+            flag_sync_stat_add(FLAG_SYNC_STAT_SPILL_WORDS, spilled);
+            flag_sync_stat_add(FLAG_SYNC_STAT_RELOAD_WORDS, reloaded);
+            flag_sync_stat_add(FLAG_SYNC_STAT_SPILL_WORDS_ELIDED, dirty.count_ones() - spilled);
+            flag_sync_stat_add(FLAG_SYNC_STAT_RELOAD_WORDS_ELIDED, 5 - reloaded);
+        }
         if unsafe { FLAG_SYNC_COUNTING } {
             self.increment_fixed_i64(flag_sync_stat_addr(FLAG_SYNC_STAT_EXEC_CALLS), 1);
             if spilled != 0 {
@@ -1581,6 +1706,7 @@ impl WasmBuilder {
     pub fn set_local_raw(&mut self, idx: u8) {
         self.instruction_body.push(op::OP_SETLOCAL);
         self.instruction_body.push(idx);
+        self.gg_note_write(idx);
     }
 
     pub fn return_call_indirect_fn1(&mut self) {

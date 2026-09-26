@@ -25,6 +25,16 @@ impl ModrmByte {
         !self.is_16 && self.second_reg.is_none() && matches!(self.first_reg, Some(ESP) | Some(EBP))
     }
 
+    /// `Some(disp)` when the effective address is exactly `reg + disp` (32-bit, no index).
+    pub fn gg_self_offset(&self, reg: u32) -> Option<i32> {
+        if !self.is_16 && self.first_reg == Some(reg) && self.second_reg.is_none() {
+            Some(self.immediate)
+        }
+        else {
+            None
+        }
+    }
+
     pub fn is_nop(&self, reg: u32) -> bool {
         self.first_reg == Some(reg)
             && self.second_reg.is_none()
@@ -274,6 +284,30 @@ pub fn get_as_reg_index_if_possible(ctx: &mut JitContext, modrm_byte: &ModrmByte
 }
 
 pub fn skip(ctx: &mut CpuContext, modrm_byte: u8) { let _ = decode(ctx, modrm_byte); }
+
+/// The operand as guard-group analysis sees it (analysis::GgDesc), or None for 16-bit
+/// addressing (its wrap is part of the address). Must be taken with the prefixes `gen` uses.
+pub fn gg_desc(cpu: &CpuContext, modrm_byte: &ModrmByte) -> Option<crate::analysis::GgDesc> {
+    use crate::analysis::{GgDesc, GG_NOREG, GG_SEG_FLAT};
+    if modrm_byte.is_16 {
+        return None;
+    }
+    let prefix = cpu.prefixes & PREFIX_MASK_SEGMENT;
+    let seg = if prefix == SEG_PREFIX_ZERO {
+        GG_SEG_FLAT
+    }
+    else {
+        let s = if prefix != 0 { (prefix - 1) as u32 } else { modrm_byte.segment };
+        if (s == DS || s == SS || s == CS) && cpu.has_flat_segmentation() { GG_SEG_FLAT } else { s as u8 + 1 }
+    };
+    Some(GgDesc {
+        seg,
+        base: modrm_byte.first_reg.map_or(GG_NOREG, |r| r as u8),
+        index: modrm_byte.second_reg.map_or(GG_NOREG, |r| r as u8),
+        scale: modrm_byte.shift,
+        disp: modrm_byte.immediate,
+    })
+}
 
 /// True when this operand's effective address IS the linear address, i.e. no segment base
 /// has to be added. Only then is a raw access equivalent to the guarded one. (16-bit

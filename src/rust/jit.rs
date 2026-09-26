@@ -116,6 +116,9 @@ static mut WBUF_INTRINSIC_CODEGEN_CALL32: u32 = 0;
 static mut WBUF_INTRINSIC_CODEGEN_SS32: u32 = 0;
 
 pub(crate) fn wbuf_intrinsic_note_call32(ssize_32: bool) {
+    if codegen_dry_run() {
+        return;
+    }
     unsafe {
         WBUF_INTRINSIC_CODEGEN_CALL32 = WBUF_INTRINSIC_CODEGEN_CALL32.wrapping_add(1);
         if ssize_32 {
@@ -468,6 +471,173 @@ fn page_tails_enabled() -> bool { unsafe { JIT_PAGE_TAILS } }
 // lists, page-granular invalidation) is the stock one. Code-shaping; default off emits
 // byte-identical modules.
 static mut JIT_HOT_EDGE_REGIONS: bool = false;
+
+// Guard groups (analysis::gg_plan, codegen GgCtx). A module is first compiled as a dry run that
+// records its guarded accesses, register writes and barriers; the plan names anchors (one TLB
+// check widened to the group's extent) and members (no check while the anchor's ok holds, the
+// normal guarded path otherwise); the module is then emitted from the plan and kept only if
+// that pass recorded the identical stream. Code-shaping; default off emits byte-identical
+// modules (the dry run and the plan are never built). Needs a JIT cache clear to take effect.
+static mut JIT_GUARD_GROUPS: bool = false;
+/// Bit 0 (UNSOUND negative control): members skip the ok test. Bit 1 (UNSOUND negative
+/// control): a base-register write neither ends nor shifts a group. Bit 2: compile runtime
+/// counters (GG_RT_*) into grouped accesses. Bit 3 (UNSOUND negative control): barriers are
+/// ignored.
+static mut GG_DEBUG: u32 = 0;
+pub const GG_DEBUG_NC_SKIP_OK: u32 = 1;
+pub const GG_DEBUG_NC_NO_BASE_KILL: u32 = 2;
+pub const GG_DEBUG_COUNT: u32 = 4;
+pub const GG_DEBUG_NC_NO_BARRIER: u32 = 8;
+static mut GG_MAX_EXTENT: u32 = 1024;
+static mut GG_MAX_SLOTS: u32 = 24;
+/// Codegen-time counters that must not count the dry run.
+static mut CODEGEN_DRY_RUN: bool = false;
+pub fn codegen_dry_run() -> bool { unsafe { CODEGEN_DRY_RUN } }
+
+// Runtime counters, compiled in only under GG_DEBUG_COUNT (they perturb timing: counts only).
+// + kind (R/W/RMW): member fast arm, member fallback, every guarded access in any module.
+pub const GG_RT_MEMBER_FAST: usize = 0;
+pub const GG_RT_MEMBER_SLOW: usize = 3;
+pub const GG_RT_ANCHOR: usize = 6;
+pub const GG_RT_ANCHOR_OK: usize = 7;
+pub const GG_RT_ACCESS: usize = 8;
+/// Accesses of grouped modules that got no role: + 0 no address description, 1 not at the
+/// instruction's top level, 2 top level (no group reached them and they did not anchor one).
+pub const GG_RT_NONE: usize = 12;
+const GG_RT_COUNT: usize = 16;
+static mut GG_RT: [u64; GG_RT_COUNT] = [0; GG_RT_COUNT];
+pub fn gg_rt_addr(i: usize) -> u32 { unsafe { (&raw mut GG_RT[i]) as u32 } }
+pub fn gg_count_enabled() -> bool { unsafe { GG_DEBUG & GG_DEBUG_COUNT != 0 } }
+
+// Compile-time census: 0 modules planned, 1 modules emitted with roles, 2 plans abandoned
+// (the emitting pass recorded a different stream), 3 anchors, 4 members, 5 anchors dropped for
+// extent, 6 keys dropped for slots, 7 analyses not converged, 8 accesses recorded, 9 of them
+// with an address description, 10 of them at instruction top level, 11 plans abandoned for
+// the local budget.
+// 12..=15: plans not made, by GgPlan::bail (malformed, block mismatch, availability, anchors).
+const GG_STAT_COUNT: usize = 16;
+static mut GG_STATS: [u64; GG_STAT_COUNT] = [0; GG_STAT_COUNT];
+fn gg_stat_add(i: usize, n: u64) { unsafe { GG_STATS[i] += n } }
+
+static mut GG_BARRIER_NAMES: Vec<(String, u64)> = Vec::new();
+pub fn gg_note_barrier_name(name: &str) {
+    if !codegen_dry_run() {
+        return;
+    }
+    unsafe {
+        let names = &mut *std::ptr::addr_of_mut!(GG_BARRIER_NAMES);
+        match names.iter_mut().find(|(n, _)| n == name) {
+            Some(e) => e.1 += 1,
+            None => names.push((name.to_string(), 1)),
+        }
+    }
+}
+
+// Diagnostic: a text record of every emitted plan (one line per grouped access).
+static mut GG_TRACE: bool = false;
+static mut GG_TRACE_TEXT: String = String::new();
+#[no_mangle]
+pub fn set_jit_guard_groups_trace(on: u32) {
+    unsafe {
+        GG_TRACE = on != 0;
+        (&mut *std::ptr::addr_of_mut!(GG_TRACE_TEXT)).clear();
+    }
+}
+#[no_mangle]
+pub fn gg_trace_ptr() -> u32 { unsafe { (&*std::ptr::addr_of!(GG_TRACE_TEXT)).as_ptr() as u32 } }
+#[no_mangle]
+pub fn gg_trace_len() -> u32 { unsafe { (&*std::ptr::addr_of!(GG_TRACE_TEXT)).len() as u32 } }
+fn gg_trace_plan(plan: &analysis::GgPlan, used: bool) {
+    use std::fmt::Write;
+    let t = unsafe { &mut *std::ptr::addr_of_mut!(GG_TRACE_TEXT) };
+    if t.len() > (4 << 20) {
+        return;
+    }
+    let _ = writeln!(t, "module used={} anchors={} members={} slots={}", used, plan.anchors, plan.members, plan.slots);
+    for (i, ev) in plan.accesses.iter().enumerate() {
+        if let analysis::GgEvent::Access { at, kind, width, desc, top } = ev {
+            let d = match desc {
+                Some(d) => format!("seg{} b{} i{} s{} d{}", d.seg, d.base, d.index, d.scale, d.disp),
+                None => "-".to_string(),
+            };
+            let _ = writeln!(t, "  {:08x} k{} w{} top{} {} {:?}", at, kind, width, *top as u8, d, plan.roles[i]);
+        }
+    }
+}
+
+#[no_mangle]
+pub fn set_jit_guard_groups(on: u32) { unsafe { JIT_GUARD_GROUPS = on != 0 } }
+#[no_mangle]
+pub fn get_jit_guard_groups() -> u32 { unsafe { JIT_GUARD_GROUPS as u32 } }
+#[no_mangle]
+pub fn set_jit_guard_groups_debug(bits: u32) {
+    unsafe {
+        GG_DEBUG = bits & 15;
+        analysis::GG_DEBUG_NO_BASE_KILL = bits & GG_DEBUG_NC_NO_BASE_KILL != 0;
+        analysis::GG_DEBUG_NO_BARRIER = bits & GG_DEBUG_NC_NO_BARRIER != 0;
+    }
+}
+#[no_mangle]
+pub fn get_jit_guard_groups_debug() -> u32 { unsafe { GG_DEBUG } }
+#[no_mangle]
+pub fn set_jit_guard_groups_params(max_extent: u32, max_slots: u32) {
+    unsafe {
+        GG_MAX_EXTENT = max_extent.clamp(8, 0x1000);
+        GG_MAX_SLOTS = max_slots.clamp(1, 48);
+    }
+}
+#[no_mangle]
+pub fn get_jit_guard_groups_param(i: u32) -> u32 {
+    unsafe {
+        match i {
+            0 => GG_MAX_EXTENT,
+            _ => GG_MAX_SLOTS,
+        }
+    }
+}
+#[no_mangle]
+pub fn get_jit_guard_group_stat(i: u32) -> f64 {
+    unsafe { if (i as usize) < GG_STAT_COUNT { GG_STATS[i as usize] as f64 } else { -1.0 } }
+}
+#[no_mangle]
+pub fn get_jit_guard_group_rt(i: u32) -> f64 {
+    unsafe { if (i as usize) < GG_RT_COUNT { GG_RT[i as usize] as f64 } else { -1.0 } }
+}
+#[no_mangle]
+pub fn jit_guard_group_stats_reset() {
+    unsafe {
+        GG_STATS = [0; GG_STAT_COUNT];
+        GG_RT = [0; GG_RT_COUNT];
+        (&mut *std::ptr::addr_of_mut!(GG_BARRIER_NAMES)).clear();
+    }
+}
+#[no_mangle]
+pub fn jit_guard_group_rt_reset() { unsafe { GG_RT = [0; GG_RT_COUNT] } }
+#[no_mangle]
+pub fn gg_barrier_count() -> u32 { unsafe { (&*std::ptr::addr_of!(GG_BARRIER_NAMES)).len() as u32 } }
+#[no_mangle]
+pub fn gg_barrier_name_ptr(i: u32) -> u32 {
+    unsafe { (&*std::ptr::addr_of!(GG_BARRIER_NAMES)).get(i as usize).map_or(0, |e| e.0.as_ptr() as u32) }
+}
+#[no_mangle]
+pub fn gg_barrier_name_len(i: u32) -> u32 {
+    unsafe { (&*std::ptr::addr_of!(GG_BARRIER_NAMES)).get(i as usize).map_or(0, |e| e.0.len() as u32) }
+}
+#[no_mangle]
+pub fn gg_barrier_hits(i: u32) -> f64 {
+    unsafe { (&*std::ptr::addr_of!(GG_BARRIER_NAMES)).get(i as usize).map_or(0.0, |e| e.1 as f64) }
+}
+
+/// Guard groups apply to a module only when no other guard experiment reshapes its accesses.
+fn guard_groups_for(state_flags: CachedStateFlags) -> bool {
+    unsafe {
+        JIT_GUARD_GROUPS
+            && !fastmem_writes_compile_enabled(state_flags)
+            && crate::cpu::perm_map::get_perm_map_reads() == 0
+            && JIT_READ_TLB_CACHE_MODE == 0
+            && crate::codegen::get_stack_raw_unsafe() == 0
+    }
+}
 static mut HOT_EDGE_THRESHOLD: u32 = 256;
 static mut HOT_EDGE_EXTRA_PAGES: u32 = 5;
 static mut HOT_EDGE_MAX_JOINS: u32 = 256;
@@ -1871,6 +2041,9 @@ pub fn fastmem_write_map_base() -> u32 {
 
 #[inline]
 pub fn fastmem_note_speculated_store_compiled() {
+    if codegen_dry_run() {
+        return;
+    }
     unsafe {
         FASTMEM_SPECULATED_STORES_COMPILED = FASTMEM_SPECULATED_STORES_COMPILED.saturating_add(1);
     }
@@ -2029,6 +2202,9 @@ pub fn fastmem_write_map_max_page() -> u32 {
 
 #[inline]
 pub fn x87_locals_note_cache_load_site_compiled() {
+    if codegen_dry_run() {
+        return;
+    }
     unsafe {
         X87_LOCAL_CACHE_LOAD_SITES_COMPILED =
             X87_LOCAL_CACHE_LOAD_SITES_COMPILED.saturating_add(1);
@@ -2037,6 +2213,9 @@ pub fn x87_locals_note_cache_load_site_compiled() {
 
 #[inline]
 pub fn x87_locals_note_cache_store_compiled() {
+    if codegen_dry_run() {
+        return;
+    }
     unsafe {
         X87_LOCAL_CACHE_STORES_COMPILED =
             X87_LOCAL_CACHE_STORES_COMPILED.saturating_add(1);
@@ -2045,6 +2224,9 @@ pub fn x87_locals_note_cache_store_compiled() {
 
 #[inline]
 pub fn x87_locals_note_cache_invalidate_compiled() {
+    if codegen_dry_run() {
+        return;
+    }
     unsafe {
         X87_LOCAL_CACHE_INVALIDATES_COMPILED =
             X87_LOCAL_CACHE_INVALIDATES_COMPILED.saturating_add(1);
@@ -2053,6 +2235,9 @@ pub fn x87_locals_note_cache_invalidate_compiled() {
 
 #[inline]
 pub fn push_run_note_site_compiled() {
+    if codegen_dry_run() {
+        return;
+    }
     unsafe {
         PUSH_RUN_SITES_COMPILED = PUSH_RUN_SITES_COMPILED.saturating_add(1);
     }
@@ -2060,6 +2245,9 @@ pub fn push_run_note_site_compiled() {
 
 #[inline]
 pub fn push_run_note_reuse_branch_compiled() {
+    if codegen_dry_run() {
+        return;
+    }
     unsafe {
         PUSH_RUN_REUSE_BRANCHES_COMPILED =
             PUSH_RUN_REUSE_BRANCHES_COMPILED.saturating_add(1);
@@ -2457,6 +2645,7 @@ pub struct JitContext<'a> {
     /// aka _ftol, FSQRT/FSIN/FCOS, FINCSTP/FDECSTP, FLD m80, FIADD-family, …)
     /// silently mutate the FPU stack / shift TOP behind stale cached values.
     pub x87_cache_kept: bool,
+    pub gg: codegen::GgCtx<'a>,
 }
 
 pub struct X87LocalCacheSlot {
@@ -2634,7 +2823,9 @@ fn flags_dead_from_addr(
             // A faulting overwriter could #PF before overwriting, and the fault frame would need the
             // (now elided) architectural flags — so only a non-faulting overwriter proves dead.
             FlagClass::Overwrite { non_faulting: true } => {
-                profiler::stat_increment_always(stat::DEAD_FLAG_ELIDED);
+                if !codegen_dry_run() {
+                    profiler::stat_increment_always(stat::DEAD_FLAG_ELIDED);
+                }
                 return true;
             },
             FlagClass::Overwrite { non_faulting: false } => return false,
@@ -2704,7 +2895,9 @@ fn should_elide_current_flags(
     if !matches!(classify_flag_class(current_addr), FlagClass::Overwrite { .. }) {
         return false;
     }
-    profiler::stat_increment_always(stat::DEAD_FLAG_ELISION_CANDIDATE);
+    if !codegen_dry_run() {
+        profiler::stat_increment_always(stat::DEAD_FLAG_ELISION_CANDIDATE);
+    }
 
     // Walk forward, skipping flag-neutral non-faulting instructions, until the flags are proven
     // dead (a non-faulting full overwriter reached first) or possibly-live (a reader / partial /
@@ -3975,14 +4168,29 @@ fn jit_analyze_and_generate(
     let basic_block_by_addr: HashMap<u32, BasicBlock> =
         basic_blocks.into_iter().map(|b| (b.addr, b)).collect();
 
-    let entries = jit_generate_module(
-        structure,
-        &basic_block_by_addr,
-        cpu,
-        &mut ctx.wasm_builder,
-        wasm_table_index,
-        state_flags,
-    );
+    let entries = if guard_groups_for(state_flags) {
+        jit_generate_module_guard_groups(
+            structure,
+            &basic_block_by_addr,
+            cpu,
+            &mut ctx.wasm_builder,
+            wasm_table_index,
+            state_flags,
+        )
+    }
+    else {
+        jit_generate_module(
+            structure,
+            &basic_block_by_addr,
+            cpu,
+            &mut ctx.wasm_builder,
+            wasm_table_index,
+            state_flags,
+            codegen::GgMode::Off,
+            None,
+        )
+        .0
+    };
     dbg_assert!(!entries.is_empty());
 
     let mut page_info = HashMap::new();
@@ -4813,6 +5021,133 @@ pub fn gen_tier2_note_retired(ctx: &mut JitContext) {
     ctx.builder.call_fn2("jit_tier2_note_retired");
 }
 
+fn structure_entry_blocks(structure: &[WasmStructure]) -> Vec<u32> {
+    let mut nodes = structure;
+    loop {
+        match nodes.first() {
+            Some(WasmStructure::Dispatcher(e)) => return e.clone(),
+            Some(WasmStructure::Block(children)) => nodes = children,
+            _ => return Vec::new(),
+        }
+    }
+}
+
+/// Dry run (record) -> plan -> emit; the emitted module is kept only if its pass recorded the
+/// same stream as the dry run, otherwise the module is generated again with groups off.
+fn jit_generate_module_guard_groups(
+    structure: Vec<WasmStructure>,
+    basic_blocks: &HashMap<u32, BasicBlock>,
+    cpu: CpuContext,
+    builder: &mut WasmBuilder,
+    wasm_table_index: WasmTableIndex,
+    state_flags: CachedStateFlags,
+) -> Vec<(u32, u16)> {
+    let entry_set: HashSet<u32> = structure_entry_blocks(&structure).into_iter().collect();
+    let blocks: Vec<analysis::GgBlock> = basic_blocks
+        .values()
+        .map(|b| {
+            let succs = if b.has_sti {
+                Vec::new()
+            }
+            else {
+                match b.ty {
+                    BasicBlockType::Normal { next_block_addr, .. } => next_block_addr.into_iter().collect(),
+                    BasicBlockType::ConditionalJump {
+                        next_block_addr,
+                        next_block_branch_taken_addr,
+                        ..
+                    } => next_block_addr.into_iter().chain(next_block_branch_taken_addr).collect(),
+                    BasicBlockType::AbsoluteEip | BasicBlockType::Exit => Vec::new(),
+                }
+            };
+            analysis::GgBlock {
+                addr: b.addr,
+                succs,
+                entry: b.is_entry_block || entry_set.contains(&b.addr),
+            }
+        })
+        .collect();
+
+    unsafe { CODEGEN_DRY_RUN = true };
+    let (_, recorded_ok) = jit_generate_module(
+        structure.clone(),
+        basic_blocks,
+        cpu.clone(),
+        builder,
+        wasm_table_index,
+        state_flags,
+        codegen::GgMode::Record,
+        None,
+    );
+    unsafe { CODEGEN_DRY_RUN = false };
+    let log = std::mem::take(&mut builder.gg.log);
+    gg_stat_add(0, 1);
+    for ev in &log {
+        if let analysis::GgEvent::Access { desc, top, .. } = ev {
+            gg_stat_add(8, 1);
+            gg_stat_add(9, desc.is_some() as u64);
+            gg_stat_add(10, *top as u64);
+        }
+    }
+    let plan = if recorded_ok {
+        let (max_extent, max_slots) = unsafe { (GG_MAX_EXTENT, GG_MAX_SLOTS as u8) };
+        Some(analysis::gg_plan(log, &blocks, max_extent, max_slots))
+    }
+    else {
+        None
+    };
+    if let Some(plan) = plan.as_ref() {
+        if !plan.converged {
+            gg_stat_add(7, 1);
+        }
+        if plan.bail > 0 {
+            gg_stat_add(11 + plan.bail as usize, 1);
+        }
+        gg_stat_add(5, plan.dropped_extent as u64);
+        gg_stat_add(6, plan.dropped_slots as u64);
+    }
+    match plan {
+        Some(plan) if plan.members > 0 => {
+            let (entries, ok) = jit_generate_module(
+                structure.clone(),
+                basic_blocks,
+                cpu.clone(),
+                builder,
+                wasm_table_index,
+                state_flags,
+                codegen::GgMode::Emit,
+                Some(&plan),
+            );
+            let same = ok && builder.gg.log == plan.log;
+            builder.gg.log.clear();
+            if unsafe { GG_TRACE } {
+                gg_trace_plan(&plan, same);
+            }
+            if same {
+                gg_stat_add(1, 1);
+                gg_stat_add(3, plan.anchors as u64);
+                gg_stat_add(4, plan.members as u64);
+                return entries;
+            }
+            gg_stat_add(if ok { 2 } else { 11 }, 1);
+        },
+        _ => {},
+    }
+    jit_generate_module(
+        structure,
+        basic_blocks,
+        cpu,
+        builder,
+        wasm_table_index,
+        state_flags,
+        codegen::GgMode::Off,
+        None,
+    )
+    .0
+}
+
+/// Returns the dispatcher entries and, for a guard-group pass, whether that pass is usable
+/// (always true with groups off).
 fn jit_generate_module(
     structure: Vec<WasmStructure>,
     basic_blocks: &HashMap<u32, BasicBlock>,
@@ -4820,12 +5155,14 @@ fn jit_generate_module(
     builder: &mut WasmBuilder,
     wasm_table_index: WasmTableIndex,
     state_flags: CachedStateFlags,
-) -> Vec<(u32, u16)> {
+    gg_mode: codegen::GgMode,
+    gg_plan: Option<&analysis::GgPlan>,
+) -> (Vec<(u32, u16)>, bool) {
     builder.reset();
     builder.branch_hint_mask = branch_hint_mask();
     builder.branch_hint_offset_fuzz = unsafe { JIT_BRANCH_HINT_OFFSET_FUZZ };
 
-    let mut register_locals = (0..8)
+    let mut register_locals: Vec<WasmLocal> = (0..8)
         .map(|i| {
             builder.load_fixed_i32(global_pointers::get_reg32_offset(i));
             builder.set_new_local()
@@ -4834,6 +5171,32 @@ fn jit_generate_module(
 
     builder.const_i32(0);
     let instruction_counter = builder.set_new_local();
+
+    let mut gg = codegen::GgCtx::off();
+    if gg_mode != codegen::GgMode::Off {
+        let base = register_locals[0].idx();
+        let consecutive = register_locals.iter().enumerate().all(|(i, l)| l.idx() == base + i as u8);
+        gg.mode = gg_mode;
+        gg.plan = gg_plan;
+        gg.debug = unsafe { GG_DEBUG };
+        if !consecutive {
+            gg.mismatch = true;
+            gg.mode = codegen::GgMode::Off;
+        }
+        else {
+            builder.gg.begin(base, gg_mode == codegen::GgMode::Record);
+            if let Some(plan) = gg_plan {
+                if builder.local_count() as u32 + plan.slots as u32 > 160 {
+                    gg.mismatch = true;
+                }
+                else {
+                    for _ in 0..plan.slots {
+                        gg.slots.push(builder.new_local_uninit());
+                    }
+                }
+            }
+        }
+    }
 
     // Flag-locals (idx 21): lazy-flag tuple lives in wasm locals for the whole
     // module — initialized from the memory globals here, spilled back at every
@@ -4896,6 +5259,7 @@ fn jit_generate_module(
         fpu_pc_cache: None,
         fpu_pc_cache_kept: false,
         x87_cache_kept: false,
+        gg,
     };
 
     let entry_blocks = {
@@ -5859,6 +6223,11 @@ fn jit_generate_module(
     ctx.builder
         .free_local(ctx.instruction_counter.unsafe_clone());
     ctx.builder.free_flag_locals();
+    for frame in ctx.gg.slots.drain(..) {
+        ctx.builder.free_local(frame);
+    }
+    let gg_usable = !ctx.gg.mismatch;
+    ctx.builder.gg.end();
 
     if unsafe { JIT_FUNCTION_NAMES } {
         // `g<entry addr, 8 hex>@t<wasm table index>`. The ADDRESS is authoritative (table
@@ -5906,7 +6275,7 @@ fn jit_generate_module(
         }
     }
 
-    return entries;
+    return (entries, gg_usable);
 }
 
 /// True if the instruction at `eip` is an x87 escape, after prefixes.
@@ -5974,6 +6343,10 @@ fn jit_generate_basic_block(
         ctx.builder.call_fn1("enter_basic_block");
     }
 
+    if ctx.gg.mode != codegen::GgMode::Off {
+        ctx.builder.gg.log.push(analysis::GgEvent::Block(block.addr));
+    }
+
     ctx.builder.get_local(&ctx.instruction_counter);
     ctx.builder.const_i32(block.number_of_instructions as i32);
     ctx.builder.add_i32();
@@ -5987,7 +6360,10 @@ fn jit_generate_basic_block(
     // Tier-2 trace-compiler: per-block exec
     // counter + CFG registration for watched pages. Emits one fixed-address u64 increment;
     // nothing is emitted for unwatched pages (zero cost when profiling is off).
-    if trace_profiler::is_enabled() && trace_profiler::is_page_watched(Page::page_of(block.addr)) {
+    if trace_profiler::is_enabled()
+        && !codegen_dry_run()
+        && trace_profiler::is_page_watched(Page::page_of(block.addr))
+    {
         let (kind, condition, succ_fallthrough, succ_taken) = match block.ty {
             BasicBlockType::Normal { next_block_addr, .. } => {
                 (trace_profiler::KIND_NORMAL, 0u8, next_block_addr.unwrap_or(0), 0)
@@ -6037,7 +6413,9 @@ fn jit_generate_basic_block(
             instruction = (memory::read32s(ctx.cpu.eip) as u32 as u64)
                 | ((memory::read32s(ctx.cpu.eip + 4) as u32 as u64) << 32);
             opstats::gen_opstats(ctx.builder, instruction);
-            opstats::record_opstat_compiled(instruction);
+            if !codegen_dry_run() {
+                opstats::record_opstat_compiled(instruction);
+            }
         }
 
         if ctx.cpu.eip == last_instruction_addr {
@@ -6063,6 +6441,14 @@ fn jit_generate_basic_block(
         ctx.x87_cache_kept = false;
         ctx.fpu_pc_cache_kept = false;
         let mut instruction_flags = 0;
+        if ctx.gg.mode != codegen::GgMode::Off {
+            ctx.gg.binds.clear();
+            ctx.builder.gg.in_insn = true;
+            ctx.builder.gg.insn_depth = ctx.builder.depth();
+            if analysis::gg_insn_is_kill_all(start_eip, &|a| read_jit_u8(a)) {
+                ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
+            }
+        }
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;
 
@@ -6081,12 +6467,15 @@ fn jit_generate_basic_block(
         {
             codegen::gen_x87_local_cache_invalidate_all_runtime(ctx);
         }
+        ctx.builder.gg.in_insn = false;
 
         let instruction_length = end_eip - start_eip;
         let was_block_boundary = instruction_flags & JIT_INSTR_BLOCK_BOUNDARY_FLAG != 0;
 
         let wasm_length = ctx.builder.instruction_body_length() - wasm_length_before;
-        opstats::record_opstat_size_wasm(instruction, wasm_length as u64);
+        if !codegen_dry_run() {
+            opstats::record_opstat_size_wasm(instruction, wasm_length as u64);
+        }
 
         dbg_assert!((end_eip == stop_addr) == (start_eip == last_instruction_addr));
         dbg_assert!(instruction_length < MAX_INSTRUCTION_LENGTH);
@@ -6684,6 +7073,13 @@ fn jit_codegen_fingerprint() -> u64 {
         if JIT_HOT_EDGE_REGIONS {
             add(0x7A11_0002);
             add(HOT_EDGE_EXTRA_PAGES);
+        }
+        if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
+            add(0x7A11_0003);
+            add(JIT_GUARD_GROUPS as u32);
+            add(GG_DEBUG);
+            add(GG_MAX_EXTENT);
+            add(GG_MAX_SLOTS);
         }
     }
     hash

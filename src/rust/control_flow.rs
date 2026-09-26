@@ -77,6 +77,7 @@ pub fn make_graph(basic_blocks: &Vec<BasicBlock>) -> Graph {
     return nodes;
 }
 
+#[derive(Clone)]
 pub enum WasmStructure {
     BasicBlock(u32),
     Dispatcher(Vec<u32>),

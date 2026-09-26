@@ -2,6 +2,7 @@ use crate::cpu::cpu::{
     tlb_data, FLAGS_ALL, FLAG_CARRY, FLAG_OVERFLOW, FLAG_PARITY, FLAG_SIGN, FLAG_ZERO, OPSIZE_16,
     OPSIZE_32, OPSIZE_8, TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_USER, TLB_READONLY, TLB_VALID,
 };
+use crate::analysis;
 use crate::cpu::global_pointers;
 use crate::cpu::memory;
 use crate::jit;
@@ -534,11 +535,15 @@ pub fn gen_modrm_resolve_with_local(
     gen: &dyn Fn(&mut JitContext, &WasmLocal),
 ) {
     if let Some(r) = modrm::get_as_reg_index_if_possible(ctx, &modrm_byte) {
-        gen(ctx, &ctx.reg(r));
+        let reg = ctx.reg(r);
+        gg_bind(ctx, &reg, gg_reg_desc(r, 0));
+        gen(ctx, &reg);
     }
     else {
+        let desc = if ctx.gg.mode != GgMode::Off { modrm::gg_desc(ctx.cpu, &modrm_byte) } else { None };
         gen_modrm_resolve(ctx, modrm_byte);
         let address = ctx.builder.set_new_local();
+        gg_bind(ctx, &address, desc);
         gen(ctx, &address);
         ctx.builder.free_local(address);
     }
@@ -647,6 +652,548 @@ pub fn gen_modrm_resolve_safe_read128(
     gen_modrm_resolve_with_local(ctx, modrm_byte, &|ctx, addr| {
         gen_safe_read128(ctx, addr, where_to_write)
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Guard groups (jit.rs set_jit_guard_groups; planner: analysis::gg_plan).
+//
+// An ANCHOR performs its access with the inline TLB check widened to the group's static extent
+// [addr + lo_rel, addr + lo_rel + len): the page's entry must pass the read mask (the write mask
+// — writable, no compiled code — when any member writes) and the extent must lie in one page.
+// It stores ok and the raw TLB entry in the key's two locals. A MEMBER emits
+// `if ok { host = (entry & ~0xFFF) ^ addr } else { <its normal guarded path> }`: exact
+// fallback, no fault can come from the fast arm.
+//
+// Why nothing inside a group can invalidate what the anchor validated. The fast arm serves
+// the anchor's TRANSLATION (entry frame ^ addr), not a cached TLB slot. A translation changes
+// only through set_tlb_entry after a page-table, CR0/CR3/CR4, INVLPG, segment or privilege
+// change, or when JS changes the page tables (decommit) — and JS runs inside a module only
+// through a helper call. Every such instruction is a kill-all (analysis::gg_insn_is_kill_all)
+// and every helper call not known to leave translations alone is a barrier
+// (analysis::gg_call_is_transparent); a module exit ends every group (entry blocks start
+// empty). What a transparent call may do — a slow memory path filling or flushing TLB
+// ENTRIES, or a device MMIO handler — re-caches the same translation, never a different one.
+// Write permission cannot be lost in the span either: READONLY is cleared only by a write
+// fill, and HAS_CODE is set only when a module is compiled, which happens between module
+// executions. So a write member on a page the anchor saw as writable and code-free still
+// needs no jit_dirty_page, and a page that has code fails the anchor's write mask outright.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum GgMode {
+    Off,
+    Record,
+    Emit,
+}
+
+pub struct GgBind {
+    idx: u8,
+    desc: analysis::GgDesc,
+    seq: u32,
+    depth: usize,
+    struct_seq: u32,
+    loop_seq: u32,
+}
+
+pub struct GgCtx<'p> {
+    pub mode: GgMode,
+    pub plan: Option<&'p analysis::GgPlan>,
+    pub ord: usize,
+    /// One local per key: the validated frame (TLB entry & ~0xFFF), 0 when not validated.
+    pub slots: Vec<WasmLocal>,
+    pub binds: Vec<GgBind>,
+    pub mismatch: bool,
+    pub debug: u32,
+}
+
+impl<'p> GgCtx<'p> {
+    pub fn off() -> Self {
+        GgCtx { mode: GgMode::Off, plan: None, ord: 0, slots: Vec::new(), binds: Vec::new(), mismatch: false, debug: 0 }
+    }
+}
+
+pub fn gg_reg_desc(reg: u32, disp: i32) -> Option<analysis::GgDesc> {
+    Some(analysis::GgDesc {
+        seg: analysis::GG_SEG_FLAT,
+        base: reg as u8,
+        index: analysis::GG_NOREG,
+        scale: 0,
+        disp,
+    })
+}
+
+/// `local` now holds the effective address `desc` describes, in terms of the register
+/// locals' CURRENT values. Valid until `local`, the base or the index is written, or the block
+/// (or if-arm) it was made in ends: a value computed in one arm is not the value after the join.
+/// Using it inside blocks opened later is sound — wasm cannot branch into a block.
+pub fn gg_bind(ctx: &mut JitContext, local: &WasmLocal, desc: Option<analysis::GgDesc>) {
+    if ctx.gg.mode == GgMode::Off || !ctx.builder.gg.active {
+        return;
+    }
+    let idx = local.idx();
+    ctx.gg.binds.retain(|b| b.idx != idx);
+    if let Some(desc) = desc {
+        ctx.gg.binds.push(GgBind {
+            idx,
+            desc,
+            seq: ctx.builder.gg.seq,
+            depth: ctx.builder.depth().min(255),
+            struct_seq: ctx.builder.gg.struct_seq,
+            loop_seq: ctx.builder.gg.loop_seq,
+        });
+    }
+}
+
+fn gg_lookup(ctx: &JitContext, local: &WasmLocal) -> Option<analysis::GgDesc> {
+    let g = &ctx.builder.gg;
+    let b = ctx.gg.binds.iter().find(|b| b.idx == local.idx())?;
+    let fresh = |i: u8| g.last_write[i as usize] <= b.seq;
+    let reg_fresh = |r: u8| r == analysis::GG_NOREG || fresh(g.reg_base.wrapping_add(r));
+    let alive = g.kill_seq[b.depth] <= b.struct_seq && g.loop_seq == b.loop_seq && ctx.builder.depth() >= b.depth;
+    if alive && fresh(b.idx) && reg_fresh(b.desc.base) && reg_fresh(b.desc.index) {
+        Some(b.desc)
+    }
+    else {
+        None
+    }
+}
+
+/// The next write of register `reg` stores its old value plus `delta`.
+pub fn gg_delta_next(ctx: &mut JitContext, reg: u32, delta: i32) {
+    if ctx.builder.gg.active {
+        ctx.builder.gg.pending_delta = Some((ctx.register_locals[reg as usize].idx(), delta));
+    }
+}
+
+/// gen_modrm_resolve into a fresh local, bound for guard groups.
+pub fn gen_modrm_resolve_into_local(ctx: &mut JitContext, modrm_byte: ModrmByte) -> WasmLocal {
+    let desc = if ctx.gg.mode != GgMode::Off { modrm::gg_desc(ctx.cpu, &modrm_byte) } else { None };
+    gen_modrm_resolve(ctx, modrm_byte);
+    let local = ctx.builder.set_new_local();
+    gg_bind(ctx, &local, desc);
+    local
+}
+
+/// The next write of `local` (if it is a register local) stores its old value plus `delta`.
+pub fn gg_delta_next_local(ctx: &mut JitContext, local: &WasmLocal, delta: i32) {
+    if ctx.builder.gg.active {
+        ctx.builder.gg.pending_delta = Some((local.idx(), delta));
+    }
+}
+
+/// Records one guarded access (both passes) and returns its planned role (emit pass).
+fn gg_note_access(ctx: &mut JitContext, kind: u8, bits: BitSize, address_local: &WasmLocal) -> analysis::GgRole {
+    use analysis::{GgEvent, GgRole};
+    if ctx.gg.mode == GgMode::Off || !ctx.builder.gg.active {
+        return GgRole::None;
+    }
+    let desc = gg_lookup(ctx, address_local);
+    let top = ctx.builder.gg.in_insn && ctx.builder.depth() == ctx.builder.gg.insn_depth;
+    let ev = GgEvent::Access { at: ctx.start_of_current_instruction, kind, width: bits.bytes() as u8, desc, top };
+    ctx.builder.gg.log.push(ev);
+    let ord = ctx.gg.ord;
+    ctx.gg.ord += 1;
+    if ctx.gg.mode != GgMode::Emit || ctx.gg.mismatch {
+        return GgRole::None;
+    }
+    let plan = ctx.gg.plan.unwrap();
+    if plan.accesses.get(ord) != Some(&ev) {
+        ctx.gg.mismatch = true;
+        return GgRole::None;
+    }
+    let role = plan.roles[ord];
+    if role == GgRole::None {
+        gg_count(ctx, jit::GG_RT_NONE + if desc.is_none() { 0 } else if top { 2 } else { 1 });
+    }
+    role
+}
+
+fn gg_tlb_mask_read(ctx: &JitContext) -> i32 {
+    (0xFFF & !TLB_READONLY & !TLB_GLOBAL & !TLB_HAS_CODE & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32
+}
+fn gg_tlb_mask_write(ctx: &JitContext) -> i32 {
+    (0xFFF & !TLB_GLOBAL & !(if ctx.cpu.cpl3() { 0 } else { TLB_NO_USER })) as i32
+}
+
+fn gg_count(ctx: &mut JitContext, i: usize) {
+    if jit::gg_count_enabled() {
+        ctx.builder.increment_fixed_i64(jit::gg_rt_addr(i), 1);
+    }
+}
+
+/// Emits `entry <- tlb_data[addr >> 12]` leaving the entry on the stack and in `entry_local`.
+fn gg_load_entry(ctx: &mut JitContext, address_local: &WasmLocal, entry_local: &WasmLocal) {
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(2);
+    ctx.builder.shl_i32();
+    ctx.builder.load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
+    ctx.builder.tee_local(entry_local);
+}
+
+/// The group part of a grouped access, emitted first inside the access's `cont` block. On the
+/// fast path it leaves `entry_local` holding a TLB entry for the operand's page (and
+/// `fast_flag` = 1 for read-modify-write) and branches to `cont`. Falls through to the access's
+/// own check otherwise; returns true when `entry_local` already holds this page's entry.
+fn gg_prelude(
+    ctx: &mut JitContext,
+    kind: u8,
+    role: analysis::GgRole,
+    address_local: &WasmLocal,
+    entry_local: &WasmLocal,
+    cont: crate::wasmgen::wasm_builder::Label,
+    fast_flag: Option<&WasmLocal>,
+) -> bool {
+    use analysis::GgRole;
+    match role {
+        GgRole::Member { slot } => {
+            let frame = ctx.gg.slots[slot as usize].unsafe_clone();
+            let skip_ok = ctx.gg.debug & jit::GG_DEBUG_NC_SKIP_OK != 0;
+            if !skip_ok {
+                ctx.builder.get_local(&frame);
+                ctx.builder.if_void_hinted(HINT_GROUP_MEM, HINT_LIKELY);
+            }
+            gg_count(ctx, jit::GG_RT_MEMBER_FAST + kind as usize);
+            ctx.builder.get_local(&frame);
+            ctx.builder.set_local(entry_local);
+            if let Some(f) = fast_flag {
+                ctx.builder.const_i32(1);
+                ctx.builder.set_local(f);
+            }
+            ctx.builder.br(cont);
+            if !skip_ok {
+                ctx.builder.block_end();
+            }
+            gg_count(ctx, jit::GG_RT_MEMBER_SLOW + kind as usize);
+            false
+        },
+        GgRole::Anchor { slot, lo_rel, len, write } => {
+            // slot <- ok ? entry & ~0xFFF : 0. A frame that happens to be 0 reads as "not
+            // validated", which only sends the group's members down their normal path.
+            let frame = ctx.gg.slots[slot as usize].unsafe_clone();
+            gg_count(ctx, jit::GG_RT_ANCHOR);
+            gg_load_entry(ctx, address_local, entry_local);
+            ctx.builder.const_i32(!0xFFF);
+            ctx.builder.and_i32();
+            ctx.builder.const_i32(0);
+            ctx.builder.get_local(entry_local);
+            let mask = if write { gg_tlb_mask_write(ctx) } else { gg_tlb_mask_read(ctx) };
+            ctx.builder.const_i32(mask);
+            ctx.builder.and_i32();
+            ctx.builder.const_i32(TLB_VALID as i32);
+            ctx.builder.eq_i32();
+            ctx.builder.get_local(address_local);
+            if lo_rel != 0 {
+                ctx.builder.const_i32(lo_rel);
+                ctx.builder.add_i32();
+            }
+            ctx.builder.const_i32(0xFFF);
+            ctx.builder.and_i32();
+            ctx.builder.const_i32(0x1000 - len as i32);
+            ctx.builder.le_i32();
+            ctx.builder.and_i32();
+            ctx.builder.select();
+            ctx.builder.tee_local(&frame);
+            if jit::gg_count_enabled() {
+                ctx.builder.if_void();
+                gg_count(ctx, jit::GG_RT_ANCHOR_OK);
+                ctx.builder.block_end();
+                ctx.builder.get_local(&frame);
+            }
+            if let Some(f) = fast_flag {
+                ctx.builder.const_i32(0);
+                ctx.builder.ne_i32();
+                ctx.builder.tee_local(f);
+            }
+            ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
+            true
+        },
+        GgRole::None => false,
+    }
+}
+
+fn gen_safe_read_grouped(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    where_to_write: Option<u32>,
+    role: analysis::GgRole,
+) {
+    ctx.builder.const_i32(0);
+    let entry_local = ctx.builder.set_new_local();
+    let cont = ctx.builder.block_void();
+    // A member's fallback is the slow helper itself: it runs only when the anchor's check
+    // failed (a page crossing or a page without the needed permission), where an inline TLB
+    // check would fail too, and it keeps every member small.
+    let has_entry = gg_prelude(ctx, analysis::GG_R, role, address_local, &entry_local, cont, None);
+    if !matches!(role, analysis::GgRole::Member { .. }) {
+        if !has_entry {
+            gg_load_entry(ctx, address_local, &entry_local);
+        }
+        else {
+            ctx.builder.get_local(&entry_local);
+        }
+        ctx.builder.const_i32(gg_tlb_mask_read(ctx));
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(TLB_VALID as i32);
+        ctx.builder.eq_i32();
+        if bits != BitSize::BYTE {
+            ctx.builder.get_local(address_local);
+            ctx.builder.const_i32(0xFFF);
+            ctx.builder.and_i32();
+            ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
+            ctx.builder.le_i32();
+            ctx.builder.and_i32();
+        }
+        ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
+    }
+
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    match bits {
+        BitSize::BYTE => ctx.builder.call_fn2_ret("safe_read8_slow_jit"),
+        BitSize::WORD => ctx.builder.call_fn2_ret("safe_read16_slow_jit"),
+        BitSize::DWORD => ctx.builder.call_fn2_ret("safe_read32s_slow_jit"),
+        BitSize::QWORD => ctx.builder.call_fn2_ret("safe_read64s_slow_jit"),
+        BitSize::DQWORD => ctx.builder.call_fn2_ret("safe_read128s_slow_jit"),
+    }
+    ctx.builder.tee_local(&entry_local);
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
+    ctx.builder.block_end();
+
+    ctx.builder.get_local(&entry_local);
+    ctx.builder.const_i32(!0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(address_local);
+    ctx.builder.xor_i32();
+    match bits {
+        BitSize::BYTE => ctx.builder.load_u8(0),
+        BitSize::WORD => ctx.builder.load_unaligned_u16(0),
+        BitSize::DWORD => ctx.builder.load_unaligned_i32(0),
+        BitSize::QWORD => ctx.builder.load_unaligned_i64(0),
+        BitSize::DQWORD => {
+            let where_to_write = where_to_write.unwrap();
+            let virt_address_local = ctx.builder.set_new_local();
+            ctx.builder.const_i32(0);
+            ctx.builder.get_local(&virt_address_local);
+            ctx.builder.load_unaligned_i64(0);
+            ctx.builder.store_unaligned_i64(where_to_write);
+            ctx.builder.const_i32(0);
+            ctx.builder.get_local(&virt_address_local);
+            ctx.builder.load_unaligned_i64(8);
+            ctx.builder.store_unaligned_i64(where_to_write + 8);
+            ctx.builder.free_local(virt_address_local);
+        },
+    }
+    ctx.builder.free_local(entry_local);
+}
+
+fn gen_safe_write_grouped(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    value_local: GenSafeWriteValue,
+    role: analysis::GgRole,
+) {
+    ctx.builder.const_i32(0);
+    let entry_local = ctx.builder.set_new_local();
+    let cont = ctx.builder.block_void();
+    // A member's fallback is the slow helper itself: it runs only when the anchor's check
+    // failed (a page crossing or a page without the needed permission), where an inline TLB
+    // check would fail too, and it keeps every member small.
+    let has_entry = gg_prelude(ctx, analysis::GG_W, role, address_local, &entry_local, cont, None);
+    if !matches!(role, analysis::GgRole::Member { .. }) {
+        if !has_entry {
+            gg_load_entry(ctx, address_local, &entry_local);
+        }
+        else {
+            ctx.builder.get_local(&entry_local);
+        }
+        ctx.builder.const_i32(gg_tlb_mask_write(ctx));
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(TLB_VALID as i32);
+        ctx.builder.eq_i32();
+        if bits != BitSize::BYTE {
+            ctx.builder.get_local(address_local);
+            ctx.builder.const_i32(0xFFF);
+            ctx.builder.and_i32();
+            ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
+            ctx.builder.le_i32();
+            ctx.builder.and_i32();
+        }
+        ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
+    }
+
+    ctx.builder.get_local(address_local);
+    match value_local {
+        GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
+        GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
+        GenSafeWriteValue::TwoI64s(local1, local2) => {
+            ctx.builder.get_local_i64(local1);
+            ctx.builder.get_local_i64(local2)
+        },
+    }
+    ctx.builder.const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    match bits {
+        BitSize::BYTE => ctx.builder.call_fn3_ret("safe_write8_slow_jit"),
+        BitSize::WORD => ctx.builder.call_fn3_ret("safe_write16_slow_jit"),
+        BitSize::DWORD => ctx.builder.call_fn3_ret("safe_write32_slow_jit"),
+        BitSize::QWORD => ctx.builder.call_fn3_i32_i64_i32_ret("safe_write64_slow_jit"),
+        BitSize::DQWORD => ctx.builder.call_fn4_i32_i64_i64_i32_ret("safe_write128_slow_jit"),
+    }
+    ctx.builder.tee_local(&entry_local);
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
+    ctx.builder.block_end();
+
+    ctx.builder.get_local(&entry_local);
+    ctx.builder.const_i32(!0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(address_local);
+    ctx.builder.xor_i32();
+    match value_local {
+        GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
+        GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
+        GenSafeWriteValue::TwoI64s(local1, local2) => {
+            let virt_address_local = ctx.builder.tee_new_local();
+            ctx.builder.get_local_i64(local1);
+            ctx.builder.store_unaligned_i64(0);
+            ctx.builder.get_local(&virt_address_local);
+            ctx.builder.get_local_i64(local2);
+            ctx.builder.store_unaligned_i64(8);
+            ctx.builder.free_local(virt_address_local);
+        },
+    }
+    match bits {
+        BitSize::BYTE => ctx.builder.store_u8(0),
+        BitSize::WORD => ctx.builder.store_unaligned_u16(0),
+        BitSize::DWORD => ctx.builder.store_unaligned_i32(0),
+        BitSize::QWORD => ctx.builder.store_unaligned_i64(0),
+        BitSize::DQWORD => {},
+    }
+    ctx.builder.free_local(entry_local);
+}
+
+fn gen_safe_read_write_grouped(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    f: &dyn Fn(&mut JitContext),
+    role: analysis::GgRole,
+) {
+    ctx.builder.const_i32(0);
+    let entry_local = ctx.builder.set_new_local();
+    ctx.builder.const_i32(0);
+    let can_use_fast_path_local = ctx.builder.set_new_local();
+    let cont = ctx.builder.block_void();
+    // A member's fallback is the slow helper itself: it runs only when the anchor's check
+    // failed (a page crossing or a page without the needed permission), where an inline TLB
+    // check would fail too, and it keeps every member small.
+    let has_entry = gg_prelude(ctx, analysis::GG_RMW, role, address_local, &entry_local, cont, Some(&can_use_fast_path_local));
+    if !matches!(role, analysis::GgRole::Member { .. }) {
+        if !has_entry {
+            gg_load_entry(ctx, address_local, &entry_local);
+        }
+        else {
+            ctx.builder.get_local(&entry_local);
+        }
+        ctx.builder.const_i32(gg_tlb_mask_write(ctx));
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(TLB_VALID as i32);
+        ctx.builder.eq_i32();
+        if bits != BitSize::BYTE {
+            ctx.builder.get_local(address_local);
+            ctx.builder.const_i32(0xFFF);
+            ctx.builder.and_i32();
+            ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
+            ctx.builder.le_i32();
+            ctx.builder.and_i32();
+        }
+        ctx.builder.tee_local(&can_use_fast_path_local);
+        ctx.builder.br_if_hinted(cont, HINT_GROUP_MEM, HINT_LIKELY);
+    }
+
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    match bits {
+        BitSize::BYTE => ctx.builder.call_fn2_ret("safe_read_write8_slow_jit"),
+        BitSize::WORD => ctx.builder.call_fn2_ret("safe_read_write16_slow_jit"),
+        BitSize::DWORD => ctx.builder.call_fn2_ret("safe_read_write32s_slow_jit"),
+        BitSize::QWORD => ctx.builder.call_fn2_ret("safe_read_write64_slow_jit"),
+        BitSize::DQWORD => dbg_assert!(false),
+    }
+    ctx.builder.tee_local(&entry_local);
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+    ctx.builder
+        .br_if_hinted(ctx.exit_with_fault_label, HINT_GROUP_MEM, HINT_UNLIKELY);
+    ctx.builder.block_end();
+
+    ctx.builder.get_local(&entry_local);
+    ctx.builder.const_i32(!0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(address_local);
+    ctx.builder.xor_i32();
+    ctx.builder.free_local(entry_local);
+    let phys_addr_local = ctx.builder.tee_new_local();
+    match bits {
+        BitSize::BYTE => ctx.builder.load_u8(0),
+        BitSize::WORD => ctx.builder.load_unaligned_u16(0),
+        BitSize::DWORD => ctx.builder.load_unaligned_i32(0),
+        BitSize::QWORD => ctx.builder.load_unaligned_i64(0),
+        BitSize::DQWORD => assert!(false),
+    }
+    f(ctx);
+    let value_local = if bits == BitSize::QWORD {
+        GenSafeReadWriteValue::I64(ctx.builder.set_new_local_i64())
+    }
+    else {
+        GenSafeReadWriteValue::I32(ctx.builder.set_new_local())
+    };
+    ctx.builder.get_local(&can_use_fast_path_local);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    {
+        ctx.builder.get_local(address_local);
+        match &value_local {
+            GenSafeReadWriteValue::I32(l) => ctx.builder.get_local(l),
+            GenSafeReadWriteValue::I64(l) => ctx.builder.get_local_i64(l),
+        }
+        ctx.builder.const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+        match bits {
+            BitSize::BYTE => ctx.builder.call_fn3_ret("safe_write8_slow_jit"),
+            BitSize::WORD => ctx.builder.call_fn3_ret("safe_write16_slow_jit"),
+            BitSize::DWORD => ctx.builder.call_fn3_ret("safe_write32_slow_jit"),
+            BitSize::QWORD => ctx.builder.call_fn3_i32_i64_i32_ret("safe_write64_slow_jit"),
+            BitSize::DQWORD => dbg_assert!(false),
+        }
+        ctx.builder.drop_();
+    }
+    ctx.builder.block_end();
+    ctx.builder.get_local(&phys_addr_local);
+    match &value_local {
+        GenSafeReadWriteValue::I32(l) => ctx.builder.get_local(l),
+        GenSafeReadWriteValue::I64(l) => ctx.builder.get_local_i64(l),
+    }
+    match bits {
+        BitSize::BYTE => ctx.builder.store_u8(0),
+        BitSize::WORD => ctx.builder.store_unaligned_u16(0),
+        BitSize::DWORD => ctx.builder.store_unaligned_i32(0),
+        BitSize::QWORD => ctx.builder.store_unaligned_i64(0),
+        BitSize::DQWORD => dbg_assert!(false),
+    }
+    match value_local {
+        GenSafeReadWriteValue::I32(l) => ctx.builder.free_local(l),
+        GenSafeReadWriteValue::I64(l) => ctx.builder.free_local_i64(l),
+    }
+    ctx.builder.free_local(can_use_fast_path_local);
+    ctx.builder.free_local(phys_addr_local);
 }
 
 pub fn gen_safe_read8(ctx: &mut JitContext, address_local: &WasmLocal) {
@@ -986,6 +1533,12 @@ fn gen_safe_read(
     address_local: &WasmLocal,
     where_to_write: Option<u32>,
 ) {
+    gg_count(ctx, jit::GG_RT_ACCESS + analysis::GG_R as usize);
+    let role = gg_note_access(ctx, analysis::GG_R, bits, address_local);
+    if role != analysis::GgRole::None {
+        gen_safe_read_grouped(ctx, bits, address_local, where_to_write, role);
+        return;
+    }
     if crate::cpu::perm_map::perm_map_reads_replace() {
         if let Some(mem8) = raw_guest_base() {
             gen_perm_read(ctx, bits, address_local, where_to_write, mem8);
@@ -1581,6 +2134,12 @@ fn gen_safe_write(
     address_local: &WasmLocal,
     value_local: GenSafeWriteValue,
 ) {
+    gg_count(ctx, jit::GG_RT_ACCESS + analysis::GG_W as usize);
+    let role = gg_note_access(ctx, analysis::GG_W, bits, address_local);
+    if role != analysis::GgRole::None {
+        gen_safe_write_grouped(ctx, bits, address_local, value_local, role);
+        return;
+    }
     // When enabled for this unit, route through the per-page write
     // map instead of the inline TLB fast path. Flag off = byte-identical to below.
     if ctx.fastmem_writes {
@@ -1788,6 +2347,12 @@ fn gen_push32_coalesced_write(
     let Some((cache_page, cache_entry, cache_valid)) = gen_push32_write_cache_slot(ctx) else {
         return false;
     };
+    gg_count(ctx, jit::GG_RT_ACCESS + analysis::GG_W as usize);
+    let role = gg_note_access(ctx, analysis::GG_W, BitSize::DWORD, address_local);
+    if role != analysis::GgRole::None {
+        gen_safe_write_grouped(ctx, BitSize::DWORD, address_local, GenSafeWriteValue::I32(value_local), role);
+        return true;
+    }
 
     crate::jit::push_run_note_site_compiled();
 
@@ -1897,6 +2462,12 @@ pub fn gen_safe_read_write(
     address_local: &WasmLocal,
     f: &dyn Fn(&mut JitContext),
 ) {
+    gg_count(ctx, jit::GG_RT_ACCESS + analysis::GG_RMW as usize);
+    let role = gg_note_access(ctx, analysis::GG_RMW, bits, address_local);
+    if role != analysis::GgRole::None {
+        gen_safe_read_write_grouped(ctx, bits, address_local, f, role);
+        return;
+    }
     // Execute a virtual memory read+write. All slow paths (memory-mapped IO, tlb miss, page fault,
     // write across page boundary and page containing jitted code are handled in
     // safe_read_write_jit_slow
@@ -2195,6 +2766,9 @@ pub fn gen_pop16_ss32(ctx: &mut JitContext) {
 
     // result = safe_read16(esp)
     let address_local = ctx.builder.set_new_local();
+    if ctx.cpu.has_flat_segmentation() {
+        gg_bind(ctx, &address_local, gg_reg_desc(regs::ESP, 0));
+    }
     gen_safe_read16(ctx, &address_local);
     ctx.builder.free_local(address_local);
 
@@ -2202,6 +2776,7 @@ pub fn gen_pop16_ss32(ctx: &mut JitContext) {
     gen_get_reg32(ctx, regs::ESP);
     ctx.builder.const_i32(2);
     ctx.builder.add_i32();
+    gg_delta_next(ctx, regs::ESP, 2);
     gen_set_reg32(ctx, regs::ESP);
 
     // return value is already on stack
@@ -2250,12 +2825,14 @@ pub fn gen_pop32s_ss32(ctx: &mut JitContext) {
     }
     else {
         let reg = ctx.register_locals[regs::ESP as usize].unsafe_clone();
+        gg_bind(ctx, &reg, gg_reg_desc(regs::ESP, 0));
         gen_safe_read32(ctx, &reg);
     }
 
     gen_get_reg32(ctx, regs::ESP);
     ctx.builder.const_i32(4);
     ctx.builder.add_i32();
+    gg_delta_next(ctx, regs::ESP, 4);
     gen_set_reg32(ctx, regs::ESP);
 
     // return value is already on stack
@@ -2275,6 +2852,7 @@ pub fn gen_adjust_stack_reg(ctx: &mut JitContext, offset: u32) {
         gen_get_reg32(ctx, regs::ESP);
         ctx.builder.const_i32(offset as i32);
         ctx.builder.add_i32();
+        gg_delta_next(ctx, regs::ESP, offset as i32);
         gen_set_reg32(ctx, regs::ESP);
     }
     else {
@@ -2303,6 +2881,9 @@ pub fn gen_leave(ctx: &mut JitContext, os32: bool) {
     }
     if os32 {
         let address_local = ctx.builder.set_new_local();
+        if ctx.cpu.ssize_32() && ctx.cpu.has_flat_segmentation() {
+            gg_bind(ctx, &address_local, gg_reg_desc(regs::EBP, 0));
+        }
         gen_safe_read32(ctx, &address_local);
         ctx.builder.free_local(address_local);
         gen_set_reg32(ctx, regs::EBP);
@@ -2409,7 +2990,9 @@ pub fn gen_push16(ctx: &mut JitContext, value_local: &WasmLocal) {
     else {
         // short path: The address written to is equal to ESP/SP minus two
         let reg_updated_local = ctx.builder.tee_new_local();
+        gg_bind(ctx, &reg_updated_local, gg_reg_desc(regs::ESP, -2));
         gen_safe_write16(ctx, &reg_updated_local, &value_local);
+        gg_delta_next(ctx, regs::ESP, -2);
         reg_updated_local
     };
 
@@ -2456,9 +3039,11 @@ pub fn gen_push32(ctx: &mut JitContext, value_local: &WasmLocal) {
     else {
         // short path: The address written to is equal to ESP/SP minus four
         let new_sp_local = ctx.builder.tee_new_local();
+        gg_bind(ctx, &new_sp_local, gg_reg_desc(regs::ESP, -4));
         if !gen_push32_coalesced_write(ctx, &new_sp_local, &value_local) {
             gen_safe_write32(ctx, &new_sp_local, &value_local);
         }
+        gg_delta_next(ctx, regs::ESP, -4);
         new_sp_local
     };
 
@@ -4650,8 +5235,7 @@ pub fn gen_fpu_relaxed_push_const_f64(ctx: &mut JitContext, value: f64, slow_r: 
 
 pub fn gen_fpu_relaxed_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool) {
     if !crate::softfloat::is_fpu_relaxed() {
-        gen_modrm_resolve(ctx, modrm_byte);
-        let address_local = ctx.builder.set_new_local();
+        let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret("f80_to_f32");
         let value_local = ctx.builder.set_new_local();
@@ -4664,8 +5248,7 @@ pub fn gen_fpu_relaxed_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, po
         return;
     }
 
-    gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
+    let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
     let st0_addr = gen_fpu_st_addr(ctx, 0);
     gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
     ctx.builder.eqz_i32();
@@ -4695,8 +5278,7 @@ pub fn gen_fpu_relaxed_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, po
 
 pub fn gen_fpu_relaxed_store_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool) {
     if !crate::softfloat::is_fpu_relaxed() {
-        gen_modrm_resolve(ctx, modrm_byte);
-        let address_local = ctx.builder.set_new_local();
+        let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret_i64("f80_to_f64");
         let value_local = ctx.builder.set_new_local_i64();
@@ -4709,8 +5291,7 @@ pub fn gen_fpu_relaxed_store_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, po
         return;
     }
 
-    gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
+    let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
     let st0_addr = gen_fpu_st_addr(ctx, 0);
     gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
     ctx.builder.eqz_i32();
@@ -4743,8 +5324,7 @@ pub fn gen_fpu_relaxed_fist_m32(
 ) {
     let helper = if truncate { "fpu_truncate_to_i32" } else { "fpu_convert_to_i32" };
     if !crate::softfloat::is_fpu_relaxed() {
-        gen_modrm_resolve(ctx, modrm_byte);
-        let address_local = ctx.builder.set_new_local();
+        let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret(helper);
         let value_local = ctx.builder.set_new_local();
@@ -4757,8 +5337,7 @@ pub fn gen_fpu_relaxed_fist_m32(
         return;
     }
 
-    gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
+    let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
     let st0_addr = gen_fpu_st_addr(ctx, 0);
     gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
     ctx.builder.eqz_i32();
@@ -4794,8 +5373,7 @@ pub fn gen_fpu_relaxed_fist_m16(
 ) {
     let helper = if truncate { "fpu_truncate_to_i16" } else { "fpu_convert_to_i16" };
     if !crate::softfloat::is_fpu_relaxed() {
-        gen_modrm_resolve(ctx, modrm_byte);
-        let address_local = ctx.builder.set_new_local();
+        let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret(helper);
         let value_local = ctx.builder.set_new_local();
@@ -4808,8 +5386,7 @@ pub fn gen_fpu_relaxed_fist_m16(
         return;
     }
 
-    gen_modrm_resolve(ctx, modrm_byte);
-    let address_local = ctx.builder.set_new_local();
+    let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
     let st0_addr = gen_fpu_st_addr(ctx, 0);
     gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
     ctx.builder.eqz_i32();
