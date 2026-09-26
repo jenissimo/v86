@@ -1299,8 +1299,8 @@ pub fn jit_tier2_note_retired(wasm_table_index: u32, retired: u32) {
     let idx = wasm_table_index as u16;
     let threshold = unsafe { JIT_TIER2_THRESHOLD } as u64;
     // Shipping OFF is also an accounting-overhead kill switch. Live modules compiled
-    // while OFF omit this call entirely; this guard covers an in-flight/old module and
-    // the accounting folded into the always-present dynamic-chain resolver.
+    // while OFF omit this call entirely and the chain resolvers gate it at the call site;
+    // this guard covers an in-flight/old module and the ungated A/B arm.
     if threshold == 0 {
         return;
     }
@@ -1319,6 +1319,32 @@ pub fn jit_tier2_note_retired(wasm_table_index: u32, retired: u32) {
         *credit = credit.saturating_add(crossings.min(u8::MAX as u64) as u8);
     }
     tier2_pending_enqueue(idx);
+}
+
+// Call gates for the two per-dispatch bookkeeping calls (chain helpers → note_retired,
+// cycle_internal → drain_pending). Both are exact: note_retired does nothing at threshold 0,
+// and drain_pending does nothing with an empty queue. With tier-2 off (shipping) that turns
+// an out-of-line call per dispatch into a load and a branch. TIER2_UNGATED restores the
+// unconditional calls — the A/B arm, not a correctness switch.
+static mut TIER2_UNGATED: bool = false;
+
+#[no_mangle]
+pub fn jit_tier2_call_gate_set(on: u32) { unsafe { TIER2_UNGATED = on == 0 } }
+#[no_mangle]
+pub fn jit_tier2_call_gate_get() -> u32 { unsafe { !TIER2_UNGATED as u32 } }
+
+#[inline(always)]
+fn tier2_note_retired_gated(wasm_table_index: u32, retired: u32) {
+    if unsafe { JIT_TIER2_THRESHOLD != 0 || TIER2_UNGATED } {
+        jit_tier2_note_retired(wasm_table_index, retired);
+    }
+}
+
+#[inline(always)]
+pub fn tier2_drain_pending_gated() {
+    if unsafe { TIER2_PENDING_LEN != 0 || TIER2_UNGATED } {
+        jit_tier2_drain_pending();
+    }
 }
 
 /// AOT units are relocatable and intentionally contain no wasm-table slot constant. They
@@ -1522,8 +1548,8 @@ fn tier2_pending_drop(idx: u16) {
 /// Apply the promotions queued by chained entries.
 ///
 /// MUST be called only from cycle_internal, i.e. between module entries, because promotion
-/// invalidates compiled table entries. Near-free when idle (one static load and a branch),
-/// which is why it can sit on the per-block path.
+/// invalidates compiled table entries. The per-block call site goes through
+/// `tier2_drain_pending_gated`, so an empty queue costs no call.
 #[no_mangle]
 pub fn jit_tier2_drain_pending() {
     if unsafe { JIT_TIER2_THRESHOLD } == 0 {
@@ -3021,7 +3047,7 @@ pub unsafe fn jit_find_cache_entry_for_chaining(
     // Chained activations do not pass cycle_internal, so credit this activation
     // before either the tail-call or fallback exit. The caller resets its local
     // counter immediately after this call, preventing a miss from double-counting.
-    jit_tier2_note_retired(current_wasm_table_index, retired);
+    tier2_note_retired_gated(current_wasm_table_index, retired);
 
     // Match do_many_cycles_native's full hypercall quantum. In particular,
     // limit==0 is the urgent-exit signal and must never be chained past.
@@ -3092,7 +3118,7 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(
     // This helper already sits on every successful/failed dynamic chain attempt. Fold
     // retired accounting into it instead of adding a second cross-module wasm call to
     // the hottest edge. The generated caller resets its local counter after this call.
-    jit_tier2_note_retired(current_wasm_table_index, retired);
+    tier2_note_retired_gated(current_wasm_table_index, retired);
     // same quantum as do_many_cycles_native (limit==0 urgent exit and in_hlt still bail) —
     // this is what keeps the async-park/spin-loop invariant: an urgent
     // exit request zeroes the budget, so we never chain past it.

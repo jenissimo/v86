@@ -3229,8 +3229,8 @@ pub unsafe fn cycle_internal() {
     // live; they can only be APPLIED here, between module entries.
     // Draining before the dispatch lookup means a module freed by the drain is already
     // gone from dispatch meta when we look, so this slice runs interpreted with no extra
-    // check. No-op cost is one static load and a branch.
-    jit::jit_tier2_drain_pending();
+    // check. Gated inline on an empty queue, so the idle cost is a load and a branch.
+    jit::tier2_drain_pending_gated();
 
     // DOD SoA lookup (jit::DISPATCH_META — no pointer chase). The old lookup-time
     // fastmem-generation deopt is gone: a stale unit self-deopts via its prologue
