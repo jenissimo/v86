@@ -6216,7 +6216,10 @@ pub fn instr_0F2A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     mmx_read64_mm_mem(ctx, "instr_0F2A", modrm_byte, r);
 }
 pub fn instr_0F2A_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    mmx_read64_mm_mm(ctx, "instr_0F2A", r1, r2);
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    ctx.builder.const_i32(r1 as i32);
+    ctx.builder.const_i32(r2 as i32);
+    ctx.builder.call_fn2("instr_0F2A_reg")
 }
 pub fn instr_660F2A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     mmx_read64_mm_mem(ctx, "instr_660F2A", modrm_byte, r);

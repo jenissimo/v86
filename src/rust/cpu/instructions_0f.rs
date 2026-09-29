@@ -933,9 +933,14 @@ pub unsafe fn instr_0F2A(source: u64, r: i32) {
     let source: [i32; 2] = std::mem::transmute(source);
     let result = [source[0] as f32, source[1] as f32];
     write_xmm64(r, std::mem::transmute(result));
+}
+#[no_mangle]
+pub unsafe fn instr_0F2A_reg(r1: i32, r2: i32) {
+    instr_0F2A(read_mmx64s(r1), r2);
+    // Only the MMX-register form enters MMX state (as cvtpi2pd below); the m64 form must
+    // leave the x87 tag word alone, or the next FLD overflows into the QNaN indefinite.
     transition_fpu_to_mmx();
 }
-pub unsafe fn instr_0F2A_reg(r1: i32, r2: i32) { instr_0F2A(read_mmx64s(r1), r2); }
 pub unsafe fn instr_0F2A_mem(addr: i32, r: i32) {
     instr_0F2A(return_on_pagefault!(safe_read64s(addr)), r);
 }
