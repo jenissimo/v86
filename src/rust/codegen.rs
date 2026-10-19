@@ -4717,6 +4717,34 @@ fn gen_fpu_round_f64_by_precision_control(ctx: &mut JitContext) {
     ctx.builder.reinterpret_i64_as_f64();
     ctx.builder.demote_f64_to_f32();
     ctx.builder.promote_f32_to_f64();
+    ctx.builder.reinterpret_f64_as_i64();
+    let rounded = ctx.builder.set_new_local_i64();
+    // The demote fast path is exact only for normal finite f32 results (or signed zero).
+    ctx.builder.get_local_i64(&rounded);
+    ctx.builder.const_i64(32);
+    ctx.builder.shr_u_i64();
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32(0x7fff_ffff);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(0x3810_0000);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32(0x0fe0_0000);
+    ctx.builder.geu_i32();
+    ctx.builder.get_local_i64(&raw);
+    ctx.builder.const_i64(1);
+    ctx.builder.shl_i64();
+    ctx.builder.const_i64(0);
+    ctx.builder.ne_i64();
+    ctx.builder.and_i32();
+    ctx.builder.if_i64();
+    ctx.builder.get_local_i64(&raw);
+    ctx.builder.const_i32(24);
+    ctx.builder.call_fn2_i64_i32_ret_i64("fpu_round_significand");
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(&rounded);
+    ctx.builder.block_end();
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.free_local_i64(rounded);
     ctx.builder.get_local_i64(&raw);
     ctx.builder.reinterpret_i64_as_f64();
     // select() keeps the FIRST value when the condition is non-zero: PC field == 00.

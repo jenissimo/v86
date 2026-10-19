@@ -28,8 +28,8 @@ fn round_by_rc(f: f64) -> f64 {
     }
 }
 
-/// PC=00 (24-bit single) rounds every arithmetic result to f32. F80 is f64-backed so
-/// P64/P80 already match (53-bit); only P32 needs the extra round.
+/// PC=00 rounds the significand to 24 bits while retaining the register exponent.
+/// F80 is f64-backed, so PC=53/64 already use the available 53-bit significand.
 ///
 /// Relaxed mode honours PC too — it is the one x87 control it cannot spend. A title that
 /// compares a freshly computed value against one it stored as f32 never sees them equal
@@ -43,7 +43,24 @@ fn round_by_rc(f: f64) -> f64 {
 /// branchlessly instead; see codegen's gen_fpu_round_f64_by_precision_control.
 #[inline]
 fn apply_precision(f: f64) -> f64 {
-    if control_word() >> 8 & 3 == 0 { f as f32 as f64 } else { f }
+    if control_word() >> 8 & 3 == 0 {
+        f64::from_bits(fpu_round_significand(f.to_bits(), 24))
+    } else { f }
+}
+
+/// Round only significant bits; narrowing the exponent would overflow valid x87 intermediates.
+#[no_mangle]
+pub extern "C" fn fpu_round_significand(bits: u64, precision: u32) -> u64 {
+    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+    let exponent = magnitude >> 52;
+    if exponent == 0x7ff || magnitude == 0 { return bits; }
+    let significant = if exponent == 0 { 64 - magnitude.leading_zeros() } else { 53 };
+    let shift = significant.saturating_sub(precision.max(1).min(53));
+    if shift == 0 { return bits; }
+    let mask = (1u64 << shift) - 1;
+    let halfway = 1u64 << (shift - 1);
+    let rounded = (magnitude + halfway - 1 + ((magnitude >> shift) & 1)) & !mask;
+    (bits & (1u64 << 63)) | rounded
 }
 
 /// Relaxed FPU mode: store raw f64 bits directly in F80.mantissa with RELAXED_TAG.

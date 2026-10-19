@@ -7041,7 +7041,7 @@ fn jit_codegen_fingerprint() -> u64 {
     };
     // Generated-code ABI revision. Bump whenever an always-on emitter changes so an AOT
     // module produced by an older runtime cannot silently bypass the new code shape.
-    add(11);
+    add(12);
     unsafe {
         add(MAX_PAGES);
         add(JIT_USE_LOOP_SAFETY as u32);

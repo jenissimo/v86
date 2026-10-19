@@ -299,8 +299,8 @@ function build_cw_image(kind)
 
     dv.setUint16(CW_BOOT - BASE, 0x037F, true);
     dv.setFloat64(VAL27 - BASE, 2.7, true);
-    dv.setFloat64(ONE - BASE, 1.0, true);
-    dv.setFloat64(THREE - BASE, 3.0, true);
+    dv.setFloat64(ONE - BASE, kind === "pc-wide" || kind === "pc-cancel" ? (2 - 2 ** -23) * 2 ** 127 : kind === "pc-tiny" ? 2 ** -126 : 1.0, true);
+    dv.setFloat64(THREE - BASE, kind === "pc" ? 3.0 : 2 ** 32, true);
 
     let o = ENTRY_OFF;
     const emit = (...b) => { for(const x of b) buf[o++] = x & 0xff; };
@@ -315,6 +315,9 @@ function build_cw_image(kind)
     emit(0xEE);                             // out  dx, al   -> host rewrites the CW
     emit(0xD9, 0x3D); imm32(OUT_CW);        // fnstcw [OUT_CW]   (did the write land?)
 
+    const exponentCase = kind.startsWith("pc-");
+    dv.setUint32(DATA + 200 - BASE, exponentCase ? 400000 : 1, true);
+    const arithmeticStart = o;
     if(kind === "rc") {
         emit(0xDD, 0x05); imm32(VAL27);     // fld   qword [2.7]
         emit(0xD9, 0xFC);                   // frndint            (helper only)
@@ -326,10 +329,18 @@ function build_cw_image(kind)
     }
     else {
         emit(0xDD, 0x05); imm32(ONE);       // fld  qword [1.0]
-        emit(0xDC, 0x35); imm32(THREE);     // fdiv qword [3.0]
+        emit(0xDC, kind === "pc-wide" || kind === "pc-cancel" ? 0x0D : 0x35); imm32(THREE);
+        if(kind === "pc-cancel") {
+            emit(0xD9, 0xEE, 0xDE, 0xC9); // fldz; fmulp st(1), st(0)
+            emit(0xD9, 0xE8, 0xDE, 0xC1); // fld1; faddp st(1), st(0)
+        }
         emit(0xDD, 0x1D); imm32(OUT_DIV);   // fstp qword
         emit(0xA1); imm32(OUT_DIV + 4);     // mov  eax, [div hi]
         emit(0x8B, 0x1D); imm32(OUT_DIV);   // mov  ebx, [div lo]
+    }
+    if(exponentCase) {
+        emit(0xFF, 0x0D); imm32(DATA + 200);
+        emit(0x0F, 0x85); imm32(arithmeticStart - (o + 4));
     }
     emit(0x0F, 0xB7, 0x0D); imm32(OUT_CW);  // movzx ecx, word [OUT_CW]
     emit(0xF4);                             // hlt
@@ -349,7 +360,8 @@ function run_cw(kind, cw, { jit, relaxed })
             try { emulator.stop(); } catch(e) {}
             const cpu = emulator.v86.cpu;
             resolve({ status, eax: cpu.reg32[0]>>>0, ebx: cpu.reg32[3]>>>0,
-                      ecx: cpu.reg32[1]>>>0 });
+                      ecx: cpu.reg32[1]>>>0,
+                      hit: Number(cpu.wm.exports.profiler_fpu_relaxed_hit_get?.() ?? 0) });
         };
         emulator.bus.register("cpu-event-halt", () => finish("halt"));
         emulator.add_listener("emulator-loaded", () => {
@@ -359,6 +371,8 @@ function run_cw(kind, cw, { jit, relaxed })
             cpu.reboot_internal(); cpu.reset_memory();
             cpu.load_multiboot(img.buffer);
             setRelaxed(relaxed ? 1 : 0);
+            cpu.wm.exports.set_fpu_relaxed_stats?.(1);
+            cpu.wm.exports.profiler_init?.();
             cpu.io.register_write(CW_PORT, cpu, () => {
                 new DataView(cpu.wasm_memory.buffer).setUint16(CW_ADDR, cw, true);
             });
@@ -387,7 +401,7 @@ for(const jit of [false, true]) {
 }
 
 // PC=00 (24-bit single) arrives the same way. Both strict and relaxed modes must round
-// arithmetic results to f32; relaxed mode removes F80 representation overhead, not the
+// arithmetic results to a 24-bit significand; relaxed mode removes representation overhead, not the
 // architectural precision-control contract (see softfloat apply_precision).
 for(const relaxed of [false, true])
 for(const jit of [false, true]) {
@@ -400,6 +414,17 @@ for(const jit of [false, true]) {
                 `cw=${r.ecx.toString(16)} ${okCw?"OK":"<<< SETUP INVALID (want 007f)"}`,
                 `1/3=${hex(r.eax)}:${hex(r.ebx)}`,
                 okDiv ? "OK" : `<<< BAD (want ${hex(f64hi(want))}:${hex(f64lo(want))})`);
+}
+
+// PC controls significand width, not the x87 register exponent range.
+for(const relaxed of [false, true])
+for(const jit of [false, true])
+for(const [kind, want] of [["pc-wide", (2 - 2 ** -23) * 2 ** 159], ["pc-tiny", 2 ** -158], ["pc-cancel", 1]]) {
+    const r = await run_cw(kind, 0x007F, { jit, relaxed });
+    const ok = r.status === "halt" && r.ecx === 0x007F && r.eax === f64hi(want) && r.ebx === f64lo(want)
+        && (!(jit && relaxed) || r.hit > 0);
+    if(!ok) fail = true;
+    console.log("PC24 exponent", kind, {relaxed,jit,hit:r.hit}, ok ? "OK" : "BAD", hex(r.eax), hex(r.ebx));
 }
 
 console.log(fail ? "VERDICT: FAIL" : "VERDICT: all OK");
