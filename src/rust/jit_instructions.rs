@@ -4725,12 +4725,22 @@ fn gen_indirect_call32(ctx: &mut JitContext, new_eip: WasmLocal) {
         ctx.builder
             .load_fixed_i32(crate::jit::wbuf_intrinsic_enabled_ptr());
         ctx.builder.if_void();
+        let (min_ptr, max_ptr) = if crate::jit::wbuf_full_range_enabled() {
+            (
+                crate::jit::wbuf_intrinsic_min_target_ptr(),
+                crate::jit::wbuf_intrinsic_max_target_ptr(),
+            )
+        }
+        else {
+            (
+                crate::jit::wbuf_intrinsic_hot_min_target_ptr(),
+                crate::jit::wbuf_intrinsic_hot_max_target_ptr(),
+            )
+        };
         ctx.builder.get_local(&new_eip);
-        ctx.builder
-            .load_fixed_i32(crate::jit::wbuf_intrinsic_hot_min_target_ptr());
+        ctx.builder.load_fixed_i32(min_ptr);
         ctx.builder.geu_i32();
-        ctx.builder
-            .load_fixed_i32(crate::jit::wbuf_intrinsic_hot_max_target_ptr());
+        ctx.builder.load_fixed_i32(max_ptr);
         ctx.builder.get_local(&new_eip);
         ctx.builder.geu_i32();
         ctx.builder.and_i32();
@@ -4820,11 +4830,87 @@ pub fn instr16_FF_4_reg_jit(ctx: &mut JitContext, r: u32) {
         .store_aligned_i32(global_pointers::instruction_pointer as u32);
 }
 pub fn instr32_FF_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
-    ctx.builder.const_i32(0);
+    if !crate::jit::wbuf_tail_jmp_enabled() {
+        ctx.builder.const_i32(0);
+        codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+        codegen::gen_add_cs_offset(ctx);
+        ctx.builder
+            .store_aligned_i32(global_pointers::instruction_pointer as u32);
+        return;
+    }
     codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
     codegen::gen_add_cs_offset(ctx);
-    ctx.builder
-        .store_aligned_i32(global_pointers::instruction_pointer as u32);
+    let new_eip = ctx.builder.set_new_local();
+    gen_indirect_jump32(ctx, new_eip);
+}
+
+/// `JMP m32` with set_jit_wbuf_tail_jmp: the import-thunk tail of `call rel32; jmp [IAT]`.
+/// Guarded by the whole registry, since thunk-called stubs (OpenGL and the like) are not hot
+/// slots. A hit leaves the stack as the stub's `RET N` would; a miss is the plain JMP.
+fn gen_indirect_jump32(ctx: &mut JitContext, new_eip: WasmLocal) {
+    if ctx.cpu.ssize_32() {
+        ctx.builder.const_i32(-1);
+        let cleanup = ctx.builder.set_new_local();
+
+        ctx.builder
+            .load_fixed_i32(crate::jit::wbuf_intrinsic_enabled_ptr());
+        ctx.builder.if_void();
+        ctx.builder.get_local(&new_eip);
+        ctx.builder
+            .load_fixed_i32(crate::jit::wbuf_intrinsic_min_target_ptr());
+        ctx.builder.geu_i32();
+        ctx.builder
+            .load_fixed_i32(crate::jit::wbuf_intrinsic_max_target_ptr());
+        ctx.builder.get_local(&new_eip);
+        ctx.builder.geu_i32();
+        ctx.builder.and_i32();
+        ctx.builder.if_void();
+        ctx.builder.get_local(&new_eip);
+        codegen::gen_get_reg32(ctx, regs::ESP);
+        ctx.builder
+            .load_fixed_i32(global_pointers::get_seg_offset(regs::SS));
+        ctx.builder.add_i32();
+        ctx.builder.call_fn2_ret("jit_wbuf_intrinsic_execute_tail");
+        ctx.builder.set_local(&cleanup);
+        ctx.builder.block_end();
+        ctx.builder.block_end();
+
+        ctx.builder.get_local(&cleanup);
+        ctx.builder.const_i32(0);
+        ctx.builder.ge_i32();
+        ctx.builder.if_void();
+
+        ctx.builder.const_i32(0);
+        codegen::gen_set_reg32(ctx, regs::EAX);
+        ctx.builder.const_i32(0xB077);
+        codegen::gen_set_reg32(ctx, regs::EDX);
+
+        ctx.builder.const_i32(0);
+        codegen::gen_pop32s(ctx);
+        codegen::gen_add_cs_offset(ctx);
+        ctx.builder
+            .store_aligned_i32(global_pointers::instruction_pointer as u32);
+
+        codegen::gen_get_reg32(ctx, regs::ESP);
+        ctx.builder.get_local(&cleanup);
+        ctx.builder.add_i32();
+        codegen::gen_set_reg32(ctx, regs::ESP);
+
+        ctx.builder.else_();
+        ctx.builder.const_i32(0);
+        ctx.builder.get_local(&new_eip);
+        ctx.builder
+            .store_aligned_i32(global_pointers::instruction_pointer as u32);
+        ctx.builder.block_end();
+        ctx.builder.free_local(cleanup);
+    }
+    else {
+        ctx.builder.const_i32(0);
+        ctx.builder.get_local(&new_eip);
+        ctx.builder
+            .store_aligned_i32(global_pointers::instruction_pointer as u32);
+    }
+    ctx.builder.free_local(new_eip);
 }
 pub fn instr32_FF_4_reg_jit(ctx: &mut JitContext, r: u32) {
     ctx.builder.const_i32(0);
