@@ -68,6 +68,13 @@ impl FunctionType {
 }
 
 pub const WASM_MODULE_ARGUMENT_COUNT: u8 = 1;
+pub const CHAIN_ARG_COUNT: u8 = 14;
+
+pub fn chain_type_index() -> u8 { FunctionType::to_u8(FunctionType::LAST) + 1 }
+
+/// Index of the chain function `g` among the module's functions when it imports `imports`
+/// functions; the dispatcher entry `f` is the next one.
+pub fn chain_function_index(imports: u16) -> u16 { imports }
 
 // Wasm branch hinting (finished proposal, core 3.0): a custom section named
 // "metadata.code.branch_hint" annotates `if`/`br_if` instructions with the expected
@@ -154,6 +161,13 @@ pub struct WasmBuilder {
     /// Guard-group recording (codegen::gg_*, analysis::gg_plan). Inactive unless the JIT
     /// switch is on for the module being compiled; while inactive nothing below is touched.
     pub gg: GgBuilderState,
+
+    /// Function-unit chain layout: the body is `g` (14 parameters, 15 results) and `f`, the
+    /// dispatcher entry, follows it. Off for every other module, whose bytes do not change.
+    chain: bool,
+    arg_count: u8,
+    chain_entry_body: Vec<u8>,
+    chain_entry_call_at: usize,
 }
 
 pub struct GgBuilderState {
@@ -324,6 +338,8 @@ impl WasmLocal {
     /// Unsafe: Can result in multiple free's. Should only be used for locals that are used during
     /// the whole module (for example, registers)
     pub fn unsafe_clone(&self) -> WasmLocal { WasmLocal(self.0) }
+    /// The page module's single parameter, the dispatcher's initial state.
+    pub fn param0() -> WasmLocal { WasmLocal(0) }
 }
 
 pub struct WasmLocalI64(u8);
@@ -373,6 +389,10 @@ impl WasmBuilder {
             branch_hint_offset_fuzz: 0,
             function_name: Vec::new(),
             gg: GgBuilderState::new(),
+            chain: false,
+            arg_count: WASM_MODULE_ARGUMENT_COUNT,
+            chain_entry_body: Vec::new(),
+            chain_entry_call_at: 0,
         };
         b.init();
         b
@@ -394,6 +414,31 @@ impl WasmBuilder {
         self.initial_static_size = self.output.len();
     }
 
+    /// Switches between the page-module layout and the function-unit chain layout. The type
+    /// section is part of the static prefix, so a switch rebuilds it.
+    pub fn set_chain_layout(&mut self, on: bool) {
+        if self.chain != on {
+            self.chain = on;
+            self.output.clear();
+            self.init();
+        }
+        self.arg_count = if on { CHAIN_ARG_COUNT } else { WASM_MODULE_ARGUMENT_COUNT };
+    }
+
+    /// The dispatcher entry `f` of a chain module: a complete function body (locals and code)
+    /// whose `call` of `g` has a two-byte index at `call_at`, patched in finish().
+    pub fn set_chain_entry_body(&mut self, body: &[u8], call_at: usize) {
+        self.chain_entry_body.clear();
+        self.chain_entry_body.extend_from_slice(body);
+        self.chain_entry_call_at = call_at;
+    }
+
+    /// Parameter `i` of the chain function `g`.
+    pub fn chain_param(&self, i: u8) -> WasmLocal {
+        dbg_assert!(self.chain && i < CHAIN_ARG_COUNT);
+        WasmLocal(i)
+    }
+
     pub fn reset(&mut self) {
         self.output.drain(self.initial_static_size..);
         self.set_import_table_size(2);
@@ -408,6 +453,7 @@ impl WasmBuilder {
         self.flag_dirty = 0;
         self.branch_hints.clear();
         self.function_name.clear();
+        self.chain_entry_body.clear();
 
         dbg_assert!(self.label_to_depth.is_empty());
         dbg_assert!(self.label_stack.is_empty());
@@ -433,8 +479,9 @@ impl WasmBuilder {
         let free_locals_i32 = &self.free_locals_i32;
         let free_locals_i64 = &self.free_locals_i64;
 
+        let arg_count = self.arg_count;
         let locals = (0..self.local_count).map(|i| {
-            let local_index = WASM_MODULE_ARGUMENT_COUNT + i;
+            let local_index = arg_count + i;
             if free_locals_i64.iter().any(|v| v.idx() == local_index) {
                 op::TYPE_I64
             }
@@ -470,7 +517,7 @@ impl WasmBuilder {
         self.output.push(0);
         self.output.push(0);
 
-        self.output.push(1); // number of function bodies: just 1
+        self.output.push(if self.chain { 2 } else { 1 }); // number of function bodies
 
         // same as above but for body size of the function
         let idx_fn_body_size = self.output.len();
@@ -494,6 +541,15 @@ impl WasmBuilder {
         // value because the ptr itself points to four bytes
         let fn_body_size = (self.output.len() - idx_fn_body_size - 4) as u32;
         write_fixed_leb32_at_idx(&mut self.output, idx_fn_body_size, fn_body_size);
+
+        if self.chain {
+            dbg_assert!(!self.chain_entry_body.is_empty());
+            write_leb_u32(&mut self.output, self.chain_entry_body.len() as u32);
+            let mut body = std::mem::take(&mut self.chain_entry_body);
+            write_fixed_leb16_at_idx(&mut body, self.chain_entry_call_at, chain_function_index(self.function_import_count));
+            self.output.extend(&body);
+            self.chain_entry_body = body;
+        }
 
         let code_section_size = (self.output.len() - idx_code_section_size - 4) as u32;
         write_fixed_leb32_at_idx(&mut self.output, idx_code_section_size, code_section_size);
@@ -589,8 +645,8 @@ impl WasmBuilder {
         self.output.push(0);
 
         let nr_of_function_types = FunctionType::to_u8(FunctionType::LAST) + 1;
-        dbg_assert!(nr_of_function_types < 128);
-        self.output.push(nr_of_function_types);
+        dbg_assert!(nr_of_function_types < 127);
+        self.output.push(nr_of_function_types + self.chain as u8);
 
         for i in 0..(nr_of_function_types) {
             match FunctionType::of_u8(i) {
@@ -751,6 +807,17 @@ impl WasmBuilder {
                 },
             }
         }
+        if self.chain {
+            self.output.push(op::TYPE_FUNC);
+            self.output.push(CHAIN_ARG_COUNT);
+            for _ in 0..CHAIN_ARG_COUNT {
+                self.output.push(op::TYPE_I32);
+            }
+            self.output.push(CHAIN_ARG_COUNT + 1);
+            for _ in 0..CHAIN_ARG_COUNT + 1 {
+                self.output.push(op::TYPE_I32);
+            }
+        }
 
         let new_len = self.output.len();
         let size = (new_len - 2) - idx_section_size;
@@ -867,12 +934,34 @@ impl WasmBuilder {
 
     pub fn write_function_section(&mut self) {
         self.output.push(op::SC_FUNCTION);
+        if self.chain {
+            self.output.push(3);
+            self.output.push(2);
+            self.output.push(chain_type_index());
+            self.output.push(FunctionType::FN1.to_u8());
+            return;
+        }
         self.output.push(2); // length of this section
         self.output.push(1); // count of signature indices
         self.output.push(FunctionType::FN1.to_u8());
     }
 
     pub fn write_export_section(&mut self) {
+        if self.chain {
+            self.output.push(op::SC_EXPORT);
+            self.output.push(1 + 2 * 5);
+            self.output.push(2);
+            for (name, index) in [(b'f', self.function_import_count + 1), (b'g', self.function_import_count)] {
+                self.output.push(1);
+                self.output.push(name);
+                self.output.push(op::EXT_FUNCTION);
+                let at = self.output.len();
+                self.output.push(0);
+                self.output.push(0);
+                write_fixed_leb16_at_idx(&mut self.output, at, index);
+            }
+            return;
+        }
         self.output.push(op::SC_EXPORT);
         self.output.push(1 + 1 + 1 + 1 + 2); // size of this section
         self.output.push(1); // count of table: just one function exported
@@ -922,7 +1011,7 @@ impl WasmBuilder {
         match self.free_locals_i32.pop() {
             Some(local) => local,
             None => {
-                let new_idx = self.local_count + WASM_MODULE_ARGUMENT_COUNT;
+                let new_idx = self.local_count + self.arg_count;
                 self.local_count = self.local_count.checked_add(1).unwrap();
                 WasmLocal(new_idx)
             },
@@ -930,7 +1019,7 @@ impl WasmBuilder {
     }
     pub fn free_local(&mut self, local: WasmLocal) {
         dbg_assert!(
-            (WASM_MODULE_ARGUMENT_COUNT..self.local_count + WASM_MODULE_ARGUMENT_COUNT)
+            (self.arg_count..self.local_count + self.arg_count)
                 .contains(&local.0)
         );
         self.free_locals_i32.push(local)
@@ -992,7 +1081,7 @@ impl WasmBuilder {
         match self.free_locals_i64.pop() {
             Some(local) => local,
             None => {
-                let new_idx = self.local_count + WASM_MODULE_ARGUMENT_COUNT;
+                let new_idx = self.local_count + self.arg_count;
                 self.local_count += 1;
                 WasmLocalI64(new_idx)
             },
@@ -1000,7 +1089,7 @@ impl WasmBuilder {
     }
     pub fn free_local_i64(&mut self, local: WasmLocalI64) {
         dbg_assert!(
-            (WASM_MODULE_ARGUMENT_COUNT..self.local_count + WASM_MODULE_ARGUMENT_COUNT)
+            (self.arg_count..self.local_count + self.arg_count)
                 .contains(&local.0)
         );
         self.free_locals_i64.push(local)
@@ -1431,8 +1520,38 @@ impl WasmBuilder {
 
     pub fn return_(&mut self) {
         self.flag_boundary();
+        if self.chain {
+            self.push_chain_exited();
+        }
         self.instruction_body.push(op::OP_RETURN);
     }
+
+    /// The chain function's EXITED result: outcome 1 and fourteen undefined values.
+    pub fn push_chain_exited(&mut self) {
+        self.const_i32(1);
+        for _ in 0..CHAIN_ARG_COUNT {
+            self.const_i32(0);
+        }
+    }
+
+    /// `return` with the fifteen results already on the stack.
+    pub fn return_values(&mut self) {
+        dbg_assert!(self.chain);
+        self.flag_boundary();
+        self.instruction_body.push(op::OP_RETURN);
+    }
+
+    /// call_indirect of a unit's chain function; the table position is on top of the stack.
+    pub fn call_indirect_chain(&mut self) {
+        dbg_assert!(self.chain);
+        self.import_indirect_function_table = true;
+        self.instruction_body.push(op::OP_CALLINDIRECT);
+        self.instruction_body.push(chain_type_index());
+        self.instruction_body.push(0);
+    }
+
+    /// Every flag local may now differ from memory.
+    pub fn flag_mark_all_dirty(&mut self) { self.flag_boundary(); }
 
     #[allow(dead_code)]
     pub fn drop_(&mut self) { self.instruction_body.push(op::OP_DROP); }

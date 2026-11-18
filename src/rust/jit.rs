@@ -2603,8 +2603,18 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
     let used = HashSet::from_iter(ctx.pages.values().map(|info| info.wasm_table_index));
     let compiling = HashSet::from_iter(ctx.compiling.as_ref().map(|&(index, _)| index));
     let staged = HashSet::from_iter(ctx.aot_staged.as_ref().map(|tx| tx.wasm_table_index));
-    let units: HashSet<WasmTableIndex> = ctx.fn_unit.units.values().map(|u| u.index).collect();
-    dbg_assert!(units.len() == ctx.fn_unit.units.len());
+    let units: HashSet<WasmTableIndex> = ctx
+        .fn_unit
+        .units
+        .values()
+        .flat_map(|u| std::iter::once(u.index).chain(u.chain))
+        .chain(ctx.fn_unit.pending.as_ref().and_then(|p| p.chain))
+        .collect();
+    dbg_assert!(
+        units.len()
+            == ctx.fn_unit.units.values().map(|u| 1 + u.chain.is_some() as usize).sum::<usize>()
+                + ctx.fn_unit.pending.as_ref().map_or(0, |p| p.chain.is_some() as usize)
+    );
     dbg_assert!(free.intersection(&units).next().is_none());
     dbg_assert!(used.intersection(&units).next().is_none());
     dbg_assert!(compiling.intersection(&units).next().is_none());
@@ -2867,6 +2877,7 @@ pub struct JitContext<'a> {
     /// silently mutate the FPU stack / shift TOP behind stale cached values.
     pub x87_cache_kept: bool,
     pub gg: codegen::GgCtx<'a>,
+    pub unit_chain: Option<UnitChainLocals>,
 }
 
 pub struct X87LocalCacheSlot {
@@ -3501,6 +3512,25 @@ fn unit_walk_pages() -> Option<&'static HashSet<Page, FixedHasher>> {
     unsafe { (*std::ptr::addr_of!(UNIT_WALK_PAGES)).as_ref() }
 }
 
+/// Set only while a function unit is emitted in the chain layout (fn_unit.rs, chained calls).
+pub struct UnitChainCompile {
+    pub sites: HashMap<u32, crate::fn_unit::ChainSite, FixedHasher>,
+    pub entry_phys: u32,
+    pub own_slot: u16,
+    pub own_token: u32,
+    pub mode: u32,
+}
+static mut UNIT_CHAIN: Option<UnitChainCompile> = None;
+pub fn unit_chain() -> Option<&'static UnitChainCompile> {
+    unsafe { (*std::ptr::addr_of!(UNIT_CHAIN)).as_ref() }
+}
+
+/// Locals of a chain-layout unit: the live budget and the ESP the unit was entered with.
+pub struct UnitChainLocals {
+    pub budget: WasmLocal,
+    pub esp_entry: WasmLocal,
+}
+
 fn jit_find_basic_blocks(
     ctx: &mut JitState,
     entry_points: HashSet<i32>,
@@ -3871,6 +3901,22 @@ fn jit_find_basic_blocks(
                         to_visit_stack.push(current_virt_addr);
                     }
 
+                    if has_next_instruction
+                        && unit_chain().map_or(false, |c| c.sites.contains_key(&addr_before_instruction))
+                    {
+                        current_block.ty = BasicBlockType::Normal {
+                            next_block_addr: if !next_on_page || !tails && is_near_end_of_page(current_address) {
+                                None
+                            }
+                            else {
+                                Some(current_address)
+                            },
+                            jump_offset: 0,
+                            jump_offset_is_32: true,
+                        };
+                        break;
+                    }
+
                     current_block.ty = BasicBlockType::Normal {
                         next_block_addr: follow_jump(
                             jump_target,
@@ -4179,7 +4225,9 @@ fn jit_find_basic_blocks(
 
     let basic_blocks: Vec<BasicBlock> = basic_blocks.into_iter().map(|(_, block)| block).collect();
 
-    for i in 0..basic_blocks.len() - 1 {
+    // Empty when a function unit's only entry lies in the last bytes of its page without page
+    // tails; fn_unit_compile then refuses the shape.
+    for i in 0..basic_blocks.len().saturating_sub(1) {
         let next_block_addr = basic_blocks[i + 1].addr;
         let next_block_end_addr = basic_blocks[i + 1].end_addr;
         let next_block_is_entry = basic_blocks[i + 1].is_entry_block;
@@ -4571,7 +4619,9 @@ pub fn codegen_finalize_failed(
         let (pending_wasm_table_index, state) = ctx.compiling.take().unwrap();
         dbg_assert!(pending_wasm_table_index == wasm_table_index);
         if let CompilingPageState::Unit = state {
-            ctx.fn_unit.pending = None;
+            if let Some(c) = ctx.fn_unit.pending.take().and_then(|p| p.chain) {
+                free_wasm_table_index(&mut ctx, c);
+            }
             crate::fn_unit::stat_add(crate::fn_unit::S_COMPILE_FAILED, 1.0);
         }
         free_wasm_table_index(&mut ctx, pending_wasm_table_index);
@@ -5409,14 +5459,26 @@ fn jit_generate_module(
     gg_mode: codegen::GgMode,
     gg_plan: Option<&analysis::GgPlan>,
 ) -> (Vec<(u32, u16)>, bool) {
+    let chain = if unit_walk_pages().is_some() { unit_chain() } else { None };
+    builder.set_chain_layout(chain.is_some());
     builder.reset();
     jit_block_map::begin_module();
     builder.branch_hint_mask = branch_hint_mask();
     builder.branch_hint_offset_fuzz = unsafe { JIT_BRANCH_HINT_OFFSET_FUZZ };
+    if chain.is_some() {
+        let (body, call_at) = unit_chain_entry_body();
+        builder.set_chain_entry_body(&body, call_at);
+    }
 
     let mut register_locals: Vec<WasmLocal> = (0..8)
         .map(|i| {
-            builder.load_fixed_i32(global_pointers::get_reg32_offset(i));
+            if chain.is_some() {
+                let p = builder.chain_param(i as u8);
+                builder.get_local(&p);
+            }
+            else {
+                builder.load_fixed_i32(global_pointers::get_reg32_offset(i));
+            }
             builder.set_new_local()
         })
         .collect();
@@ -5453,7 +5515,7 @@ fn jit_generate_module(
     // Flag-locals (idx 21): lazy-flag tuple lives in wasm locals for the whole
     // module — initialized from the memory globals here, spilled back at every
     // exit epilogue and around every non-whitelisted helper call (builder funnel).
-    if flag_locals_enabled() {
+    if flag_locals_enabled() || chain.is_some() {
         let addrs: [u32; 5] = [
             global_pointers::last_op1 as u32,
             global_pointers::last_result as u32,
@@ -5463,20 +5525,55 @@ fn jit_generate_module(
         ];
         let mut locals = [(0u8, 0u32); 5];
         for (i, &addr) in addrs.iter().enumerate() {
-            builder.load_fixed_i32(addr);
+            if chain.is_some() {
+                let p = builder.chain_param(8 + CHAIN_FLAG_SLOT_OF_ABI.iter().position(|&x| x == i).unwrap() as u8);
+                builder.get_local(&p);
+            }
+            else {
+                builder.load_fixed_i32(addr);
+            }
             let l = builder.set_new_local();
             locals[i] = (l.idx(), addr);
             std::mem::forget(l); // whole-module lifetime; freed via free_flag_locals
         }
         builder.flag_locals = Some(locals);
+        if chain.is_some() {
+            builder.flag_mark_all_dirty();
+        }
     }
+
+    let unit_chain_locals = match chain {
+        Some(c) => {
+            let p = builder.chain_param(13);
+            builder.get_local(&p);
+            let budget = builder.set_new_local();
+            let p = builder.chain_param(crate::regs::ESP as u8);
+            builder.get_local(&p);
+            let esp_entry = builder.set_new_local();
+            let entry_index = structure_entry_blocks(&structure)
+                .iter()
+                .position(|&a| a == c.entry_phys)
+                .expect("unit entry is a dispatcher entry");
+            builder.const_i32(entry_index as i32);
+            let state = builder.set_new_local();
+            builder.arg_local_initial_state = state;
+            Some(UnitChainLocals { budget, esp_entry })
+        },
+        None => {
+            builder.arg_local_initial_state = WasmLocal::param0();
+            None
+        },
+    };
 
     let exit_label = builder.block_void();
     let exit_with_fault_label = builder.block_void();
     let main_loop_label = builder.loop_void();
     if unsafe { JIT_USE_LOOP_SAFETY } {
         builder.get_local(&instruction_counter);
-        builder.const_i32(cpu::LOOP_COUNTER);
+        match &unit_chain_locals {
+            Some(l) => builder.get_local(&l.budget),
+            None => builder.const_i32(cpu::LOOP_COUNTER),
+        }
         builder.geu_i32();
         if cfg!(feature = "profiler") || exit_site_sampling_enabled() {
             builder.if_void();
@@ -5513,6 +5610,7 @@ fn jit_generate_module(
         fpu_pc_cache_kept: false,
         x87_cache_kept: false,
         gg,
+        unit_chain: unit_chain_locals,
     };
 
     let entry_blocks = {
@@ -6340,7 +6438,10 @@ fn jit_generate_module(
                     codegen::gen_profiler_stat_increment(ctx.builder, stat::LOOP_SAFETY);
                     if unsafe { JIT_USE_LOOP_SAFETY } {
                         ctx.builder.get_local(&ctx.instruction_counter);
-                        ctx.builder.const_i32(cpu::LOOP_COUNTER);
+                        match &ctx.unit_chain {
+                            Some(l) => ctx.builder.get_local(&l.budget),
+                            None => ctx.builder.const_i32(cpu::LOOP_COUNTER),
+                        }
                         ctx.builder.geu_i32();
                         if cfg!(feature = "profiler") || exit_site_sampling_enabled() {
                             ctx.builder.if_void();
@@ -6474,8 +6575,17 @@ fn jit_generate_module(
         codegen::gen_move_registers_from_locals_to_memory(ctx);
         gen_tier2_note_retired(ctx);
         codegen::gen_update_instruction_counter(ctx);
+        if ctx.unit_chain.is_some() {
+            ctx.builder.push_chain_exited();
+        }
     }
 
+    if let Some(l) = ctx.unit_chain.take() {
+        ctx.builder.free_local(l.budget);
+        ctx.builder.free_local(l.esp_entry);
+        let state = std::mem::replace(&mut ctx.builder.arg_local_initial_state, WasmLocal::param0());
+        ctx.builder.free_local(state);
+    }
     for local in ctx.register_locals.drain(..) {
         ctx.builder.free_local(local);
     }
@@ -7580,6 +7690,7 @@ pub struct FnUnitEntry {
     pub ret_addr: u32,
     pub esp: u32,
     pub ret_imm: u32,
+    pub chain: bool,
 }
 
 fn fn_unit_free(ctx: &mut JitState, indices: Vec<WasmTableIndex>) {
@@ -7643,6 +7754,36 @@ fn fn_unit_compile(
     let allowed: HashSet<Page, FixedHasher> = cand.pages.iter().copied().collect();
     let cpu = CpuContext { eip: 0, prefixes: 0, cs_offset: cpu::get_seg_cs() as u32, state_flags };
 
+    // Chain layout: two table slots (the dispatcher entry and the chain function) and a token
+    // reserved now, so the unit's own calls to itself and its caller-token check can name them.
+    let chain_compile = if chain_mode() != 0 && ctx.wasm_table_index_free_list.len() >= 2 {
+        let n = ctx.wasm_table_index_free_list.len();
+        let own_slot = ctx.wasm_table_index_free_list[n - 1];
+        let own_chain = ctx.wasm_table_index_free_list[n - 2];
+        let token = next_token();
+        let (sites, callees, waiting) =
+            unit_chain_sites(ctx, virt, cand.phys, state_flags, own_chain.to_u16(), own_slot.to_u16(), token);
+        let mut links: Vec<u32> = sites.values().map(|s| s.target).collect();
+        links.sort_unstable();
+        links.dedup();
+        unsafe {
+            UNIT_CHAIN = Some(UnitChainCompile {
+                sites,
+                entry_phys: cand.phys,
+                own_slot: own_slot.to_u16(),
+                own_token: token,
+                mode: chain_mode(),
+            })
+        };
+        Some((token, callees, waiting, links))
+    }
+    else if chain_mode() != 0 {
+        return Err(S_DEFERRED_BUSY);
+    }
+    else {
+        None
+    };
+
     unsafe { UNIT_WALK_PAGES = Some(allowed) };
     let mut entry = HashSet::new();
     entry.insert(virt as i32);
@@ -7653,7 +7794,10 @@ fn fn_unit_compile(
     let mut stack = match by_addr.get(&cand.phys) {
         Some(&i) => vec![i],
         None => {
-            unsafe { UNIT_WALK_PAGES = None };
+            unsafe {
+                UNIT_WALK_PAGES = None;
+                UNIT_CHAIN = None;
+            }
             return Err(S_REFUSE_SHAPE);
         },
     };
@@ -7679,7 +7823,10 @@ fn fn_unit_compile(
     let mut kept: Vec<BasicBlock> = blocks.into_iter().zip(keep).filter(|(_, k)| *k).map(|(b, _)| b).collect();
     let inside = |b: &BasicBlock| cand.runs.iter().any(|&(s, e)| s <= b.addr && b.end_addr <= e);
     if !kept.iter().all(|b| inside(b) && b.indirect_local_dispatch.is_empty() && b.ret_speculation.is_empty()) {
-        unsafe { UNIT_WALK_PAGES = None };
+        unsafe {
+            UNIT_WALK_PAGES = None;
+            UNIT_CHAIN = None;
+        }
         return Err(S_REFUSE_SHAPE);
     }
     let known: HashSet<u32> = kept.iter().map(|b| b.addr).collect();
@@ -7705,8 +7852,11 @@ fn fn_unit_compile(
         }
     }
 
-    if ctx.wasm_table_index_free_list.is_empty() {
-        unsafe { UNIT_WALK_PAGES = None };
+    if ctx.wasm_table_index_free_list.len() < 1 + chain_compile.is_some() as usize {
+        unsafe {
+            UNIT_WALK_PAGES = None;
+            UNIT_CHAIN = None;
+        }
         return Err(S_DEFERRED_BUSY);
     }
 
@@ -7715,6 +7865,7 @@ fn fn_unit_compile(
     control_flow::blockify(&mut structure, &graph);
 
     let wasm_table_index = ctx.wasm_table_index_free_list.pop().expect("unit table index");
+    let chain_slot = chain_compile.as_ref().map(|_| ctx.wasm_table_index_free_list.pop().expect("unit chain slot"));
     let by_addr: HashMap<u32, BasicBlock> = kept.into_iter().map(|b| (b.addr, b)).collect();
     let entries = jit_generate_module(
         structure,
@@ -7727,12 +7878,19 @@ fn fn_unit_compile(
         None,
     )
     .0;
-    unsafe { UNIT_WALK_PAGES = None };
+    unsafe {
+        UNIT_WALK_PAGES = None;
+        UNIT_CHAIN = None;
+    }
 
     let state = match entries.iter().find(|&&(a, _)| a == cand.phys) {
         Some(&(_, s)) => s,
         None => {
             free_wasm_table_index(ctx, wasm_table_index);
+            if let Some(c) = chain_slot {
+                free_wasm_table_index(ctx, c);
+            }
+            ctx.wasm_builder.set_chain_layout(false);
             return Err(S_REFUSE_SHAPE);
         },
     };
@@ -7744,6 +7902,7 @@ fn fn_unit_compile(
     cpu::tlb_set_has_code_multiple(&pages, true);
     ctx.fn_unit.track_pages(virt, &page_list);
     let generation = ctx.fn_unit.generation(virt);
+    let (token, callees, waiting_on, links) = chain_compile.unwrap_or((0, Vec::new(), Vec::new(), Vec::new()));
     ctx.fn_unit.pending = Some(Pending {
         virt,
         phys: cand.phys,
@@ -7752,6 +7911,11 @@ fn fn_unit_compile(
         state_flags,
         pages: page_list,
         ret_imm: cand.ret_summary & 0xFFFF,
+        chain: chain_slot,
+        token,
+        callees,
+        waiting_on,
+        links,
     });
     ctx.compiling = Some((wasm_table_index, CompilingPageState::Unit));
     stat_add(S_COMPILES, 1.0);
@@ -7763,6 +7927,7 @@ fn fn_unit_compile(
         ctx.wasm_builder.get_output_ptr() as u32,
         ctx.wasm_builder.get_output_len(),
     );
+    ctx.wasm_builder.set_chain_layout(false);
     Ok(())
 }
 
@@ -7778,9 +7943,39 @@ fn fn_unit_finished(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
     if p.generation != ctx.fn_unit.generation(p.virt) && !mutation(M_NO_GENERATION_CHECK) {
         stat_add(S_WRITTEN_DURING_COMPILE, 1.0);
         free_wasm_table_index(ctx, wasm_table_index);
+        if let Some(c) = p.chain {
+            free_wasm_table_index(ctx, c);
+        }
+        return;
+    }
+    if p.callees.iter().any(|&(_, slot, token)| token_of(slot) != token) {
+        stat_add(S_CHAIN_STALE_PUBLISH, 1.0);
+        free_wasm_table_index(ctx, wasm_table_index);
+        if let Some(c) = p.chain {
+            free_wasm_table_index(ctx, c);
+        }
         return;
     }
     stat_add(S_PUBLISHED, 1.0);
+    let mut freed = Vec::new();
+    if let Some(old) = ctx.fn_unit.units.get(&p.virt).map(|_| p.virt) {
+        ctx.fn_unit.drop_unit(old, &mut freed);
+    }
+    if p.chain.is_some() {
+        set_token(wasm_table_index, p.token);
+        for &(callee, _, _) in &p.callees {
+            let deps = ctx.fn_unit.dependants.entry(callee).or_insert_with(Vec::new);
+            if !deps.contains(&p.virt) {
+                deps.push(p.virt);
+            }
+        }
+        for &target in &p.waiting_on {
+            let w = ctx.fn_unit.waiting.entry(target).or_insert_with(Vec::new);
+            if !w.contains(&p.virt) {
+                w.push(p.virt);
+            }
+        }
+    }
     ctx.fn_unit.units.insert(
         p.virt,
         Unit {
@@ -7791,8 +7986,22 @@ fn fn_unit_finished(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
             state_flags: p.state_flags,
             pages: p.pages,
             ret_imm: p.ret_imm,
+            chain: p.chain,
+            token: p.token,
+            links: p.links,
         },
     );
+    if p.chain.is_some() {
+        if let Some(callers) = ctx.fn_unit.waiting.remove(&p.virt) {
+            for caller in callers {
+                if caller != p.virt && ctx.fn_unit.units.contains_key(&caller) {
+                    stat_add(S_CHAIN_DROPPED, 1.0);
+                    ctx.fn_unit.drop_unit(caller, &mut freed);
+                }
+            }
+        }
+    }
+    fn_unit_free(ctx, freed);
 }
 
 fn fn_unit_maybe_compile(ctx: &mut JitState, virt: u32, state_flags: CachedStateFlags) {
@@ -7816,10 +8025,21 @@ fn fn_unit_maybe_compile(ctx: &mut JitState, virt: u32, state_flags: CachedState
         stat_add(S_REFUSE_STALE_ROW, 1.0);
         return;
     }
-    if !state_flags.is_32() || !state_flags.has_flat_segmentation() {
+    if !state_flags.is_32()
+        || !state_flags.has_flat_segmentation()
+        || !state_flags.ssize_32() && !mutation(M_ADMIT_SS16)
+    {
         return refuse(ctx, S_REFUSE_STATE);
     }
-    if cand.unit != 0 || cand.window != 0 {
+    let (unit_ok, window_ok) = {
+        use crate::fn_census::{U_GUEST_CALL, W_ESP_ALIGN, W_OUT_CALL};
+        let chain = chain_mode() != 0;
+        (
+            if chain { U_GUEST_CALL } else { 0 },
+            if chain { W_OUT_CALL } else { 0 } | if and_esp() { W_ESP_ALIGN } else { 0 },
+        )
+    };
+    if cand.unit & !unit_ok != 0 || cand.window & !window_ok != 0 {
         return refuse(ctx, S_REFUSE_NOT_M1);
     }
     if cand.ret_summary & RET_KNOWN == 0 || cand.ret_summary & RET_MIXED != 0 {
@@ -7849,8 +8069,8 @@ pub unsafe fn fn_unit_lookup(virt: u32, state_flags: CachedStateFlags) -> Option
         return None;
     }
     let mut ctx = get_jit_state();
-    let (phys, index, state, generation, flags, ret_imm) = match ctx.fn_unit.units.get(&virt) {
-        Some(u) => (u.phys, u.index, u.state, u.generation, u.state_flags, u.ret_imm),
+    let (phys, index, state, generation, flags, ret_imm, chain) = match ctx.fn_unit.units.get(&virt) {
+        Some(u) => (u.phys, u.index, u.state, u.generation, u.state_flags, u.ret_imm, u.chain.is_some()),
         None => {
             fn_unit_maybe_compile(&mut ctx, virt, state_flags);
             return None;
@@ -7858,8 +8078,9 @@ pub unsafe fn fn_unit_lookup(virt: u32, state_flags: CachedStateFlags) -> Option
     };
     if generation != ctx.fn_unit.generation(virt) && !mutation(M_NO_GENERATION_CHECK) {
         stat_add(S_SKIP_GENERATION, 1.0);
-        ctx.fn_unit.units.remove(&virt);
-        free_wasm_table_index(&mut ctx, index);
+        let mut freed = Vec::new();
+        ctx.fn_unit.drop_unit(virt, &mut freed);
+        fn_unit_free(&mut ctx, freed);
         return None;
     }
     if flags != state_flags {
@@ -7881,7 +8102,7 @@ pub unsafe fn fn_unit_lookup(virt: u32, state_flags: CachedStateFlags) -> Option
             return None;
         },
     };
-    Some(FnUnitEntry { index: index.to_u16(), state, ret_addr, esp, ret_imm })
+    Some(FnUnitEntry { index: index.to_u16(), state, ret_addr, esp, ret_imm, chain })
 }
 
 /// After the unit returned: MATCHED when its RET landed on the pushed return address with the
@@ -7890,6 +8111,7 @@ pub unsafe fn fn_unit_note_return(e: &FnUnitEntry, retired: u32) {
     use crate::fn_unit::*;
     stat_add(S_ENTRIES, 1.0);
     stat_add(S_INSNS, retired as f64);
+    stat_max(S_MAX_RETIRED, retired as f64);
     let expected_esp = e.esp.wrapping_add(4).wrapping_add(e.ret_imm);
     let matched = *global_pointers::instruction_pointer as u32 == e.ret_addr
         && cpu::read_reg32(crate::regs::ESP as i32) as u32 == expected_esp;
@@ -7903,4 +8125,582 @@ pub unsafe fn fn_unit_note_return(e: &FnUnitEntry, retired: u32) {
             cpu::write_reg32(crate::regs::ESP as i32, expected_esp as i32);
         }
     }
+}
+
+// ─── Function units: chained calls (fn_unit.rs, chain switch) ──────────────────
+
+/// Flag-local slot for each position of the ABI tuple (flags, flags_changed, last_op_size,
+/// last_op1, last_result); the slots are 0=last_op1 1=last_result 2=last_op_size
+/// 3=flags_changed 4=flags.
+pub const CHAIN_FLAG_SLOT_OF_ABI: [usize; 5] = [4, 3, 2, 0, 1];
+
+fn chain_flag_addrs() -> [u32; 5] {
+    [
+        global_pointers::flags as u32,
+        global_pointers::flags_changed as u32,
+        global_pointers::last_op_size as u32,
+        global_pointers::last_op1 as u32,
+        global_pointers::last_result as u32,
+    ]
+}
+
+/// Body of `f`, the dispatcher entry of a chain-layout unit. Parameter 0 is the return address
+/// the dispatcher read at entry. Loads the state, calls `g` with the entry budget the dispatcher
+/// computed from the live slice (at most the loop budget), and on
+/// MATCHED stores the returned state with EIP at that return address. EXITED left canonical
+/// state already.
+fn unit_chain_entry_body() -> (Vec<u8>, usize) {
+    use crate::leb::{write_leb_i32, write_leb_u32};
+    use crate::wasmgen::wasm_opcodes as op;
+    fn c(b: &mut Vec<u8>, v: i32) {
+        b.push(op::OP_I32CONST);
+        write_leb_i32(b, v);
+    }
+    fn ld(b: &mut Vec<u8>, off: u32) {
+        b.push(op::OP_I32LOAD);
+        b.push(op::MEM_ALIGN32);
+        write_leb_u32(b, off);
+    }
+    fn st(b: &mut Vec<u8>, off: u32) {
+        b.push(op::OP_I32STORE);
+        b.push(op::MEM_ALIGN32);
+        write_leb_u32(b, off);
+    }
+    fn get(b: &mut Vec<u8>, i: u8) { b.extend([op::OP_GETLOCAL, i]); }
+    fn set(b: &mut Vec<u8>, i: u8) { b.extend([op::OP_SETLOCAL, i]); }
+    const D: u8 = 16;
+    let depth = crate::fn_unit::depth_addr() as i32;
+    let flags = chain_flag_addrs();
+    let mut b = vec![1, D, op::TYPE_I32];
+    c(&mut b, depth);
+    ld(&mut b, 0);
+    b.extend([op::OP_TEELOCAL, D]);
+    c(&mut b, 2);
+    b.push(op::OP_I32SHL);
+    get(&mut b, 0);
+    st(&mut b, crate::fn_unit::ret_expect_addr());
+    c(&mut b, depth);
+    get(&mut b, D);
+    c(&mut b, 1);
+    b.push(op::OP_I32ADD);
+    st(&mut b, 0);
+    for r in 0..8 {
+        c(&mut b, global_pointers::get_reg32_offset(r) as i32);
+        ld(&mut b, 0);
+    }
+    for &a in &flags {
+        c(&mut b, a as i32);
+        ld(&mut b, 0);
+    }
+    if crate::fn_unit::mutation(crate::fn_unit::M_CHAIN_FIXED_BUDGET) {
+        c(&mut b, cpu::LOOP_COUNTER);
+    }
+    else {
+        c(&mut b, crate::fn_unit::entry_budget_addr() as i32);
+        ld(&mut b, 0);
+    }
+    b.push(op::OP_CALL);
+    let call_at = b.len();
+    b.extend([0, 0]);
+    for i in (1..=15).rev() {
+        set(&mut b, i);
+    }
+    c(&mut b, depth);
+    get(&mut b, D);
+    st(&mut b, 0);
+    get(&mut b, 1);
+    b.push(op::OP_I32EQZ);
+    b.extend([op::OP_IF, op::TYPE_VOID_BLOCK]);
+    for r in 0..8u8 {
+        c(&mut b, global_pointers::get_reg32_offset(r as u32) as i32);
+        get(&mut b, 2 + r);
+        st(&mut b, 0);
+    }
+    for (k, &a) in flags.iter().enumerate() {
+        c(&mut b, a as i32);
+        get(&mut b, 10 + k as u8);
+        st(&mut b, 0);
+    }
+    c(&mut b, global_pointers::instruction_pointer as i32);
+    get(&mut b, 0);
+    st(&mut b, 0);
+    b.push(op::OP_END);
+    b.push(op::OP_END);
+    (b, call_at)
+}
+
+fn chain_count(ctx: &mut JitContext, i: usize) {
+    if crate::fn_unit::chain_counting() {
+        let a = crate::fn_unit::counter_addr(i);
+        ctx.builder.const_i32(a as i32);
+        ctx.builder.load_fixed_i32(a);
+        ctx.builder.const_i32(1);
+        ctx.builder.add_i32();
+        ctx.builder.store_aligned_i32(0);
+    }
+}
+
+/// Branches to `label` when the i32 on the stack is non-zero, counting the reason.
+fn chain_br_if(ctx: &mut JitContext, label: Label, counter: usize) {
+    if crate::fn_unit::chain_counting() {
+        ctx.builder.if_void();
+        chain_count(ctx, counter);
+        ctx.builder.br(label);
+        ctx.builder.block_end();
+    }
+    else {
+        ctx.builder.br_if(label);
+    }
+}
+
+fn chain_free_caches(ctx: &mut JitContext) {
+    codegen::gen_x87_local_cache_free_all(ctx);
+    codegen::gen_push32_write_cache_free(ctx);
+    codegen::gen_read_tlb_cache_free(ctx);
+    codegen::gen_perm_map_off_free(ctx);
+    codegen::gen_fpu_pc_cache_free(ctx);
+}
+
+/// Leaves the unit before the current instruction (the last of its block) has run.
+fn chain_exit_before_current(ctx: &mut JitContext) {
+    codegen::gen_set_eip_low_bits(ctx.builder, ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.const_i32(1);
+    ctx.builder.sub_i32();
+    ctx.builder.set_local(&ctx.instruction_counter);
+    ctx.builder.br(ctx.exit_label);
+}
+
+fn chain_push_state(ctx: &mut JitContext) {
+    for r in 0..8 {
+        ctx.builder.get_local(&ctx.register_locals[r]);
+    }
+    for &slot in &CHAIN_FLAG_SLOT_OF_ABI {
+        let ok = ctx.builder.flag_local_get(slot);
+        dbg_assert!(ok);
+    }
+}
+
+/// A direct CALL to a published unit, from a unit in the chain layout.
+pub fn gen_unit_chain_call(ctx: &mut JitContext, imm: u32, site: crate::fn_unit::ChainSite) {
+    use crate::fn_unit::*;
+    let chain = unit_chain().expect("chain compile");
+    let canonical = chain.mode == 1;
+    let (own_slot, own_token) = (chain.own_slot, chain.own_token);
+    stat_add(S_CHAIN_SITES, 1.0);
+    chain_free_caches(ctx);
+    let budget = ctx.unit_chain.as_ref().expect("chain locals").budget.unsafe_clone();
+
+    let done = ctx.builder.block_void();
+    let fallback = ctx.builder.block_void();
+
+    ctx.builder.load_fixed_i32(depth_addr());
+    let depth = ctx.builder.tee_new_local();
+    if mutation(M_CHAIN_NO_DEPTH) {
+        ctx.builder.drop_();
+    }
+    else {
+        ctx.builder.const_i32(CHAIN_MAX_DEPTH as i32);
+        ctx.builder.geu_i32();
+        chain_br_if(ctx, fallback, C_FB_DEPTH);
+    }
+
+    ctx.builder.get_local(&budget);
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.sub_i32();
+    let rem = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(0);
+    ctx.builder.le_i32();
+    chain_br_if(ctx, fallback, C_FB_BUDGET);
+
+    if !mutation(M_CHAIN_FIXED_BUDGET) {
+        gen_unit_chain_slice_check(ctx, fallback, &rem);
+    }
+
+    if !mutation(M_CHAIN_NO_TOKEN) {
+        ctx.builder.load_fixed_i32(token_addr(site.token_slot));
+        ctx.builder.const_i32(site.token as i32);
+        ctx.builder.ne_i32();
+        chain_br_if(ctx, fallback, C_FB_TOKEN);
+    }
+
+    codegen::gen_get_real_eip(ctx);
+    let cont = ctx.builder.set_new_local();
+    ctx.builder.get_local(&cont);
+    ctx.builder.const_i32(imm as i32);
+    ctx.builder.add_i32();
+    let target = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&target);
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(2);
+    ctx.builder.shl_i32();
+    ctx.builder.load_aligned_i32(std::ptr::addr_of!(cpu::tlb_data) as u32);
+    let entry = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(
+        (0xFFF
+            & !cpu::TLB_READONLY
+            & !cpu::TLB_GLOBAL
+            & !cpu::TLB_HAS_CODE
+            & !(if ctx.cpu.cpl3() { 0 } else { cpu::TLB_NO_USER })) as i32,
+    );
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(cpu::TLB_VALID as i32);
+    ctx.builder.ne_i32();
+    chain_br_if(ctx, fallback, C_FB_MAPPING);
+    ctx.builder.get_local(&entry);
+    ctx.builder.const_i32(!0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&target);
+    ctx.builder.xor_i32();
+    ctx.builder.const_i32((site.callee_phys as i32).wrapping_add(unsafe { memory::mem8 } as i32));
+    ctx.builder.ne_i32();
+    chain_br_if(ctx, fallback, C_FB_MAPPING);
+    ctx.builder.free_local(entry);
+
+    codegen::gen_push32(ctx, &cont);
+
+    gen_tier2_note_retired(ctx);
+    codegen::gen_update_instruction_counter(ctx);
+    ctx.builder.const_i32(0);
+    ctx.builder.set_local(&ctx.instruction_counter);
+
+    // The push can write a code page and drop the callee (or any unit) on the way. The CALL has
+    // committed: on a moved token the unit leaves with the pushed stack, EIP at the target and
+    // the CALL retired once, and the dispatcher continues from there.
+    if !mutation(M_CHAIN_NO_TOKEN_AFTER_PUSH) {
+        ctx.builder.load_fixed_i32(token_addr(site.token_slot));
+        ctx.builder.const_i32(site.token as i32);
+        ctx.builder.ne_i32();
+        ctx.builder.if_void();
+        chain_count(ctx, C_TOKEN_AFTER_PUSH);
+        ctx.builder.const_i32(global_pointers::instruction_pointer as i32);
+        ctx.builder.get_local(&target);
+        ctx.builder.store_aligned_i32(0);
+        ctx.builder.br(ctx.exit_label);
+        ctx.builder.block_end();
+    }
+
+    ctx.builder.get_local(&rem);
+    ctx.builder.set_local(&budget);
+    if canonical {
+        codegen::gen_move_registers_from_locals_to_memory(ctx);
+    }
+
+    ctx.builder.get_local(&depth);
+    ctx.builder.const_i32(2);
+    ctx.builder.shl_i32();
+    ctx.builder.get_local(&cont);
+    ctx.builder.store_aligned_i32(ret_expect_addr());
+    ctx.builder.const_i32(depth_addr() as i32);
+    ctx.builder.get_local(&depth);
+    ctx.builder.const_i32(1);
+    ctx.builder.add_i32();
+    ctx.builder.store_aligned_i32(0);
+    ctx.builder.load_fixed_i32(global_pointers::instruction_pointer as u32);
+    let eip_saved = ctx.builder.set_new_local();
+    ctx.builder.const_i32(global_pointers::instruction_pointer as i32);
+    ctx.builder.get_local(&target);
+    ctx.builder.store_aligned_i32(0);
+    chain_count(ctx, C_CALLS);
+
+    chain_push_state(ctx);
+    ctx.builder.get_local(&budget);
+    ctx.builder.const_i32(site.chain_slot as i32 + cpu::WASM_TABLE_OFFSET as i32);
+    ctx.builder.call_indirect_chain();
+
+    let b_out = ctx.builder.set_new_local();
+    let mut f_out: Vec<WasmLocal> = (0..5).map(|_| ctx.builder.set_new_local()).collect();
+    f_out.reverse();
+    let mut r_out: Vec<WasmLocal> = (0..8).map(|_| ctx.builder.set_new_local()).collect();
+    r_out.reverse();
+    let outcome = ctx.builder.set_new_local();
+
+    ctx.builder.const_i32(depth_addr() as i32);
+    ctx.builder.get_local(&depth);
+    ctx.builder.store_aligned_i32(0);
+
+    ctx.builder.get_local(&outcome);
+    ctx.builder.if_void();
+    chain_count(ctx, C_CALLEE_EXITED);
+    ctx.builder.return_();
+    ctx.builder.block_end();
+
+    if canonical {
+        codegen::gen_move_registers_from_memory_to_locals(ctx);
+    }
+    else {
+        for r in 0..8 {
+            ctx.builder.get_local(&r_out[r]);
+            ctx.builder.set_local(&ctx.register_locals[r]);
+        }
+        if !mutation(M_CHAIN_STALE_FLAGS) {
+            for (k, &slot) in CHAIN_FLAG_SLOT_OF_ABI.iter().enumerate() {
+                ctx.builder.get_local(&f_out[k]);
+                ctx.builder.flag_local_set(slot);
+            }
+        }
+        ctx.builder.flag_mark_all_dirty();
+    }
+    if mutation(M_CHAIN_BUDGET_NOT_CARRIED) {
+        ctx.builder.get_local(&rem);
+    }
+    else {
+        ctx.builder.get_local(&b_out);
+    }
+    ctx.builder.set_local(&budget);
+
+    if !mutation(M_CHAIN_NO_CALLER_TOKEN) {
+        ctx.builder.load_fixed_i32(token_addr(own_slot));
+        ctx.builder.const_i32(own_token as i32);
+        ctx.builder.ne_i32();
+        ctx.builder.if_void();
+        chain_count(ctx, C_CALLER_TOKEN);
+        codegen::gen_move_registers_from_locals_to_memory(ctx);
+        ctx.builder.const_i32(global_pointers::instruction_pointer as i32);
+        ctx.builder.get_local(&cont);
+        ctx.builder.store_aligned_i32(0);
+        ctx.builder.return_();
+        ctx.builder.block_end();
+    }
+
+    // Back in the caller's block: EIP regains the value it had before the call, on the block's
+    // page, so the block epilogue computes the continuation exactly once (also when it is the
+    // first byte of the next page).
+    ctx.builder.const_i32(global_pointers::instruction_pointer as i32);
+    if mutation(M_CHAIN_EIP_ABSOLUTE) {
+        ctx.builder.get_local(&cont);
+    }
+    else {
+        ctx.builder.get_local(&eip_saved);
+    }
+    ctx.builder.store_aligned_i32(0);
+    ctx.builder.br(done);
+    ctx.builder.block_end();
+
+    chain_exit_before_current(ctx);
+    ctx.builder.block_end();
+
+    for l in r_out.into_iter().chain(f_out.into_iter()) {
+        ctx.builder.free_local(l);
+    }
+    ctx.builder.free_local(outcome);
+    ctx.builder.free_local(eip_saved);
+    ctx.builder.free_local(b_out);
+    ctx.builder.free_local(target);
+    ctx.builder.free_local(cont);
+    ctx.builder.free_local(rem);
+    ctx.builder.free_local(depth);
+    chain_free_caches(ctx);
+}
+
+/// The slice deadline the page chain honours (jit_find_cache_entry_for_chaining): an urgent exit
+/// request (cycle limit 0 with the hypercall page on) or a used-up slice falls back before the
+/// CALL commits; otherwise `rem` becomes the smaller of itself and what is left of the slice.
+fn gen_unit_chain_slice_check(ctx: &mut JitContext, fallback: Label, rem: &WasmLocal) {
+    use crate::fn_unit::*;
+    let hp = unsafe { hypercall::hp_ptr() as u32 };
+    ctx.builder.load_fixed_i32(hp);
+    let limit = ctx.builder.set_new_local();
+    ctx.builder.get_local(&limit);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    ctx.builder.load_fixed_i32(hp + 0x008);
+    chain_br_if(ctx, fallback, C_FB_BUDGET);
+    ctx.builder.const_i32(100_003);
+    ctx.builder.set_local(&limit);
+    ctx.builder.block_end();
+
+    ctx.builder.get_local(&limit);
+    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.add_i32();
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32);
+    ctx.builder.sub_i32();
+    let elapsed = ctx.builder.tee_new_local();
+    ctx.builder.leu_i32();
+    chain_br_if(ctx, fallback, C_FB_BUDGET);
+
+    ctx.builder.get_local(&limit);
+    ctx.builder.get_local(&elapsed);
+    ctx.builder.sub_i32();
+    let left = ctx.builder.tee_new_local();
+    ctx.builder.get_local(rem);
+    ctx.builder.get_local(&left);
+    ctx.builder.get_local(rem);
+    ctx.builder.ltu_i32();
+    ctx.builder.select();
+    ctx.builder.set_local(rem);
+    ctx.builder.free_local(left);
+    ctx.builder.free_local(elapsed);
+    ctx.builder.free_local(limit);
+}
+
+/// RET of a unit in the chain layout: MATCHED when ESP is the entry ESP and the return address
+/// is the expected continuation, checked before the pop; otherwise the unit leaves at the RET.
+pub fn gen_unit_chain_ret(ctx: &mut JitContext, imm16: u32) {
+    use crate::fn_unit::*;
+    let canonical = unit_chain().map_or(false, |c| c.mode == 1);
+    chain_free_caches(ctx);
+    let (budget, esp_entry) = {
+        let l = ctx.unit_chain.as_ref().expect("chain locals");
+        (l.budget.unsafe_clone(), l.esp_entry.unsafe_clone())
+    };
+    let mismatch = ctx.builder.block_void();
+    codegen::gen_get_reg32(ctx, crate::regs::ESP);
+    ctx.builder.get_local(&esp_entry);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(mismatch);
+    if !mutation(M_CHAIN_NO_RET_CHECK) {
+        codegen::gen_get_reg32(ctx, crate::regs::ESP);
+        let addr = ctx.builder.set_new_local();
+        codegen::gen_safe_read32(ctx, &addr);
+        ctx.builder.free_local(addr);
+        ctx.builder.load_fixed_i32(depth_addr());
+        ctx.builder.const_i32(1);
+        ctx.builder.sub_i32();
+        ctx.builder.const_i32(2);
+        ctx.builder.shl_i32();
+        ctx.builder.load_aligned_i32(ret_expect_addr());
+        ctx.builder.ne_i32();
+        ctx.builder.br_if(mismatch);
+    }
+    codegen::gen_get_reg32(ctx, crate::regs::ESP);
+    ctx.builder.const_i32(4 + imm16 as i32);
+    ctx.builder.add_i32();
+    codegen::gen_set_reg32(ctx, crate::regs::ESP);
+    chain_count(ctx, C_RET_MATCHED);
+    if canonical {
+        codegen::gen_move_registers_from_locals_to_memory(ctx);
+    }
+    gen_tier2_note_retired(ctx);
+    codegen::gen_update_instruction_counter(ctx);
+    ctx.builder.const_i32(0);
+    chain_push_state(ctx);
+    ctx.builder.get_local(&budget);
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.sub_i32();
+    let left = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(0);
+    ctx.builder.get_local(&left);
+    ctx.builder.const_i32(0);
+    ctx.builder.gt_i32();
+    ctx.builder.select();
+    ctx.builder.free_local(left);
+    ctx.builder.return_values();
+    ctx.builder.block_end();
+    chain_count(ctx, C_RET_MISMATCH);
+    chain_exit_before_current(ctx);
+}
+
+/// The chain sites of a unit about to be compiled: every direct CALL the census recorded whose
+/// target is a published chain unit with the same state flags, or the unit itself.
+fn unit_chain_sites(
+    ctx: &mut JitState,
+    virt: u32,
+    phys: u32,
+    state_flags: CachedStateFlags,
+    own_chain: u16,
+    own_slot: u16,
+    own_token: u32,
+) -> (HashMap<u32, crate::fn_unit::ChainSite, FixedHasher>, Vec<(u32, u16, u32)>, Vec<u32>) {
+    use crate::fn_census::{CALL_INDIRECT, CALL_CALLEE_RET_KNOWN};
+    use crate::fn_unit::*;
+    let mut sites = HashMap::default();
+    let mut callees = Vec::new();
+    let mut waiting = Vec::new();
+    for rec in crate::fn_census::unit_calls(&mut ctx.fn_census, virt) {
+        let (site_virt, target, flags) = (rec[0], rec[1], rec[2]);
+        if flags & CALL_INDIRECT != 0 || flags & CALL_CALLEE_RET_KNOWN == 0 || target == 0 {
+            continue;
+        }
+        let site_phys = match cpu::translate_address_read_no_side_effects(site_virt as i32) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Only a plain E8 rel32 (no prefix, operand size 32 from the admitted state) whose
+        // decoded target is the recorded one becomes a site; its five bytes are on one page.
+        if site_phys & 0xFFF > 0x1000 - 5
+            || crate::cpu::memory::read8(site_phys) != 0xE8
+            || site_virt.wrapping_add(5).wrapping_add(crate::cpu::memory::read32s(site_phys + 1) as u32) != target
+        {
+            stat_add(S_CHAIN_TARGET_MISMATCH, 1.0);
+            continue;
+        }
+        let site = if target == virt {
+            Some(ChainSite {
+                site_virt,
+                target,
+                callee_phys: phys,
+                chain_slot: own_chain,
+                token_slot: own_slot,
+                token: own_token,
+            })
+        }
+        else {
+            match ctx.fn_unit.units.get(&target) {
+                Some(u) if u.chain.is_some() && u.state_flags == state_flags && u.generation == ctx.fn_unit.generation(target) => {
+                    Some(ChainSite {
+                        site_virt,
+                        target,
+                        callee_phys: u.phys,
+                        chain_slot: u.chain.unwrap().to_u16(),
+                        token_slot: u.index.to_u16(),
+                        token: u.token,
+                    })
+                },
+                _ => None,
+            }
+        };
+        match site {
+            Some(s) => {
+                if s.target != virt && !callees.iter().any(|&(t, _, _)| t == s.target) {
+                    callees.push((s.target, s.token_slot, s.token));
+                }
+                sites.insert(site_phys, s);
+            },
+            None => {
+                stat_add(S_CHAIN_UNCHAINED, 1.0);
+                if !waiting.contains(&target) {
+                    waiting.push(target);
+                }
+            },
+        }
+    }
+    (sites, callees, waiting)
+}
+
+#[no_mangle]
+pub fn fn_unit_set_chain(mode: u32) {
+    crate::fn_unit::set_chain_mode_raw(if mode > 2 { 2 } else { mode });
+    fn_unit_clear(&mut get_jit_state());
+}
+
+#[no_mangle]
+pub fn fn_unit_get_chain() -> u32 { crate::fn_unit::chain_mode() }
+
+#[no_mangle]
+pub fn fn_unit_set_and_esp(on: u32) {
+    crate::fn_unit::set_and_esp_raw(on != 0);
+    fn_unit_clear(&mut get_jit_state());
+}
+
+#[no_mangle]
+pub fn fn_unit_get_and_esp() -> u32 { crate::fn_unit::and_esp() as u32 }
+
+#[no_mangle]
+pub fn fn_unit_pending_chain_slot() -> u32 {
+    get_jit_state().fn_unit.pending.as_ref().and_then(|p| p.chain).map_or(0, |c| c.to_u16() as u32)
+}
+
+/// 1 when the published unit at `caller` was compiled with a chained call site to `callee`.
+#[no_mangle]
+pub fn fn_unit_chain_linked(caller: u32, callee: u32) -> u32 {
+    get_jit_state().fn_unit.units.get(&caller).map_or(false, |u| u.chain.is_some() && u.links.contains(&callee)) as u32
+}
+
+#[no_mangle]
+pub fn fn_unit_chain_slot(virt: u32) -> u32 {
+    get_jit_state().fn_unit.units.get(&virt).and_then(|u| u.chain).map_or(u32::MAX, |c| c.to_u16() as u32)
 }

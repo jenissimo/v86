@@ -1519,3 +1519,24 @@ pub fn unit_candidate(c: &mut Census, virt: u32) -> Option<UnitCandidate> {
     }
     Some(cand)
 }
+
+/// The call sites recorded for the row at `virt`: (site, target, flags, callee ret imm16).
+pub fn unit_calls(c: &mut Census, virt: u32) -> Vec<[u32; CALL_WORDS]> {
+    let row = match c.index.get(&virt) {
+        Some(&r) => r,
+        None => return Vec::new(),
+    };
+    let r = c.row(row);
+    let (start, count) = (r[R_CALL_START] as usize, r[R_CALL_COUNT] as usize);
+    let mut out = Vec::with_capacity(count);
+    for i in start..(start + count) {
+        let s = i * CALL_WORDS;
+        if s + CALL_WORDS > c.calls.len() {
+            break;
+        }
+        let mut rec = [0u32; CALL_WORDS];
+        rec.copy_from_slice(&c.calls[s..s + CALL_WORDS]);
+        out.push(rec);
+    }
+    out
+}

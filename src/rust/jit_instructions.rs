@@ -3484,6 +3484,13 @@ pub fn instr16_E8_jit(ctx: &mut JitContext, _imm: u32) {
     ctx.builder.free_local(value_local);
 }
 pub fn instr32_E8_jit(ctx: &mut JitContext, imm: u32) {
+    if ctx.unit_chain.is_some() {
+        if let Some(site) = crate::jit::unit_chain().and_then(|c| c.sites.get(&ctx.start_of_current_instruction).copied()) {
+            dbg_assert!(site.site_virt.wrapping_add(ctx.cpu.eip.wrapping_sub(ctx.start_of_current_instruction)).wrapping_add(imm) == site.target);
+            crate::jit::gen_unit_chain_call(ctx, imm, site);
+            return;
+        }
+    }
     codegen::gen_get_real_eip(ctx);
     let value_local = ctx.builder.set_new_local();
     codegen::gen_push32(ctx, &value_local);
@@ -3514,6 +3521,10 @@ pub fn instr16_C2_jit(ctx: &mut JitContext, imm16: u32) {
 }
 
 pub fn instr32_C2_jit(ctx: &mut JitContext, imm16: u32) {
+    if ctx.unit_chain.is_some() {
+        crate::jit::gen_unit_chain_ret(ctx, imm16);
+        return;
+    }
     ctx.builder.const_i32(0);
     codegen::gen_pop32s(ctx);
     codegen::gen_add_cs_offset(ctx);
@@ -3531,6 +3542,10 @@ pub fn instr16_C3_jit(ctx: &mut JitContext) {
 }
 
 pub fn instr32_C3_jit(ctx: &mut JitContext) {
+    if ctx.unit_chain.is_some() {
+        crate::jit::gen_unit_chain_ret(ctx, 0);
+        return;
+    }
     ctx.builder.const_i32(0);
     codegen::gen_pop32s(ctx);
     codegen::gen_add_cs_offset(ctx);

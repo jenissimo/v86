@@ -1920,6 +1920,7 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         const f = result.exports["f"];
 
         this.wm.wasm_table.set(wasm_table_index + WASM_TABLE_OFFSET, f);
+        this.set_unit_chain_function(result.exports["g"]);
         if(publication) publication["published"]();
         this.codegen_finalize_finished(wasm_table_index, start, state_flags);
 
@@ -1935,6 +1936,7 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
         const f = result.instance.exports["f"];
 
         this.wm.wasm_table.set(wasm_table_index + WASM_TABLE_OFFSET, f);
+        this.set_unit_chain_function(result.instance.exports["g"]);
         if(publication) publication["published"]();
         this.codegen_finalize_finished(wasm_table_index, start, state_flags);
 
@@ -1964,6 +1966,19 @@ CPU.prototype.codegen_finalize = function(wasm_table_index, start, state_flags, 
             debugger;
         });
     }
+};
+
+// A function-unit module in chain layout also exports `g`, which goes into the chain slot the
+// pending unit compile reserved.
+CPU.prototype.set_unit_chain_function = function(g)
+{
+    if(!g)
+    {
+        return;
+    }
+    const slot = this.wm.exports["fn_unit_pending_chain_slot"]() >>> 0;
+    dbg_assert(slot > 0 && slot < WASM_TABLE_SIZE);
+    this.wm.wasm_table.set(slot + WASM_TABLE_OFFSET, g);
 };
 
 CPU.prototype.log_uncompiled_code = function(start, end)
